@@ -1,0 +1,13 @@
+[package]
+name = "license-core"
+version = "0.1.0"
+edition = "2021"
+description = "QZA 授权校验纯逻辑：与 Tauri 无关，可独立单元测试"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 纯 Rust 实现，不引入 C 依赖，避免交叉编译时的原生工具链问题。
+ed25519-dalek = "2"

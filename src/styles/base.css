@@ -1,0 +1,369 @@
+/**
+ * 全局基础样式。
+ *
+ * 只放三类东西：reset、全局元素默认值、第三方组件库的 token 适配。
+ * 任何具体页面或业务组件的样式都不应写在这里——那些属于各自的 scoped style。
+ */
+
+@import "./tokens.css";
+
+/* ------------------------------------------------------------------ reset */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  min-width: 320px;
+  margin: 0;
+  overflow: hidden;
+}
+
+html {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--color-text);
+  background: var(--color-canvas);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+}
+
+body {
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--color-canvas);
+  color: var(--color-text);
+}
+
+/* 桌面应用惯例：禁止误选文本与拖拽图片，但输入控件与可复制内容除外。 */
+
+input,
+textarea,
+[contenteditable="true"],
+.selectable,
+.selectable * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+img,
+video {
+  -webkit-user-drag: none;
+  user-drag: none;
+  max-width: 100%;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-text);
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* 键盘可达性：只在键盘导航时显示焦点环，鼠标点击不显示。 */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ------------------------------------------------------------- 滚动条 */
+
+* {
+  -webkit-user-select: none;
+  user-select: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border: 3px solid transparent;
+  border-radius: var(--radius-full);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-tertiary);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* --------------------------------------------------- 减少动态效果 */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ------------------------------------------------- 通用工具类（极少量） */
+
+.qza-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qza-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.qza-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: calc(var(--line-width) * -1);
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ------------------------------------------- PrimeVue 适配到设计 tokens
+ * PrimeVue 自身的主题（Aura）与我们的 tokens 是两套体系。这里做一次映射，
+ * 让组件库的控件（按钮、输入框、对话框、浮层）在两种主题下都与设计语言一致，
+ * 而不是各页面分别写 :deep() 覆盖。
+ */
+
+.p-component {
+  font-family: var(--font-sans);
+  --p-primary-color: var(--color-accent);
+  --p-primary-hover-color: var(--color-accent-hover);
+  --p-primary-active-color: var(--color-accent-active);
+  --p-primary-contrast-color: var(--color-on-accent);
+  --p-button-primary-background: var(--color-accent);
+  --p-button-primary-border-color: var(--color-accent);
+  --p-button-primary-color: var(--color-on-accent);
+  --p-button-primary-hover-background: var(--color-accent-hover);
+  --p-button-primary-hover-border-color: var(--color-accent-hover);
+  --p-button-primary-hover-color: var(--color-on-accent);
+  --p-button-primary-active-background: var(--color-accent-active);
+  --p-button-primary-active-border-color: var(--color-accent-active);
+  --p-button-primary-active-color: var(--color-on-accent);
+  --p-button-danger-background: var(--color-danger);
+  --p-button-danger-border-color: var(--color-danger);
+  --p-button-danger-color: var(--color-text-inverse);
+  --p-button-danger-hover-background: color-mix(in srgb, var(--color-danger) 90%, var(--color-text));
+  --p-button-danger-hover-border-color: var(--color-danger);
+  --p-button-danger-hover-color: var(--color-text-inverse);
+  --p-button-text-primary-color: var(--color-accent);
+  --p-button-outlined-primary-color: var(--color-accent);
+  --p-button-outlined-primary-border-color: var(--color-accent-border);
+  --p-select-option-selected-background: var(--color-accent-soft);
+  --p-select-option-selected-color: var(--color-accent);
+  --p-select-option-selected-focus-background: var(--color-accent-soft);
+  --p-select-option-selected-focus-color: var(--color-accent);
+  --p-inputtext-focus-border-color: var(--color-accent);
+  --p-checkbox-checked-background: var(--color-accent);
+  --p-checkbox-checked-border-color: var(--color-accent);
+  --p-checkbox-checked-hover-background: var(--color-accent-hover);
+  --p-checkbox-checked-hover-border-color: var(--color-accent-hover);
+}
+
+.p-dialog,
+.p-overlaypanel,
+.p-popover,
+.p-drawer {
+  background: var(--color-surface-raised);
+  border: var(--line-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  max-width: calc(100vw - var(--space-4) * 2);
+  max-height: calc(100dvh - var(--space-4) * 2);
+  color: var(--color-text);
+}
+
+.p-dialog .p-dialog-header,
+.p-drawer .p-drawer-header {
+  padding: var(--space-4) var(--space-5);
+  border-bottom: var(--line-width) solid var(--color-border);
+  background: transparent;
+}
+
+.p-dialog .p-dialog-title,
+.p-drawer .p-drawer-title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+.p-dialog .p-dialog-content,
+.p-drawer .p-drawer-content {
+  padding: var(--space-5);
+  background: transparent;
+  color: var(--color-text);
+}
+
+.p-dialog .p-dialog-footer {
+  padding: var(--space-4) var(--space-5);
+  border-top: var(--line-width) solid var(--color-border);
+}
+
+.p-inputtext,
+.p-password-input,
+.p-inputnumber-input {
+  background: var(--color-surface);
+  border: var(--line-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-text);
+  transition: border-color var(--duration-fast) var(--ease-out),
+    box-shadow var(--duration-fast) var(--ease-out);
+}
+
+.p-inputtext:hover,
+.p-password-input:hover {
+  border-color: var(--color-border-strong);
+}
+
+.p-inputtext:focus,
+.p-password-input:focus,
+.p-inputnumber-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: var(--shadow-focus);
+}
+
+.p-inputtext::placeholder,
+.p-password-input::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.p-button {
+  min-height: var(--control-height);
+  border-radius: var(--radius-md);
+  font-weight: var(--weight-medium);
+  transition: background-color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.p-button:focus-visible {
+  box-shadow: var(--shadow-focus);
+}
+
+.p-tooltip .p-tooltip-text {
+  background: var(--color-text);
+  color: var(--color-surface);
+  font-size: var(--text-xs);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.p-checkbox .p-checkbox-box {
+  border-radius: var(--radius-xs);
+  border-color: var(--color-border-strong);
+  background: var(--color-surface);
+}
+
+.p-checkbox .p-checkbox-box.p-highlight {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+.p-progressbar {
+  background: var(--color-surface-sunken);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.p-progressbar .p-progressbar-value {
+  background: var(--color-accent);
+  border-radius: var(--radius-full);
+}
+
+.p-skeleton {
+  background: var(--color-surface-sunken);
+  border-radius: var(--radius-sm);
+}
+
+.p-select,
+.p-dropdown {
+  background: var(--color-surface);
+  border: var(--line-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.p-select-overlay { background: var(--color-surface-raised); color: var(--color-text); border-color: var(--color-border); }
+.p-select-option { color: var(--color-text); }
+.p-select-option:not(.p-select-option-selected):hover { background: var(--color-surface-sunken); }
+.p-select-label { color: var(--color-text); }
+.p-paginator { flex-wrap: wrap; background: var(--color-surface); border-radius: var(--radius-lg); color: var(--color-text-secondary); }
+.p-paginator-page-selected { background: var(--color-accent-soft); color: var(--color-accent); }
+.p-password { width: 100%; }
+.p-password-input { width: 100%; min-width: 0; }
+.p-dialog-footer { flex-wrap: wrap; }
+.p-dialog-mask { background: var(--color-overlay); }
+.p-drawer-right { width: min(var(--layout-detail-width), 100vw); }
+.p-drawer-bottom { max-height: 80dvh; padding-bottom: env(safe-area-inset-bottom); }
+.p-dialog-content { min-height: 0; overscroll-behavior: contain; }
+
+@media (max-width: 860px) {
+  .p-button, .p-inputtext, .p-inputnumber-input, .p-select, .p-select-option, .p-paginator-page, .p-paginator-next, .p-paginator-prev { min-height: var(--touch-target); }
+  .p-dialog-close-button, .p-drawer-close-button { min-width: var(--touch-target); min-height: var(--touch-target); flex-shrink: 0; }
+}
+
+.p-tag {
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+}

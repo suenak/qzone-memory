@@ -1,0 +1,35 @@
+import type { PrimeVueLocaleOptions } from "primevue/config";
+
+// 与页面文案保持一致，也为键盘和读屏操作提供中文提示。
+export const zhLocale: PrimeVueLocaleOptions = {
+  fileSizeTypes: ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"],
+  dayNames: ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"],
+  dayNamesShort: ["周日", "周一", "周二", "周三", "周四", "周五", "周六"],
+  dayNamesMin: ["日", "一", "二", "三", "四", "五", "六"],
+  monthNames: ["一月", "二月", "三月", "四月", "五月", "六月", "七月", "八月", "九月", "十月", "十一月", "十二月"],
+  monthNamesShort: ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"],
+  today: "今天", weekHeader: "周", firstDayOfWeek: 1, showMonthAfterYear: true, dateFormat: "yy/mm/dd",
+  clear: "清除", apply: "应用", accept: "确认", reject: "取消",
+  choose: "选择", upload: "上传", cancel: "取消",
+  completed: "已完成", pending: "等待中", passwordPrompt: "填写密码",
+  weak: "较弱", medium: "一般", strong: "较强",
+  emptyFilterMessage: "没有找到匹配内容", emptySearchMessage: "没有找到匹配内容",
+  emptyMessage: "暂无可选项", searchMessage: "找到 {0} 项",
+  selectionMessage: "已选择 {0} 项", emptySelectionMessage: "尚未选择",
+  aria: {
+    trueLabel: "是", falseLabel: "否", nullLabel: "未选择",
+    selectAll: "全选", unselectAll: "取消全选", close: "关闭",
+    previous: "上一项", next: "下一项", navigation: "导航", scrollTop: "回到顶部",
+    moveTop: "移到顶部", moveUp: "上移", moveDown: "下移", moveBottom: "移到底部",
+    moveToTarget: "移入", moveToSource: "移出", moveAllToTarget: "全部移入", moveAllToSource: "全部移出",
+    pageLabel: "第 {page} 页", firstPageLabel: "第一页", lastPageLabel: "最后一页",
+    nextPageLabel: "下一页", prevPageLabel: "上一页", rowsPerPageLabel: "每页条数",
+    jumpToPageDropdownLabel: "选择页码", jumpToPageInputLabel: "填写页码",
+    selectRow: "选择此行", unselectRow: "取消选择此行", expandRow: "展开此行", collapseRow: "收起此行",
+    showFilterMenu: "展开筛选", hideFilterMenu: "收起筛选", filterOperator: "筛选方式", filterConstraint: "筛选条件",
+    editRow: "编辑此行", saveEdit: "保存修改", cancelEdit: "取消修改",
+    listView: "列表", gridView: "网格", slide: "图片", slideNumber: "第 {slideNumber} 张",
+    zoomImage: "查看大图", zoomIn: "放大", zoomOut: "缩小", rotateRight: "向右旋转", rotateLeft: "向左旋转",
+    listLabel: "可选项", star: "1 星", stars: "{star} 星",
+  },
+};
