@@ -76,7 +76,7 @@ pub async fn fetch_update_manifest() -> Result<Option<UpdateManifest>, String> {
 /// 清单格式见 `docs/RELEASE-AUTO-UPDATE.md`。
 pub const UPDATE_ENDPOINT: &str = match option_env!("QZA_UPDATE_ENDPOINT") {
     Some(value) => value,
-    None => "https://updates.invalid/api/v1/update/latest",
+    None => "https://license.example.com/api/v1/update/latest",
 };
 
 /// 官网下载页兜底地址。
@@ -85,7 +85,7 @@ pub const UPDATE_ENDPOINT: &str = match option_env!("QZA_UPDATE_ENDPOINT") {
 /// 只有清单没有给、或者解析失败时才用这里。
 pub const DOWNLOAD_PAGE: &str = match option_env!("QZA_DOWNLOAD_PAGE") {
     Some(value) => value,
-    None => "https://updates.invalid/download",
+    None => "https://qzone.example.com/",
 };
 
 #[tauri::command]

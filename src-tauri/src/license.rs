@@ -26,13 +26,12 @@ use license_core::{
     LicensePayload, LicenseStatus,
 };
 
-/// 编译期可通过 `QZA_LICENSE_SERVER` 注入正式域名；未注入时使用占位地址。
-/// 发布前必须替换，否则激活请求会打到不存在的域名 —— 而 `license.example.com`
-/// 是 IANA 保留域，不存在任何授权服务，激活永远不可能成功。
+/// 生产授权服务器地址。
 ///
-/// 因此这里不能只靠注释约束：回退值会被 `initialize` 写进 `last_error`（见
-/// `license_server_is_placeholder`），源码构建者一激活就能看到「本构建未配置授权服务器」。
-const LICENSE_SERVER_FALLBACK: &str = "https://license.example.com";
+/// 这是面向最终用户的默认值，指向部署在阿里云 ECS 上的授权服务。
+/// 本地调试用 `scripts/build-local-windows.ps1` 注入
+/// `QZA_LICENSE_SERVER=http://127.0.0.1:8787` 覆盖，不必改动源码。
+const LICENSE_SERVER_DEFAULT: &str = "https://license.example.com";
 
 /// 凭据库服务名，与 qlogin.rs 的 QQ 会话共用同一命名空间，但使用不同的 account。
 const CREDENTIAL_SERVICE: &str = "top.ehre.qzonearchive";
@@ -45,15 +44,7 @@ const HEARTBEAT_INTERVAL_SECONDS: i64 = 24 * 3600;
 const REQUEST_TIMEOUT_SECONDS: u64 = 20;
 
 pub fn license_server() -> &'static str {
-    option_env!("QZA_LICENSE_SERVER").unwrap_or(LICENSE_SERVER_FALLBACK)
-}
-
-/// 本构建是否在使用占位授权服务器地址，即编译期没有注入 `QZA_LICENSE_SERVER`。
-///
-/// 用于把「本构建未配置授权服务器」变成运行时可观测的状态，而不是只写在注释里：
-/// 占位域名下的激活请求永远失败，用户只会看到笼统的网络错误。
-fn license_server_is_placeholder() -> bool {
-    option_env!("QZA_LICENSE_SERVER").is_none()
+    option_env!("QZA_LICENSE_SERVER").unwrap_or(LICENSE_SERVER_DEFAULT)
 }
 
 fn now_seconds() -> i64 {
@@ -655,14 +646,6 @@ pub fn initialize(app: &tauri::AppHandle) {
             }
         }
         runtime.identity = Some(identity);
-    }
-
-    // 源码构建未配置授权服务器时明确告知：占位域名下激活请求永远失败，
-    // 静默下去用户只会看到笼统的网络错误。已有更具体的错误时不覆盖。
-    if license_server_is_placeholder() && last_error.is_none() {
-        last_error = Some(format!(
-            "本构建未配置授权服务器，激活请求会发往占位地址 {LICENSE_SERVER_FALLBACK}"
-        ));
     }
 
     runtime.last_error = last_error;
@@ -1417,9 +1400,18 @@ fn default_device_label() -> String {
     platform.to_owned()
 }
 
-/// 客户端内置的 Ed25519 公钥，由 `npm run gen-keys` 生成。
-/// 公钥公开无风险；私钥只存在于服务端。
-pub const LICENSE_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA2dESnOkaJgAVrQj6gQA6BdNdTPe2Qs5RBTbt2vhJwHc=\n-----END PUBLIC KEY-----\n";
+/// 客户端内置的 Ed25519 公钥，即生产授权服务的签名公钥。
+///
+/// 公钥公开无风险；私钥只存在于服务端 `/opt/qza-license/secrets/license_private.pem`，
+/// 由 `npm run gen-keys` 在该机器上生成后从未离开。改动这里的公钥等于让所有已签发的
+/// 授权 token 失效，因此不要用开发密钥覆盖它。
+///
+/// 指向自建服务端调试时用编译期环境变量 `QZA_LICENSE_PUBLIC_KEY` 覆盖，
+/// 否则用本地密钥签发的 token 会全部校验失败。
+pub const LICENSE_PUBLIC_KEY_PEM: &str = match option_env!("QZA_LICENSE_PUBLIC_KEY") {
+    Some(value) => value,
+    None => "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA2dESnOkaJgAVrQj6gQA6BdNdTPe2Qs5RBTbt2vhJwHc=\n-----END PUBLIC KEY-----\n",
+};
 
 #[cfg(test)]
 mod tests {

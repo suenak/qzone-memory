@@ -87,9 +87,11 @@ install started.
 - The manifest request runs in Rust, with a 10-second timeout and a 512 KiB response limit.
   It accepts no endpoint argument or QQ credentials from the frontend; WebView CSP stays narrow.
 - Endpoint and fallback download page are constants in `src-tauri/src/updater.rs`, each overridable
-  at compile time via `QZA_UPDATE_ENDPOINT` / `QZA_DOWNLOAD_PAGE`. Their defaults use the reserved
-  `.invalid` domain on purpose so that an unconfigured build ships a visible failure instead of
-  pointing at someone else's host.
+  at compile time via `QZA_UPDATE_ENDPOINT` / `QZA_DOWNLOAD_PAGE`. Their defaults point at the
+  production deployment — `https://license.example.com/api/v1/update/latest` and
+  `https://qzone.example.com/`. Earlier revisions defaulted to a reserved `.invalid` host so an
+  unconfigured build failed visibly; that stopped being useful once a real deployment existed, and
+  a build that cannot reach the manifest now silently reports "up to date", which is worse.
 
 Server side, `QZA_DOWNLOAD_PAGE` is what the manifest advertises; publishing no longer requires
 minisign signatures. Release steps: [docs/RELEASE-AUTO-UPDATE.md](docs/RELEASE-AUTO-UPDATE.md).

@@ -60,7 +60,7 @@ jobs:
           retention-days: 90
 
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -77,9 +77,29 @@ jobs:
             librsvg2-dev \
             libdbus-1-dev \
             pkg-config \
-            patchelf
+            patchelf \
+            squashfs-tools \
+            xvfb
+      - name: Prepare world-executable AppRun helper
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
+          mkdir -p "$cache_dir"
+          curl -fL \
+            "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-$arch" \
+            -o "$cache_dir/AppRun-$arch"
+          chmod 0755 "$cache_dir/AppRun-$arch"
+          test "$(stat -c '%a' "$cache_dir/AppRun-$arch")" = "755"
       - run: npm ci
       - run: npx tauri build --bundles appimage,deb,rpm
+      - name: Verify AppImage portability and startup
+        run: |
+          set -euo pipefail
+          appimage="$(find src-tauri/target/release/bundle/appimage -type f -name '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          chmod 0755 "$appimage"
+          bash scripts/verify-appimage.sh "$appimage"
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-linux-${{ github.sha }}
@@ -119,16 +139,31 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npx tauri android build --target aarch64
+      - name: Restore Android keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::缺少仓库 secret ANDROID_KEYSTORE_BASE64。"
+            echo "签名密钥库不进版本控制，必须由 secret 提供（release.jks 的 base64）。"
+            exit 1
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+
       - name: Sign Android APK
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           unsigned_apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
           signed_apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
           keytool -genkeypair -keystore "$RUNNER_TEMP/android-test.jks" -alias test -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Temporary CI Test"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
-            --ks "$RUNNER_TEMP/android-test.jks" \
-            --ks-key-alias test \
-            --ks-pass pass:android \
-            --key-pass pass:android \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$ANDROID_KEY_PASSWORD" \
             --out "$signed_apk" \
             "$unsigned_apk"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$signed_apk"
@@ -238,15 +273,30 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p nightly
-          cp artifacts/windows/*.exe nightly/QzoneArchive-nightly_x64-setup.exe
-          cp artifacts/macos-x64/*.dmg nightly/QzoneArchive-nightly_x64.dmg
-          cp artifacts/macos-arm64/*.dmg nightly/QzoneArchive-nightly_aarch64.dmg
-          cp artifacts/linux/*.AppImage nightly/QzoneArchive-nightly_amd64.AppImage
-          cp artifacts/linux/*.deb nightly/QzoneArchive-nightly_amd64.deb
-          cp artifacts/linux/*.rpm nightly/QzoneArchive-nightly_x86_64.rpm
-          cp artifacts/android/*.apk nightly/QzoneArchive-nightly-universal.apk
-          cp artifacts/ios-unsigned/*.ipa nightly/QzoneArchive-nightly-ios-arm64-unsigned.ipa
-          cp artifacts/nixos/*.tar.gz nightly/qzonearchive-nixos-nightly-x86_64-linux.tar.gz
+
+          copy_artifact() {
+            local source_root="$1"
+            local pattern="$2"
+            local destination="$3"
+            local source_path
+
+            source_path="$(find "$source_root" -type f -name "$pattern" -print -quit)"
+            if [ -z "$source_path" ]; then
+              echo "Artifact not found under $source_root: $pattern" >&2
+              exit 1
+            fi
+            cp "$source_path" "$destination"
+          }
+
+          copy_artifact artifacts/windows '*.exe' nightly/QzoneArchive-nightly_x64-setup.exe
+          copy_artifact artifacts/macos-x64 '*.dmg' nightly/QzoneArchive-nightly_x64.dmg
+          copy_artifact artifacts/macos-arm64 '*.dmg' nightly/QzoneArchive-nightly_aarch64.dmg
+          copy_artifact artifacts/linux '*.AppImage' nightly/QzoneArchive-nightly_amd64.AppImage
+          copy_artifact artifacts/linux '*.deb' nightly/QzoneArchive-nightly_amd64.deb
+          copy_artifact artifacts/linux '*.rpm' nightly/QzoneArchive-nightly_x86_64.rpm
+          copy_artifact artifacts/android '*.apk' nightly/QzoneArchive-nightly-universal.apk
+          copy_artifact artifacts/ios-unsigned '*.ipa' nightly/QzoneArchive-nightly-ios-arm64-unsigned.ipa
+          copy_artifact artifacts/nixos '*.tar.gz' nightly/qzonearchive-nixos-nightly-x86_64-linux.tar.gz
           ls -lh nightly
           gh release create nightly \
             --repo "$GITHUB_REPOSITORY" \

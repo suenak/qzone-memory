@@ -238,8 +238,24 @@ jobs:
             \( -name "*.apk" -o -name "*.aab" \) \
             -print || true
 
+      - name: Restore Android keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::缺少仓库 secret ANDROID_KEYSTORE_BASE64。"
+            echo "签名密钥库不进版本控制，必须由 secret 提供（release.jks 的 base64）。"
+            exit 1
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+
       - name: Sign APK
         shell: bash
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -260,10 +276,10 @@ jobs:
 
           keytool -genkeypair -keystore "$RUNNER_TEMP/android-test.jks" -alias test -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Temporary CI Test"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
-            --ks "$RUNNER_TEMP/android-test.jks" \
-            --ks-key-alias test \
-            --ks-pass pass:android \
-            --key-pass pass:android \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$ANDROID_KEY_PASSWORD" \
             --out "$APK_SIGNED" \
             "$APK_UNSIGNED"
 
@@ -281,7 +297,7 @@ jobs:
 
   # Linux
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: ${{ ! inputs.skip_linux }}
 
     steps:
@@ -309,13 +325,39 @@ jobs:
             librsvg2-dev \
             libdbus-1-dev \
             pkg-config \
-            patchelf
+            patchelf \
+            squashfs-tools \
+            xvfb
+
+      - name: Prepare world-executable AppRun helper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          arch="$(uname -m)"
+          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
+          mkdir -p "$cache_dir"
+          curl -fL \
+            "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-$arch" \
+            -o "$cache_dir/AppRun-$arch"
+          chmod 0755 "$cache_dir/AppRun-$arch"
+          test "$(stat -c '%a' "$cache_dir/AppRun-$arch")" = "755"
 
       - name: Install frontend dependencies
         run: npm ci
 
       - name: Build Linux bundles
         run: npx tauri build --bundles appimage,deb,rpm
+
+      - name: Verify AppImage portability and startup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          appimage="$(find src-tauri/target/release/bundle/appimage -type f -name '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          chmod 0755 "$appimage"
+          bash scripts/verify-appimage.sh "$appimage"
 
       - name: Upload Linux bundles
         uses: actions/upload-artifact@v4
@@ -850,7 +892,7 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            ## QQ Zone Restore Archive 1.1.0
+            ## QQ Zone Restore Archive ${{ github.ref_name }}
 
             这是一个本地优先的 QQ 空间恢复归档工具。本版将当前可见说说、旧历史残留和互动记录进行结构化合并，并提供相册、视频、留言板、旧收藏、联系人互动、年份筛选、全文搜索和离线导出。
 
@@ -867,6 +909,12 @@ jobs:
             ### 重要说明
 
             “恢复已删除内容”依赖 QQ 接口仍保留的点赞、评论、回复或其他互动残留。没有互动痕迹、服务端已彻底清除、无权访问或接口不再返回的内容无法恢复，也不能保证结果完整。请仅归档本人账号或已获授权的数据。
+
+            ### 本版修复
+
+            - 腾讯 WAF 拦截移动端互动接口时，保留并完成当前可见说说与旧历史消息归档，不再让整次任务失败。
+            - 本人说说为空时通过 QQ 资料接口补齐昵称，避免历史卡片已读取但写入 0 条。
+            - Linux AppImage 固定 glibc 2.35 基线，并在发布前校验启动器权限与实际启动状态。
 
             本项目基于 Gaoshu705/QzoneArchive 进行 GPLv3 二次开发，参考项目与完整免责声明见仓库 README 和 THIRD_PARTY_NOTICES。
         env:

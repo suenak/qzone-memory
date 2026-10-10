@@ -2521,6 +2521,16 @@ fn interaction_error_can_be_partial(error: &str) -> bool {
         || error.starts_with("上次异常位置仍标记为临时接口故障")
 }
 
+fn interaction_failure_can_finish(
+    error: &str,
+    visible_moments: u64,
+    saved_history_records: u64,
+) -> bool {
+    qzone::feed_error_is_waf_block(error)
+        || ((visible_moments > 0 || saved_history_records > 0)
+            && interaction_error_can_be_partial(error))
+}
+
 #[tauri::command]
 pub async fn start_feed_archive(
     app: tauri::AppHandle,
@@ -2600,6 +2610,27 @@ pub async fn start_feed_archive(
                 set_progress(&archive, |progress| {
                     progress.message = "本人说说接口暂时不可用，正在改用历史消息接口继续归档…".into();
                 });
+            }
+        }
+        if visible_summary.owner_name.is_none() {
+            set_progress(&archive, |progress| {
+                progress.message =
+                    "本人可见说说未提供昵称，正在通过 QQ 资料接口确认历史记录归属…".into();
+            });
+            match qzone::fetch_portrait_names(&login, [owner_uin.clone()]).await {
+                Ok(names) => {
+                    visible_summary.owner_name = names
+                        .get(&owner_uin)
+                        .map(String::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty() && *name != owner_uin)
+                        .map(str::to_owned);
+                }
+                Err(error) => {
+                    history_sync_error = Some(concise_archive_error(&format!(
+                        "无法补全本人昵称：{error}"
+                    )));
+                }
             }
         }
         match sync_history_messages(
@@ -2826,8 +2857,11 @@ pub async fn start_feed_archive(
     let quality_summary = archive_quality_summary(&app, &owner_uin).unwrap_or_default();
     let result = match interaction_result {
         Err(error)
-            if (visible_summary.moments > 0 || history_summary.records > 0)
-                && interaction_error_can_be_partial(&error) =>
+            if interaction_failure_can_finish(
+                &error,
+                visible_summary.moments,
+                history_summary.saved,
+            ) =>
         {
             Err(format!("ARCHIVE_INTERACTIONS_UNAVAILABLE:{error}"))
         }
@@ -4907,12 +4941,27 @@ pub async fn list_qzone_library_years(
 mod tests {
     use super::{
         advance_feed_cursor, archive_page_delay_ms, canonical_qzone_cell_id, checkpoint_is_stale,
-        comment_from_values, library_created_at, merge_comments, migrate_history_guestbook_records,
-        migrate_library_guestbook_timestamps, parse_feed, parse_feed_cursor, serialize_query_pairs,
-        skip_probe_offsets, video_cover_url, video_urls, ArchiveCheckpoint, FeedCursorDetails,
+        comment_from_values, interaction_failure_can_finish, library_created_at, merge_comments,
+        migrate_history_guestbook_records, migrate_library_guestbook_timestamps, parse_feed,
+        parse_feed_cursor, serialize_query_pairs, skip_probe_offsets, video_cover_url, video_urls,
+        ArchiveCheckpoint, FeedCursorDetails,
     };
     use rusqlite::{params, Connection};
     use serde_json::json;
+
+    #[test]
+    fn waf_block_finishes_after_desktop_channels_even_without_saved_rows() {
+        let error = "QQ 空间接口暂时不可用（获取空间动态失败：腾讯 WAF 拦截了移动端互动接口（HTTP 501 Not Implemented））。归档进度已保存";
+        assert!(interaction_failure_can_finish(error, 0, 0));
+    }
+
+    #[test]
+    fn unrelated_server_failure_still_fails_when_no_fallback_saved_data() {
+        let error = "QQ 空间接口暂时不可用（获取空间动态失败：HTTP 500 Internal Server Error）";
+        assert!(!interaction_failure_can_finish(error, 0, 0));
+        assert!(interaction_failure_can_finish(error, 1, 0));
+        assert!(interaction_failure_can_finish(error, 0, 1));
+    }
 
     #[test]
     fn parses_guestbook_wall_clock_time_after_zero_modify_time() {

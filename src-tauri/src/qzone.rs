@@ -1355,6 +1355,9 @@ pub async fn recover_recycle_photos(
 }
 
 fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<String> {
+    if is_tencent_waf_response(status, body) {
+        return None;
+    }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         return Some(format!("HTTP {status}"));
     }
@@ -1382,6 +1385,20 @@ fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<
         return Some("响应中暂时缺少 data".into());
     }
     None
+}
+
+fn is_tencent_waf_response(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::NOT_IMPLEMENTED
+        && body.contains("waf.tencent.com")
+        && body.contains("501page")
+}
+
+fn feed_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    if is_tencent_waf_response(status, body) {
+        "获取空间动态失败：腾讯 WAF 拦截了移动端互动接口（HTTP 501 Not Implemented）".into()
+    } else {
+        format!("获取空间动态失败：HTTP {status}")
+    }
 }
 
 fn feed_retry_delay(attempt: u32) -> std::time::Duration {
@@ -2612,6 +2629,14 @@ pub(crate) async fn fetch_history_messages(
                     let html = decode_history_html(&body)?;
                     let (record_count, feeds) =
                         history_html_as_feeds(&html, &auth.uin, owner_name, offset);
+                    if record_count > 0
+                        && owner_name.map(str::trim).is_none_or(|name| name.is_empty())
+                    {
+                        return Err(
+                            "历史消息包含记录，但无法确认本人昵称；为避免错配正文，本页未写入"
+                                .into(),
+                        );
+                    }
                     return Ok(HistoryMessagePage {
                         record_count,
                         feeds,
@@ -2756,6 +2781,10 @@ pub(crate) fn feed_error_is_transient(error: &str) -> bool {
         || ["系统繁忙", "稍后再试", "频繁", "限流"]
             .iter()
             .any(|keyword| error.contains(keyword))
+}
+
+pub(crate) fn feed_error_is_waf_block(error: &str) -> bool {
+    error.contains("腾讯 WAF 拦截了移动端互动接口")
 }
 
 async fn fetch_feeds_with_attempts(
@@ -2934,7 +2963,7 @@ async fn fetch_feeds_with_attempts(
         return Err(error);
     };
     if !status.is_success() {
-        let error = format!("获取空间动态失败：HTTP {status}");
+        let error = feed_http_error(status, &body);
         log_feed_request_error(
             "http_status",
             &request_url,
@@ -2990,9 +3019,9 @@ mod tests {
     use super::{
         decode_history_html, ensure_qzone_success, extract_qzone_token,
         extract_qzone_token_expression, feed_error_can_skip, feed_error_is_transient,
-        history_html_as_feeds, library_page_size, mood_cell_id_published_at, parse_feed_page,
-        parse_portrait_names, parse_qzone_json, retryable_response_reason, visible_moment_as_feeds,
-        FEEDS_URL,
+        feed_error_is_waf_block, feed_http_error, history_html_as_feeds, is_tencent_waf_response,
+        library_page_size, mood_cell_id_published_at, parse_feed_page, parse_portrait_names,
+        parse_qzone_json, retryable_response_reason, visible_moment_as_feeds, FEEDS_URL,
     };
     use reqwest::StatusCode;
     use serde_json::json;
@@ -3080,6 +3109,27 @@ mod tests {
             r#"{"code":-1,"message":"系统繁忙，请稍后再试"}"#,
         )
         .is_some());
+    }
+
+    #[test]
+    fn recognizes_tencent_waf_501_without_retrying_it() {
+        let body = r#"<script>location.href='https://waf.tencent.com/501page.html'</script>"#;
+        assert!(is_tencent_waf_response(StatusCode::NOT_IMPLEMENTED, body));
+        assert!(retryable_response_reason(StatusCode::NOT_IMPLEMENTED, body).is_none());
+        let error = feed_http_error(StatusCode::NOT_IMPLEMENTED, body);
+        assert!(feed_error_is_waf_block(&error));
+        assert!(feed_error_is_transient(&error));
+    }
+
+    #[test]
+    fn leaves_unrelated_501_responses_as_regular_server_errors() {
+        let body = "upstream proxy does not implement this request";
+        assert!(!is_tencent_waf_response(StatusCode::NOT_IMPLEMENTED, body));
+        assert!(retryable_response_reason(StatusCode::NOT_IMPLEMENTED, body).is_some());
+        assert!(!feed_error_is_waf_block(&feed_http_error(
+            StatusCode::NOT_IMPLEMENTED,
+            body
+        )));
     }
 
     #[test]

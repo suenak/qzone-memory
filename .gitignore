@@ -37,11 +37,21 @@ xiaohongshu-video-script.md
 sign-apk.bat
 .playwright-mcp
 .playwright-cli/
-output/playwright/
+# 审计与 QA 产物：截图、测试脚本、npm audit 导出、一次性 ps1 都在这里，整体忽略。
+output/
 src-tauri/license-core/target/
 .build-tools/
 build-output/
 public/sponsor/
+
+# 签名密钥库绝不入版本控制
+*.jks
+*.keystore
+
+
+# 内部安全审计报告：含私有服务端的源码路径，不进公开仓库
+docs/CODE-AUDIT-*.md
+
 
 # Never publish runtime data, credentials or management services
 output/

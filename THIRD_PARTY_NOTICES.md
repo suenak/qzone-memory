@@ -4,7 +4,6 @@ QQ Zone Restore Archive 基于或参考了以下开源项目。项目名称、�
 
 ## 主要上游
 
-- [xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive) — 本次公开快照所用衍生项目的基础，保留其作者和版权说明。
 - [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) — GPL-3.0；本项目的主要上游与二次开发基础。
 
 ## 接口与解析参考
