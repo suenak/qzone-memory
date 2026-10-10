@@ -384,7 +384,7 @@ async function refreshSeats() {
         <div class="about__head">
           <span class="about__mark" aria-hidden="true">忆</span>
           <div>
-            <strong>QQ Zone Restore Archive</strong>
+            <strong>拾忆</strong>
             <span>跨平台 QQ 空间恢复备份工具</span>
           </div>
           <span class="about__version">{{ appVersion ? `v${appVersion}` : "版本未知" }}</span>
