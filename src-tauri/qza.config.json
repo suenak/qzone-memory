@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "构建期部署配置。build.rs 会读取本文件，把下面四项生成成 Rust 常量。",
+    "",
+    "本文件随仓库公开，因此里面只能放占位值。真实部署值放在同目录的",
+    "qza.config.local.json（已在 .gitignore 中，不入库），或在构建时用同名环境变量覆盖。",
+    "",
+    "取值优先级：环境变量 > qza.config.local.json > 本文件。",
+    "",
+    "四项全部取自本文件时，生成的 CONFIG_IS_PLACEHOLDER 为 true，客户端会明确告知",
+    "「本构建未配置授权服务器」。这样占位构建是可见地失败，而不是让用户对着",
+    "一个笼统的网络错误猜原因。"
+  ],
+
+  "QZA_LICENSE_SERVER": "https://license.example.com",
+  "QZA_LICENSE_PUBLIC_KEY": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA2dESnOkaJgAVrQj6gQA6BdNdTPe2Qs5RBTbt2vhJwHc=\n-----END PUBLIC KEY-----\n",
+  "QZA_UPDATE_ENDPOINT": "https://updates.invalid/api/v1/update/latest",
+  "QZA_DOWNLOAD_PAGE": "https://updates.invalid/"
+}

@@ -26,12 +26,15 @@ use license_core::{
     LicensePayload, LicenseStatus,
 };
 
-/// 生产授权服务器地址。
+/// 授权服务器地址。
 ///
-/// 这是面向最终用户的默认值，指向部署在阿里云 ECS 上的授权服务。
+/// 值来自构建期生成的部署常量：打包机上的 `qza.config.local.json` 放真实地址，
+/// 公开仓库里的 `qza.config.json` 放占位地址。取值规则见 `build.rs`。
 /// 本地调试用 `scripts/build-local-windows.ps1` 注入
-/// `QZA_LICENSE_SERVER=http://127.0.0.1:8787` 覆盖，不必改动源码。
-const LICENSE_SERVER_DEFAULT: &str = "https://license.example.com";
+/// `QZA_LICENSE_SERVER=http://127.0.0.1:8787` 覆盖，不必改动任何文件。
+pub fn license_server() -> &'static str {
+    crate::qza_config::QZA_LICENSE_SERVER
+}
 
 /// 凭据库服务名，与 qlogin.rs 的 QQ 会话共用同一命名空间，但使用不同的 account。
 const CREDENTIAL_SERVICE: &str = "top.ehre.qzonearchive";
@@ -42,10 +45,6 @@ const CREDENTIAL_LICENSE: &str = "app-license-token";
 const HEARTBEAT_INTERVAL_SECONDS: i64 = 24 * 3600;
 /// 网络请求超时。
 const REQUEST_TIMEOUT_SECONDS: u64 = 20;
-
-pub fn license_server() -> &'static str {
-    option_env!("QZA_LICENSE_SERVER").unwrap_or(LICENSE_SERVER_DEFAULT)
-}
 
 fn now_seconds() -> i64 {
     SystemTime::now()
@@ -646,6 +645,16 @@ pub fn initialize(app: &tauri::AppHandle) {
             }
         }
         runtime.identity = Some(identity);
+    }
+
+    // 从公开源码直接构建时拿到的是占位配置，激活请求永远失败。占位地址下的失败会
+    // 被网络层折叠成一句笼统的「网络错误」，用户无从判断是配置问题还是服务问题，
+    // 所以在这里把它变成一句明确提示。已有更具体的错误时不覆盖。
+    if crate::qza_config::CONFIG_IS_PLACEHOLDER && last_error.is_none() {
+        last_error = Some(format!(
+            "本构建未配置授权服务器，激活请求会发往占位地址 {}",
+            license_server()
+        ));
     }
 
     runtime.last_error = last_error;
@@ -1400,18 +1409,16 @@ fn default_device_label() -> String {
     platform.to_owned()
 }
 
-/// 客户端内置的 Ed25519 公钥，即生产授权服务的签名公钥。
+/// 客户端内置的 Ed25519 公钥，用来验证服务端签发的授权凭证。
 ///
-/// 公钥公开无风险；私钥只存在于服务端 `/opt/qza-license/secrets/license_private.pem`，
-/// 由 `npm run gen-keys` 在该机器上生成后从未离开。改动这里的公钥等于让所有已签发的
-/// 授权 token 失效，因此不要用开发密钥覆盖它。
+/// 值来自构建期生成的部署常量。公钥公开无风险；对应的私钥只存在于服务端
+/// `/opt/qza-license/secrets/license_private.pem`，由 `npm run gen-keys` 在该机器上
+/// 生成后从未离开。改动这里的公钥等于让所有已签发的凭证失效。
 ///
-/// 指向自建服务端调试时用编译期环境变量 `QZA_LICENSE_PUBLIC_KEY` 覆盖，
-/// 否则用本地密钥签发的 token 会全部校验失败。
-pub const LICENSE_PUBLIC_KEY_PEM: &str = match option_env!("QZA_LICENSE_PUBLIC_KEY") {
-    Some(value) => value,
-    None => "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA2dESnOkaJgAVrQj6gQA6BdNdTPe2Qs5RBTbt2vhJwHc=\n-----END PUBLIC KEY-----\n",
-};
+/// 公开仓库里带的是占位公钥 —— 它能解析、但验不过任何真实凭证。自建授权服务时
+/// 必须在 `qza.config.local.json` 里换成自己的公钥，否则本地密钥签发的凭证会
+/// 全部校验失败。
+pub use crate::qza_config::QZA_LICENSE_PUBLIC_KEY as LICENSE_PUBLIC_KEY_PEM;
 
 #[cfg(test)]
 mod tests {

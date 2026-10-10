@@ -5,6 +5,15 @@ mod qlogin;
 mod qzone;
 mod updater;
 
+/// 构建期部署常量。
+///
+/// 内容由 `build.rs` 从 `qza.config.json` / `qza.config.local.json` 生成，
+/// 具体取值规则见 `build.rs` 顶部说明。这里只用 `include!` 把生成文件挂进来，
+/// 不写任何逻辑。
+pub(crate) mod qza_config {
+    include!(concat!(env!("OUT_DIR"), "/qza_config.rs"));
+}
+
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
     app.exit(0);

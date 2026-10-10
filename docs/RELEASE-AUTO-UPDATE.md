@@ -43,16 +43,21 @@
 
 ### 2.1 客户端：更新清单地址
 
-`src-tauri/src/updater.rs`：
+地址不写在源码里。`src-tauri/src/updater.rs` 只做了一层 `pub use` 别名，真正的值由
+`src-tauri/build.rs` 在构建期从配置读出：
 
-```rust
-pub const UPDATE_ENDPOINT: &str = "https://你的域名/api/v1/update/latest";
-pub const DOWNLOAD_PAGE: &str = "https://你的官网/download";   // 兜底地址
+```jsonc
+// src-tauri/qza.config.json（入库，占位值）或 src-tauri/qza.config.local.json（不入库，真实值）
+{
+  "QZA_UPDATE_ENDPOINT": "https://你的域名/api/v1/update/latest",
+  "QZA_DOWNLOAD_PAGE": "https://你的官网/"   // 兜底地址
+}
 ```
 
-两处都有编译期环境变量覆盖（`QZA_UPDATE_ENDPOINT` / `QZA_DOWNLOAD_PAGE`）,但直接改这里的默认值最省事。
+取值优先级：编译期环境变量 > `qza.config.local.json` > `qza.config.json`。仓库里带的是
+`https://updates.invalid/...`——**故意不可解析的保留域名**，克隆下来能编译但不会连到任何真实服务。
 
-> 仓库里目前是 `https://updates.invalid/...`——这是**故意不可解析的保留域名**,防止未配置就误上线。发布前必须替换。
+> 发布构建必须在打包机上提供 `qza.config.local.json`（或设置同名环境变量），否则打出来的包指向占位地址、无法激活。四项全为占位值时 `build.rs` 会发 `cargo:warning`，客户端也会明确提示「本构建未配置授权服务器」。
 
 `DOWNLOAD_PAGE` 是兜底：清单里带了 `download_page` 时以清单为准，这样改下载页不需要重新发客户端。
 

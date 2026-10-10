@@ -72,21 +72,15 @@ pub async fn fetch_update_manifest() -> Result<Option<UpdateManifest>, String> {
 
 /// 更新清单地址。
 ///
-/// 发布时用编译期环境变量 `QZA_UPDATE_ENDPOINT` 覆盖，或在源码里改这里的默认值。
-/// 清单格式见 `docs/RELEASE-AUTO-UPDATE.md`。
-pub const UPDATE_ENDPOINT: &str = match option_env!("QZA_UPDATE_ENDPOINT") {
-    Some(value) => value,
-    None => "https://license.example.com/api/v1/update/latest",
-};
+/// 值来自构建期生成的部署常量，取值规则见 `build.rs`。清单格式见
+/// `docs/RELEASE-AUTO-UPDATE.md`。
+pub use crate::qza_config::QZA_UPDATE_ENDPOINT as UPDATE_ENDPOINT;
 
 /// 官网下载页兜底地址。
 ///
 /// 优先级低于清单里的 `download_page`:清单可以随版本改地址，而不必重新发客户端。
 /// 只有清单没有给、或者解析失败时才用这里。
-pub const DOWNLOAD_PAGE: &str = match option_env!("QZA_DOWNLOAD_PAGE") {
-    Some(value) => value,
-    None => "https://qzone.example.com/",
-};
+pub use crate::qza_config::QZA_DOWNLOAD_PAGE as DOWNLOAD_PAGE;
 
 #[tauri::command]
 pub fn update_endpoint() -> String {

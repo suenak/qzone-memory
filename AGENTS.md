@@ -86,12 +86,17 @@ install started.
   names for possible future use and is not consumed today.
 - The manifest request runs in Rust, with a 10-second timeout and a 512 KiB response limit.
   It accepts no endpoint argument or QQ credentials from the frontend; WebView CSP stays narrow.
-- Endpoint and fallback download page are constants in `src-tauri/src/updater.rs`, each overridable
-  at compile time via `QZA_UPDATE_ENDPOINT` / `QZA_DOWNLOAD_PAGE`. Their defaults point at the
-  production deployment — `https://license.example.com/api/v1/update/latest` and
-  `https://qzone.example.com/`. Earlier revisions defaulted to a reserved `.invalid` host so an
-  unconfigured build failed visibly; that stopped being useful once a real deployment existed, and
-  a build that cannot reach the manifest now silently reports "up to date", which is worse.
+- Deployment constants — the update endpoint, the fallback download page, the licence server
+  address and the embedded verification public key — are **not** written into the source. They are
+  read at build time by `src-tauri/build.rs` and generated into `qza_config.rs`. Resolution order:
+  compile-time environment variable (`QZA_UPDATE_ENDPOINT`, `QZA_DOWNLOAD_PAGE`,
+  `QZA_LICENSE_SERVER`, `QZA_LICENSE_PUBLIC_KEY`) → `src-tauri/qza.config.local.json` (untracked,
+  holds a machine's real values) → `src-tauri/qza.config.json` (tracked, holds placeholders).
+  The public repository ships placeholders, so a clone builds and runs but cannot activate. When
+  all four resolve to placeholders `build.rs` emits a warning and sets `CONFIG_IS_PLACEHOLDER`, and
+  the licence layer surfaces "本构建未配置授权服务器" instead of letting the user guess at a generic
+  network error. Publishing a real build means supplying `qza.config.local.json` on the build
+  machine; never commit one.
 
 Server side, `QZA_DOWNLOAD_PAGE` is what the manifest advertises; publishing no longer requires
 minisign signatures. Release steps: [docs/RELEASE-AUTO-UPDATE.md](docs/RELEASE-AUTO-UPDATE.md).
