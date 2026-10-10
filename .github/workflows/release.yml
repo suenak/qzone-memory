@@ -461,9 +461,12 @@ jobs:
           nix build --extra-experimental-features "nix-command flakes" -L .#qzonearchive
 
           host="$(node -p 'new URL(process.env.QZA_LICENSE_SERVER).host')"
-          if ! grep -qF "$host" result/bin/qzonearchive; then
+          # wrapGAppsHook4 renames the real executable to .qzonearchive-wrapped;
+          # result/bin/qzonearchive is only a shell wrapper without the string.
+          binary="result/bin/.qzonearchive-wrapped"
+          if ! grep -qF "$host" "$binary"; then
             echo "The NixOS binary still carries the placeholder deployment config."
-            echo "Expected the licence host to appear in result/bin/qzonearchive: $host"
+            echo "Expected the licence host to appear in $binary: $host"
             exit 1
           fi
 
@@ -490,7 +493,7 @@ jobs:
           CLOSURE="$HERE/qzonearchive.closure"
 
           command -v nix >/dev/null 2>&1 || { echo "错误: 未找到 nix，请先安装 NixOS 或 Nix。" >&2; exit 1; }
-          [ -f "$CLOSURE" ] || { echo "错误: 缺少 $CLOSURE，请确认压缩包完整。" >&2; exit 1; }
+          [ -f "$CLOSURE" ] || { echo "错误: 缺少 ${CLOSURE}，请确认压缩包完整。" >&2; exit 1; }
 
           # 已安装则跳过（幂等）
           if nix --extra-experimental-features "nix-command flakes" profile list 2>/dev/null \

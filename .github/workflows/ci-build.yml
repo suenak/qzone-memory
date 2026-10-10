@@ -226,7 +226,7 @@ jobs:
             echo "::error::$ipa 里的部署配置是占位值，缺少 $host"
             exit 1
           fi
-          echo "部署配置已进入 ipa：$host（$ipa）"
+          echo "deployment config present in the ipa: ${host} (${ipa})"
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-ios-unsigned-${{ github.sha }}
@@ -251,8 +251,16 @@ jobs:
         run: |
           set -euo pipefail
           host="$(node -p 'new URL(process.env.QZA_LICENSE_SERVER).host')"
-          grep -qF "$host" result/bin/qzonearchive
-          echo "部署配置已进入 NixOS 包：$host"
+
+          # wrapGAppsHook4 把真正的可执行文件改名成 .qzonearchive-wrapped，
+          # result/bin/qzonearchive 只是个壳脚本，字符串不在里面。
+          binary="result/bin/.qzonearchive-wrapped"
+          test -x "$binary"
+          if ! grep -qF "$host" "$binary"; then
+            echo "::error::the NixOS binary still carries the placeholder deployment config"
+            exit 1
+          fi
+          echo "deployment config present in the NixOS package: ${host}"
       - name: Package Nix closure
         run: |
           mkdir -p dist/nix
