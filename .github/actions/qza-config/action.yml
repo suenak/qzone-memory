@@ -1,0 +1,39 @@
+name: Write the deployment config
+description: >-
+  Write the four deployment constants into src-tauri/qza.config.local.json for build.rs.
+  Reads the workflow-level env (QZA_LICENSE_SERVER, QZA_LICENSE_PUBLIC_KEY,
+  QZA_UPDATE_ENDPOINT, QZA_DOWNLOAD_PAGE), which comes from repository secrets.
+
+# 为什么落成文件，而不是只靠 env：
+# build.rs 的取值顺序是「环境变量 > qza.config.local.json > qza.config.json」。
+# 桌面平台两条路都通，但 iOS 不行 —— `tauri ios build` 把 Rust 那一步交给 Xcode
+# 的构建阶段执行，环境经过裁剪，工作流 env 到不了 build.rs，于是它静默退回仓库里
+# 的占位配置，打出来的 ipa 指向 license.example.com，装上也激活不了。文件路径由
+# CARGO_MANIFEST_DIR 决定，不受环境影响，所以两种机制同时保留：env 优先，文件兜底。
+runs:
+  using: composite
+  steps:
+    - name: Write src-tauri/qza.config.local.json
+      shell: bash
+      run: |
+        set -euo pipefail
+        node -e '
+          const fs = require("fs");
+          const keys = [
+            "QZA_LICENSE_SERVER",
+            "QZA_LICENSE_PUBLIC_KEY",
+            "QZA_UPDATE_ENDPOINT",
+            "QZA_DOWNLOAD_PAGE",
+          ];
+          const missing = keys.filter((key) => !process.env[key]);
+          if (missing.length > 0) {
+            console.error("::error::缺少部署配置：" + missing.join("、"));
+            process.exit(1);
+          }
+          const config = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+          fs.writeFileSync(
+            "src-tauri/qza.config.local.json",
+            JSON.stringify(config, null, 2) + "\n",
+          );
+          console.log("已写入 src-tauri/qza.config.local.json（四项部署常量均来自 secret）");
+        '

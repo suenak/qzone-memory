@@ -1,0 +1,68 @@
+name: Assert the deployment config reached the build
+description: >-
+  Check that build.rs actually baked the real licence host into the build, by reading the
+  qza_config.rs it generated under src-tauri/target.
+
+# 为什么需要这一步：build.rs 在没有真实值时不会报错，只会把占位配置烤进二进制，
+# 产出一个装上也激活不了的包。日志里那句 `QZA_LICENSE_SERVER 来自环境变量` 是
+# 可信的，但 iOS 的构建输出被 Xcode 吞掉了，看不见。所以在这里直接读 build.rs
+# 的产物 —— 文件在就在，内容骗不了人。
+runs:
+  using: composite
+  steps:
+    - name: Check the generated qza_config.rs
+      shell: bash
+      run: |
+        set -euo pipefail
+        node -e '
+          const fs = require("fs");
+          const path = require("path");
+
+          const hits = [];
+          const collect = (buildDir) => {
+            let entries = [];
+            try {
+              entries = fs.readdirSync(buildDir);
+            } catch {
+              return;
+            }
+            for (const name of entries) {
+              if (!name.startsWith("qzonearchive-")) continue;
+              const file = path.join(buildDir, name, "out", "qza_config.rs");
+              if (fs.existsSync(file)) hits.push(file);
+            }
+          };
+
+          // 本机构建落在 target/<profile>/build，交叉编译落在 target/<triple>/<profile>/build。
+          let top = [];
+          try {
+            top = fs.readdirSync("src-tauri/target");
+          } catch {
+            top = [];
+          }
+          for (const name of top) {
+            collect(path.join("src-tauri/target", name, "build"));
+            collect(path.join("src-tauri/target", name, "release", "build"));
+          }
+
+          if (hits.length === 0) {
+            console.log("::warning::没有找到 build.rs 生成的 qza_config.rs，跳过这项检查");
+            process.exit(0);
+          }
+
+          hits.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          const newest = hits[0];
+          const host = new URL(process.env.QZA_LICENSE_SERVER).host;
+          const body = fs.readFileSync(newest, "utf8");
+
+          if (!body.includes(host)) {
+            console.error("::error::构建里的部署配置不是真实值，缺少 " + host + "（" + newest + "）");
+            for (const line of body.split("\n")) {
+              if (line.includes("LICENSE_SERVER") || line.includes("UPDATE_ENDPOINT")) {
+                console.error("  " + line);
+              }
+            }
+            process.exit(1);
+          }
+          console.log("部署配置已进入构建：" + host + "（" + newest + "）");
+        '

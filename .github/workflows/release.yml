@@ -37,7 +37,12 @@ concurrency:
   cancel-in-progress: false
 
 # 部署常量在构建期由 build.rs 注入（见 src-tauri/build.rs）。仓库里只有占位值，
-# 真实值存在仓库 secret 里。不设置这四项，发布的包会指向占位地址、无法激活。
+# 真实值存在仓库 secret 里。不提供这四项，发布的包会指向占位地址、无法激活。
+#
+# 两条注入路径同时保留：工作流 env 管桌面平台，qza-config 动作写出的
+# src-tauri/qza.config.local.json 管 iOS —— `tauri ios build` 把 Rust 编译交给
+# Xcode，环境被裁剪，env 到不了 build.rs。构建后由 qza-verify（以及 iOS 那步
+# 额外的开袋检查）核对真实产物，避免又安静地发布一批废包。
 env:
   QZA_LICENSE_SERVER: ${{ secrets.QZA_LICENSE_SERVER }}
   QZA_LICENSE_PUBLIC_KEY: ${{ secrets.QZA_LICENSE_PUBLIC_KEY }}
@@ -67,8 +72,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - uses: ./.github/actions/qza-config
+
       - name: Build Windows
         run: npx tauri build --bundles nsis
+
+      - uses: ./.github/actions/qza-verify
 
       - name: Show Windows artifacts
         if: always()
@@ -113,8 +122,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - uses: ./.github/actions/qza-config
+
       - name: Build macOS x64
         run: npx tauri build --target x86_64-apple-darwin --bundles dmg
+
+      - uses: ./.github/actions/qza-verify
 
       - name: Show macOS x64 artifacts
         if: always()
@@ -155,8 +168,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - uses: ./.github/actions/qza-config
+
       - name: Build macOS ARM64
         run: npx tauri build --target aarch64-apple-darwin --bundles dmg
+
+      - uses: ./.github/actions/qza-verify
 
       - name: Show macOS ARM64 artifacts
         if: always()
@@ -234,8 +251,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - uses: ./.github/actions/qza-config
+
       - name: Build Android
         run: npx tauri android build --target aarch64
+
+      - uses: ./.github/actions/qza-verify
 
       - name: Find generated Android artifacts
         if: always()
@@ -354,8 +375,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - uses: ./.github/actions/qza-config
+
       - name: Build Linux bundles
         run: npx tauri build --bundles appimage,deb,rpm
+
+      - uses: ./.github/actions/qza-verify
 
       - name: Verify AppImage portability and startup
         shell: bash
@@ -416,12 +441,31 @@ jobs:
           rustc --version || true
           cargo --version || true
 
+      - uses: ./.github/actions/qza-config
+
+      - name: Stage the deployment config into the flake source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # nix 只按 git 索引挑文件进构建沙箱，而 qza.config.local.json 正好被
+          # .gitignore 排除 —— 不强制入库，build.rs 在沙箱里读不到它就会退回占位值。
+          git add -f src-tauri/qza.config.local.json
+          test -f src-tauri/qza.config.local.json
+
       - name: Package Nix result
         shell: bash
         run: |
           set -euo pipefail
 
           nix build --extra-experimental-features "nix-command flakes" -L .#qzonearchive
+
+          host="$(node -p 'new URL(process.env.QZA_LICENSE_SERVER).host')"
+          if ! grep -qF "$host" result/bin/qzonearchive; then
+            echo "The NixOS binary still carries the placeholder deployment config."
+            echo "Expected the licence host to appear in result/bin/qzonearchive: $host"
+            exit 1
+          fi
 
           DRV_OUT_PATH="$(readlink -f result)"
           echo "Nix output: $DRV_OUT_PATH"
@@ -569,6 +613,8 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - uses: ./.github/actions/qza-config
 
       - name: Check Tauri CLI
         shell: bash
@@ -791,6 +837,16 @@ jobs:
           test -f "$APP_PATH/AppIcon60x60@2x.png"
           grep -a -q "assets/index-" "$APP_PATH/$EXECUTABLE"
 
+          # 部署常量必须真的烤进二进制。iOS 的 Rust 编译在 Xcode 构建阶段里跑，
+          # 工作流 env 到不了 build.rs，靠 qza-config 写出的本地配置兜底 ——
+          # 少了这层检查，占位配置会安静地变成一包装上也激活不了的 ipa。
+          LICENSE_HOST="$(node -p 'new URL(process.env.QZA_LICENSE_SERVER).host')"
+          if ! grep -a -qF "$LICENSE_HOST" "$APP_PATH/$EXECUTABLE"; then
+            echo "The iOS executable still carries the placeholder deployment config."
+            echo "Expected the licence host to appear in $APP_PATH/$EXECUTABLE: $LICENSE_HOST"
+            exit 1
+          fi
+
           # Published releases must remain unsigned.
           test ! -d "$APP_PATH/_CodeSignature"
           test ! -f "$APP_PATH/embedded.mobileprovision"
@@ -805,6 +861,7 @@ jobs:
           echo "  privacy manifest: present"
           echo "  custom icon: present"
           echo "  embedded frontend: present"
+          echo "  deployment config: present ($LICENSE_HOST)"
           echo "  code signature: absent"
 
       - name: Upload unsigned iOS IPA

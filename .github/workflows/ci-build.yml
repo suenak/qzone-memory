@@ -13,7 +13,13 @@ concurrency:
   cancel-in-progress: true
 
 # 部署常量在构建期由 build.rs 注入（见 src-tauri/build.rs）。仓库里只有占位值，
-# 真实值存在仓库 secret 里。不设置这四项，打出来的包会指向占位地址、无法激活。
+# 真实值存在仓库 secret 里。不提供这四项，打出来的包会指向占位地址、无法激活。
+#
+# 两条注入路径同时保留，缺一不可：
+#   1. 工作流级 env（下面的 env: 块）—— 桌面平台走这条；
+#   2. src-tauri/qza.config.local.json（qza-config 动作写出）—— iOS 走这条，
+#      因为 `tauri ios build` 把 Rust 编译交给 Xcode，环境被裁剪，env 到不了。
+# 构建后由 qza-verify 动作核对 build.rs 的真实产物，避免又安静地打出一批废包。
 env:
   QZA_LICENSE_SERVER: ${{ secrets.QZA_LICENSE_SERVER }}
   QZA_LICENSE_PUBLIC_KEY: ${{ secrets.QZA_LICENSE_PUBLIC_KEY }}
@@ -31,8 +37,10 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri build --bundles nsis
+      - uses: ./.github/actions/qza-verify
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-windows-${{ github.sha }}
@@ -59,8 +67,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri build --target ${{ matrix.target }} --bundles dmg
+      - uses: ./.github/actions/qza-verify
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-${{ matrix.artifact }}-${{ github.sha }}
@@ -100,8 +110,10 @@ jobs:
             -o "$cache_dir/AppRun-$arch"
           chmod 0755 "$cache_dir/AppRun-$arch"
           test "$(stat -c '%a' "$cache_dir/AppRun-$arch")" = "755"
+      - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri build --bundles appimage,deb,rpm
+      - uses: ./.github/actions/qza-verify
       - name: Verify AppImage portability and startup
         run: |
           set -euo pipefail
@@ -146,8 +158,10 @@ jobs:
             "ndk;27.0.12077973"
           echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri android build --target aarch64
+      - uses: ./.github/actions/qza-verify
       - name: Restore Android keystore
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -193,9 +207,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri ios init --ci
       - run: npx tauri ios build --target aarch64 --ci --no-sign
+      # iOS 的 Rust 编译在 Xcode 构建阶段里跑，cargo 的输出不会出现在日志里，
+      # qza-verify 也只能看到 target 目录的常规位置。所以这里直接开袋检查 ipa。
+      - name: Assert the ipa carries the real deployment config
+        run: |
+          set -euo pipefail
+          host="$(node -p 'new URL(process.env.QZA_LICENSE_SERVER).host')"
+          ipa="$(find src-tauri/gen/apple -type f -name '*.ipa' -print -quit)"
+          test -n "$ipa"
+          binary="$RUNNER_TEMP/ios-binary"
+          unzip -p "$ipa" 'Payload/*/qzone-memory' > "$binary"
+          test -s "$binary"
+          if ! grep -qF "$host" "$binary"; then
+            echo "::error::$ipa 里的部署配置是占位值，缺少 $host"
+            exit 1
+          fi
+          echo "部署配置已进入 ipa：$host（$ipa）"
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-ios-unsigned-${{ github.sha }}
@@ -209,8 +240,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v16
+      - uses: ./.github/actions/qza-config
+      # flake 打包源码时会跳过 .gitignore 命中的路径，而 qza.config.local.json 正是
+      # 被忽略的那个，所以必须先强制入索引，否则 nix 沙箱里的 build.rs 读不到它。
+      - name: Stage the deployment config into the flake source
+        run: git add -f src-tauri/qza.config.local.json
       - name: Build NixOS package
         run: nix build -L .#qzonearchive
+      - name: Assert the NixOS package carries the real config
+        run: |
+          set -euo pipefail
+          host="$(node -p 'new URL(process.env.QZA_LICENSE_SERVER).host')"
+          grep -qF "$host" result/bin/qzonearchive
+          echo "部署配置已进入 NixOS 包：$host"
       - name: Package Nix closure
         run: |
           mkdir -p dist/nix
