@@ -80,7 +80,8 @@
         "languages": ["SimpChinese", "English"],
         "displayLanguageSelector": false,
         "compression": "lzma",
-        "startMenuFolder": "拾忆"
+        "startMenuFolder": "拾忆",
+        "installerHooks": "nsis-hooks.nsh"
       },
       "wix": {
         "upgradeCode": "24779296-0f03-5f99-83ea-fc2fcda733b9",
