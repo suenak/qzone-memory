@@ -4,7 +4,8 @@ import { computed, ref } from "vue";
 import { getQzoneLoginUser, type LoginCredentials, openWebLogin, checkWebLogin, syncCookiesToWebview } from "../utils/qlogin";
 import { useRecycleSessionStore } from "./recycle";
 
-export interface LoginUser {
+/** 仅本 store 内部使用：外部通过 user.value 读取即可，全仓没有 import type 引用，不需要导出。 */
+interface LoginUser {
   uin: string;
   nickname: string;
   avatarImage?: string;
@@ -56,16 +57,22 @@ export const useAuthStore = defineStore("auth", () => {
   }
 
   async function openLogin() {
+    // 网页登录模式不能跨对话框残留：每次打开都从扫码开始，否则会看到「登录窗口已打开」，而实际在跑的是扫码轮询。
+    webLoginMode.value = false;
     dialogVisible.value = true;
     if (!loggedIn.value) await refreshQrCode();
   }
 
   function closeLogin() {
     dialogVisible.value = false;
+    // 关闭时一并退出网页登录模式，避免下次打开时界面与真实轮询状态错位。
+    webLoginMode.value = false;
     pollingRun += 1;
   }
 
   async function refreshQrCode() {
+    // 扫码与网页登录互斥：一进入扫码流程就退出网页登录模式，保证模板走二维码分支。
+    webLoginMode.value = false;
     const run = ++pollingRun;
     loading.value = true;
     qrImage.value = "";
@@ -140,7 +147,9 @@ export const useAuthStore = defineStore("auth", () => {
           return;
         }
         if (result.status === "webLoginCancelled") {
+          // 用户在 QQ 登录窗口里取消：退回扫码时必须重新取二维码，否则会停在既无二维码也无按钮的空档。
           webLoginMode.value = false;
+          if (dialogVisible.value) void refreshQrCode();
           return;
         }
         if (result.status === "error") return;
@@ -165,6 +174,8 @@ export const useAuthStore = defineStore("auth", () => {
     status.value = "loggedOut";
     message.value = "使用手机 QQ 扫码登录";
     loading.value = false;
+    // 回到扫码后必须重新取二维码：否则 qrState 归为 waiting，界面上既没有二维码也没有刷新按钮，用户只能关掉对话框重开。
+    if (dialogVisible.value) void refreshQrCode();
   }
 
   async function logout() {

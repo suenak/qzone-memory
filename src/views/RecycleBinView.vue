@@ -88,14 +88,20 @@ function responseAlbumId(response: Record<string, unknown>) {
 }
 async function loadPhotos(albumId = "") {
   const sequence = ++photoSequence;
-  loading.value = true; error.value = ""; selectedIds.value = []; activeAlbumId.value = albumId;
+  // 预览失败标记与新的一批照片一一对应：不重置的话，「刷新」后会有一批卡片
+  // 永远走失败回退分支，刷新对它们永久失效。
+  loading.value = true; error.value = ""; selectedIds.value = []; resetSelectedSets();
+  activeAlbumId.value = albumId;
   try {
     const mapped = mapPhotos(await listRecyclePhotos(token.value, albumId || undefined), albumId);
     if (sequence !== photoSequence) return;
     photos.value = mapped;
     const previews = await Promise.all(mapped.map(async (photo) => {
       if (!photo.url || photo.url.startsWith("data:")) return photo;
-      try { return { ...photo, url: await loadRecyclePhotoPreview(photo.url) }; } catch { return photo; }
+      try { return { ...photo, url: await loadRecyclePhotoPreview(photo.url) }; }
+      // 取回失败时把地址置空，而不是留下原始 http 地址：那个地址是后端刻意
+      // 拒绝加载的非 QQ 域名，交给 <img> 只会得到一个永不消失的骨架。
+      catch { return { ...photo, url: undefined }; }
     }));
     if (sequence === photoSequence) photos.value = previews;
   }
@@ -103,9 +109,16 @@ async function loadPhotos(albumId = "") {
   finally { if (sequence === photoSequence) loading.value = false; }
 }
 async function loadAll() {
-  loading.value = true; error.value = "";
-  try { albums.value = mapAlbums(await listRecycleAlbums(token.value)); await loadPhotos(); }
-  catch (reason) { error.value = String(reason); loading.value = false; }
+  // 与 loadPhotos 共用序号：并发点两次「刷新」时，先发的响应不再覆盖后发的结果。
+  const sequence = ++photoSequence;
+  loading.value = true; error.value = ""; resetSelectedSets();
+  try {
+    const mapped = mapAlbums(await listRecycleAlbums(token.value));
+    if (sequence !== photoSequence) return;
+    albums.value = mapped;
+    await loadPhotos();
+  }
+  catch (reason) { if (sequence === photoSequence) { error.value = String(reason); loading.value = false; } }
 }
 async function verify() {
   if (!auth.loggedIn) { await auth.openLogin(); return; }
@@ -132,7 +145,14 @@ async function verify() {
     }
     while (run === verifyRun && verifying.value) {
       const result = await checkRecyclePassword();
-      if (result) { recycleSession.setVerified(result, auth.user?.uin ?? ""); verifying.value = false; await closeRecyclePasswordWindow(); await loadAll(); return; }
+      if (result) {
+        recycleSession.setVerified(result, auth.user?.uin ?? ""); verifying.value = false;
+        /* 收尾各自兜错：签名已经写入，关窗或加载失败都只是收尾问题，
+         * 抛到同一个 catch 会得到「已验证 + 列表空白 + 错误提示」的矛盾界面。 */
+        try { await closeRecyclePasswordWindow(); } catch { /* 关窗失败不影响后续加载 */ }
+        try { await loadAll(); } catch (reason) { error.value = String(reason); }
+        return;
+      }
       await delay(1200);
     }
   } catch (reason) { error.value = String(reason); verifying.value = false; }
@@ -169,35 +189,49 @@ async function recover() {
     const group = groups.get(photo.sourceAlbumId) ?? [];
     group.push(photo.id); groups.set(photo.sourceAlbumId, group);
   }
-  recovering.value = true; error.value = "";
+  recovering.value = true; error.value = ""; recoveredCount.value = 0;
+  let targetAlbumId = destinationAlbumId.value;
   try {
-    let targetAlbumId = destinationAlbumId.value;
     if (destinationMode.value === "create") {
       const name = recoveryAlbumName.value.trim();
       if (!name) throw new Error("请输入新相册名称");
       const beforeAlbums = mapAlbums(await listQzoneAlbums());
-      const previousIds = new Set(beforeAlbums.map((album) => album.id));
-      const created = await createQzoneAlbum(name);
-      targetAlbumId = "";
-      for (let attempt = 0; attempt < 3 && !targetAlbumId; attempt += 1) {
-        const refreshed = mapAlbums(await listQzoneAlbums());
-        targetAlbumId = refreshed.find((album) => album.name === name && !previousIds.has(album.id))?.id ?? "";
-        if (!targetAlbumId && attempt < 2) await delay(300 * (attempt + 1));
+      // 幂等：第二次重试时不能再看「调用前不存在」，否则会再建一个同名相册，
+      // 照片散落在两个相册里。同名相册存在就直接复用。
+      const existing = beforeAlbums.find((album) => album.name === name);
+      targetAlbumId = existing?.id ?? "";
+      if (!targetAlbumId) {
+        const previousIds = new Set(beforeAlbums.map((album) => album.id));
+        const created = await createQzoneAlbum(name);
+        for (let attempt = 0; attempt < 3 && !targetAlbumId; attempt += 1) {
+          const refreshed = mapAlbums(await listQzoneAlbums());
+          targetAlbumId = refreshed.find((album) => album.name === name && !previousIds.has(album.id))?.id ?? "";
+          if (!targetAlbumId && attempt < 2) await delay(300 * (attempt + 1));
+        }
+        targetAlbumId ||= responseAlbumId(created);
+        if (!targetAlbumId) throw new Error("相册已创建，但响应中缺少相册 ID，请刷新后重试");
+        // 新相册会先出现在列表服务中，照片恢复服务通常还需要短暂同步。
+        await delay(1800);
       }
-      targetAlbumId ||= responseAlbumId(created);
-      if (!targetAlbumId) throw new Error("相册已创建，但响应中缺少相册 ID，请刷新后重试");
-      // 新相册会先出现在列表服务中，照片恢复服务通常还需要短暂同步。
-      await delay(1800);
     } else if (!targetAlbumId) {
       throw new Error("请选择恢复目标相册");
     }
-    for (const [sourceAlbumId, ids] of groups) {
+    // 逐组串行恢复，成功的分组立刻从待办剔除：再点「确认恢复」只会请求失败的那部分，
+    // 不会把已经恢复的照片重复提交一遍。
+    for (const [sourceAlbumId, ids] of [...groups]) {
       if (!sourceAlbumId) throw new Error("照片缺少回收站来源相册 ID");
       await recoverRecyclePhotos(token.value, sourceAlbumId, targetAlbumId, ids);
+      groups.delete(sourceAlbumId);
+      recoveredCount.value += ids.length;
     }
     confirmVisible.value = false; await loadPhotos(activeAlbumId.value);
   }
-  catch (reason) { error.value = String(reason); }
+  catch (reason) {
+    // 部分成功时把已恢复数量说清楚，用户才知道剩下几张还需要重试。
+    error.value = recoveredCount.value
+      ? `本次已成功恢复 ${recoveredCount.value} 张照片，其余照片未恢复：${String(reason)}`
+      : String(reason);
+  }
   finally { recovering.value = false; }
 }
 function openAlbumRecoverDialog(album: Album) { albumRecoverTarget.value = album; }
@@ -211,7 +245,17 @@ async function recoverAlbum() {
   } catch (reason) { error.value = String(reason); }
   finally { albumRecovering.value = false; }
 }
-function resetVerification() { photoSequence += 1; recycleSession.clear(); photos.value = []; albums.value = []; selectedIds.value = []; }
+function resetVerification() {
+  // 先让在飞的验证轮询失效并停止，再清前端会话；否则旧会话清空后，
+  // 仍在跑的轮询可能把刚验证到的签名重新写回去。
+  verifyRun += 1;
+  verifying.value = false;
+  photoSequence += 1;
+  recycleSession.clear(); photos.value = []; albums.value = []; selectedIds.value = [];
+  resetSelectedSets();
+  // 后端仍持有旧签名；关闭验证窗口后，下一次「验证独立密码」会开新窗口并清掉它。
+  if (isTauri()) void closeRecyclePasswordWindow().catch(() => {});
+}
 onMounted(() => {
   if (token.value && ownerUin.value === (auth.user?.uin ?? "")) void loadAll();
   else if (token.value) recycleSession.clear();
@@ -222,13 +266,23 @@ onBeforeUnmount(() => { verifyRun += 1; verifying.value = false; if (isTauri()) 
  * 以下全部是展示用状态，不触碰上面的业务逻辑：
  * 步骤指示、已加载标记、预览可见性、图片加载失败标记、危险操作二次确认。 */
 
+/** 预览失败标记与可见集合一起复位；由 loadPhotos / loadAll / resetVerification 调用。 */
+function resetSelectedSets() {
+  failedPreviewIds.value = new Set();
+  visiblePhotoIds.value = new Set();
+}
+
 const toast = useToast();
 const visiblePhotoIds = ref(new Set<string>());
 const failedPreviewIds = ref(new Set<string>());
 const recoverConfirmed = ref(false);
+/** 本次恢复流程里已经成功的照片数：部分失败时用它给出「已成功恢复 N 张」。 */
+const recoveredCount = ref(0);
 /** 恢复是否成功结束：只在成功关闭弹窗后给一次提示。 */
 const recoverSucceeded = ref(false);
 let observer: IntersectionObserver | undefined;
+/** 已经交给观察器的卡片，补观察时用它去重，避免重复 observe 与全量重查。 */
+const observedCards = new WeakSet<Element>();
 
 /** 当前步骤：1 验证独立密码 → 2 选择内容 → 3 恢复。 */
 const currentStep = computed(() => {
@@ -255,7 +309,9 @@ const visiblePhotoIds$ = computed(() => photos.value.map((item) => item.id));
 
 /** 预览仍在从 QQ 服务端取回：此时显示占位骨架，而不是空的图片框。 */
 function photoPending(photo: Photo) {
-  return !photo.url || /^https?:/i.test(photo.url);
+  // 取回失败时 url 已被置空，所以这里只看有没有真实地址：
+  // 不再把 http(s) 地址当成「待取回」，避免加载失败后落进永不消失的骨架。
+  return !photo.url;
 }
 
 function photoFailed(photo: Photo) {
@@ -266,19 +322,33 @@ function markPreviewFailed(photo: Photo) {
   failedPreviewIds.value = new Set(failedPreviewIds.value).add(photo.id);
 }
 
-/** 只观察已经解析出真实图片地址的卡片，未解析的正由后端逐张取回。 */
-function observeCards() {
-  observer?.disconnect();
-  if (typeof IntersectionObserver === "undefined") return;
+/** 观察器实例：懒建一次后长期复用，不再每次重绘都 disconnect + 新建。 */
+function ensureObserver() {
+  if (observer || typeof IntersectionObserver === "undefined") return observer;
   observer = new IntersectionObserver((entries) => {
     const next = new Set(visiblePhotoIds.value);
     for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
       const id = (entry.target as HTMLElement).dataset.photoId;
       if (id) next.add(id);
     }
+    /* 集合内容没变就不赋值：这个 Set 参与渲染求值，每次新实例都会触发重渲染，
+     * 而 onUpdated 又会补观察卡片 → 形成无限循环。 */
+    if (next.size === visiblePhotoIds.value.size && [...next].every((id) => visiblePhotoIds.value.has(id))) return;
     visiblePhotoIds.value = next;
   }, { rootMargin: "240px 0px" });
-  document.querySelectorAll<HTMLElement>(".photo-grid [data-photo-id]").forEach((element) => observer?.observe(element));
+  return observer;
+}
+
+/** 观察器只建一次，这里只把「新出现的」卡片补进去，不再做全量 DOM 查询。 */
+function observeCards() {
+  const current = ensureObserver();
+  if (!current) return;
+  document.querySelectorAll<HTMLElement>(".photo-grid [data-photo-id]").forEach((element) => {
+    if (observedCards.has(element)) return;
+    observedCards.add(element);
+    current.observe(element);
+  });
 }
 
 function toggleVisibleSelection() {
@@ -290,6 +360,8 @@ function toggleVisibleSelection() {
 
 function confirmWithRecover() {
   if (!recoverConfirmed.value || recovering.value) return;
+  // 重试前清掉上一次的失败说明，避免旧的「已成功恢复 N 张」残留在弹窗里。
+  error.value = "";
   recoverSucceeded.value = false;
   void recover();
 }
@@ -357,9 +429,9 @@ onMounted(() => {
   // 页面进入时若已有验证签名，业务侧的 onMounted 会加载数据；这里只负责接入观察器。
   observeCards();
 });
-// 照片列表每次重绘后重新观察（预览是逐张异步解析出来的）。
+// 照片列表每次重绘后只补充观察新卡片（预览是逐张异步解析出来的），不再重建观察器。
 onUpdated(() => { observeCards(); });
-onBeforeUnmount(() => observer?.disconnect());
+onBeforeUnmount(() => { observer?.disconnect(); observer = undefined; });
 </script>
 
 <template>
@@ -478,6 +550,8 @@ onBeforeUnmount(() => observer?.disconnect());
           <span>{{ friendlyError(error) }}</span>
           <Button label="刷新重试" size="small" severity="secondary" outlined @click="loadAll" ><template #icon><RefreshCw :size="16" :stroke-width="1.8" /></template></Button>
         </div>
+        <!-- 后端固定只返回最近 18 张（size=18, dayNum=90），文案不能暗示「全部」。 -->
+        <p v-if="!activeAlbum" class="list-note">当前显示最近 90 天内回收的前 18 张照片，勾选后可恢复到指定相册。</p>
       </SectionCard>
 
       <div class="recycle-layout">
@@ -492,8 +566,9 @@ onBeforeUnmount(() => observer?.disconnect());
             >
               <span class="album-item__icon" aria-hidden="true"><Images :size="18" :stroke-width="1.8" /></span>
               <span class="album-item__copy">
+                <!-- 后端 list_recycle_photos 固定取 size=18，这里不是「全部相册」的聚合。 -->
                 <strong>全部照片</strong>
-                <small>回收站内所有相册</small>
+                <small>最近回收的 18 张</small>
               </span>
             </button>
             <button
@@ -557,7 +632,7 @@ onBeforeUnmount(() => observer?.disconnect());
                   input-id="select-all-recycle"
                   @update:model-value="toggleVisibleSelection"
                 />
-                <label for="select-all-recycle">全选当前照片（{{ photos.length }} 张）</label>
+                <label for="select-all-recycle">全选当前照片（最多 {{ photos.length }} 张）</label>
                 <span v-if="selectedIds.length" class="select-row__count">已选 {{ selectedIds.length }} 张</span>
               </div>
 
@@ -570,6 +645,8 @@ onBeforeUnmount(() => observer?.disconnect());
                   :data-photo-id="photo.id"
                 >
                   <span class="photo-card__media">
+                    <!-- 只有已解析出的真实地址才交给 <img>；原始 http 地址由后端白名单拒绝，
+                         渲染它只会得到一个永不消失的骨架。 -->
                     <img
                       v-if="photo.url && !photoFailed(photo)"
                       :src="photo.url"
@@ -579,12 +656,12 @@ onBeforeUnmount(() => observer?.disconnect());
                       referrerpolicy="no-referrer"
                       @error="markPreviewFailed(photo)"
                     />
-                    <span v-else-if="photoPending(photo) && visiblePhotoIds.has(photo.id)" class="photo-card__placeholder">
+                    <span v-else-if="photoPending(photo)" class="photo-card__placeholder">
                       <SkeletonBlock width="100%" height="100%" />
                     </span>
                     <span v-else class="photo-card__placeholder is-fallback">
                       <ImageOff :size="20" :stroke-width="1.8" aria-hidden="true" />
-                      <small>{{ photoFailed(photo) ? "预览加载失败" : "正在取回预览" }}</small>
+                      <small>预览不可用</small>
                     </span>
                   </span>
 
@@ -672,7 +749,9 @@ onBeforeUnmount(() => observer?.disconnect());
         <Checkbox v-model="recoverConfirmed" binary :disabled="recovering" />
         <span>我已确认照片数量和目标相册。</span>
       </label>
+      <!-- 部分成功时把「已成功恢复 N 张」显式说出来，重试只需处理剩下的照片。 -->
       <p v-if="error" class="dialog-error" role="alert">{{ describeError(error, '恢复未完成，请核对回收站和目标相册后重试。') }}</p>
+      <p v-else-if="recoveredCount" class="dialog-note">本次已成功恢复 {{ recoveredCount }} 张照片，剩余照片可再次确认恢复。</p>
 
       <template #footer>
         <Button label="取消" severity="secondary" text :disabled="recovering" @click="closeRecoverDialog" />
@@ -923,6 +1002,14 @@ onBeforeUnmount(() => observer?.disconnect());
 
 .error-banner svg {
   flex-shrink: 0;
+}
+
+/* 说明列表的实际范围（后端固定取最近 18 张），避免「全部照片」被误解。 */
+.list-note {
+  margin-top: var(--space-3);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
 }
 
 /* -------------------------------------------------------------- 布局 */

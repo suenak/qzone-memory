@@ -250,8 +250,10 @@ async function sync() {
     await load();
   } catch (reason) {
     if (sourceModule === module.value && sourceParent === parentKey.value) {
-      await load();
-      error.value = String(reason);
+      const syncFailure = String(reason);
+      // load() 首行会清空 error，而且它自身失败时的文案（「读取失败」）不该盖过本轮备份的真实原因；
+      // 用 finally 把备份失败原因写回，避免限流／凭证失效被显示成读取失败。
+      try { await load(); } finally { error.value = syncFailure; }
     }
   }
   finally { syncing.value = false; }
@@ -264,6 +266,13 @@ function openItem(item: LibraryItem) {
 async function openMedia(item: LibraryItem) {
   const url = item.mediaUrls.find((value) => /\.(?:mp4|m3u8)(?:[?#]|$)/i.test(value)) || item.mediaUrls[0] || item.coverUrl;
   if (!url) return;
+  // 库内记录可能被污染，交给系统 Opener 之前必须校验 scheme。
+  // 只放行 http/https：旧备份里的 QQ 媒体链接可能是 HTTP，一律拦掉会让这些记录打不开；
+  // 真正要挡的是 file:、自定义协议这类会被系统直接拉起的危险 scheme。
+  try {
+    const protocol = new URL(url).protocol;
+    if (protocol !== "https:" && protocol !== "http:") { toast.error("媒体地址协议不受支持，已阻止打开。"); return; }
+  } catch { toast.error("媒体地址无法识别，已阻止打开。"); return; }
   const { openUrl } = await import("@tauri-apps/plugin-opener");
   try { await openUrl(url); }
   catch (reason) { toast.error(describeError(reason, "无法打开媒体地址，请重新备份后再试。")); }

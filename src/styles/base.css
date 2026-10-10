@@ -26,6 +26,10 @@ body,
 }
 
 html {
+  /* 让 WebView 在解析样式表之前就按系统配色绘制首帧。
+     深色模式冷启动时，主题类要等模块脚本求值后才挂到 <html> 上，
+     没有这一行会先闪一帧白底。 */
+  color-scheme: light dark;
   font-family: var(--font-sans);
   font-size: var(--text-base);
   line-height: var(--leading-normal);
@@ -186,7 +190,7 @@ a:hover {
  * 而不是各页面分别写 :deep() 覆盖。
  */
 
-.p-component {
+html .p-component {
   font-family: var(--font-sans);
   --p-primary-color: var(--color-accent);
   --p-primary-hover-color: var(--color-accent-hover);
@@ -221,10 +225,9 @@ a:hover {
   --p-checkbox-checked-hover-border-color: var(--color-accent-hover);
 }
 
-.p-dialog,
-.p-overlaypanel,
-.p-popover,
-.p-drawer {
+html .p-dialog,
+html .p-popover,
+html .p-drawer {
   background: var(--color-surface-raised);
   border: var(--line-width) solid var(--color-border);
   border-radius: var(--radius-lg);
@@ -259,9 +262,13 @@ a:hover {
   border-top: var(--line-width) solid var(--color-border);
 }
 
-.p-inputtext,
-.p-password-input,
-.p-inputnumber-input {
+/* PrimeVue 的主题样式在运行时注入到 <head> 末尾，与本文档同特异性时会排在后面而胜出。
+   下面这些适配统一加 html 前缀把特异性提到 (0,1,1)，确保设计令牌不被 Aura 默认值覆盖，
+   不依赖 cssLayer 的运行时行为。main.ts 里同时配置了 cssLayer 作为第二道保险。
+   已经是 .p-x .p-y 形态的规则（如 .p-dialog .p-dialog-header）特异性足够，不加前缀。 */
+html .p-inputtext,
+html .p-password-input,
+html .p-inputnumber-input {
   background: var(--color-surface);
   border: var(--line-width) solid var(--color-border);
   border-radius: var(--radius-md);
@@ -271,25 +278,25 @@ a:hover {
     box-shadow var(--duration-fast) var(--ease-out);
 }
 
-.p-inputtext:hover,
-.p-password-input:hover {
+html .p-inputtext:hover,
+html .p-password-input:hover {
   border-color: var(--color-border-strong);
 }
 
-.p-inputtext:focus,
-.p-password-input:focus,
-.p-inputnumber-input:focus {
+html .p-inputtext:focus,
+html .p-password-input:focus,
+html .p-inputnumber-input:focus {
   outline: none;
   border-color: var(--color-accent);
   box-shadow: var(--shadow-focus);
 }
 
-.p-inputtext::placeholder,
-.p-password-input::placeholder {
+html .p-inputtext::placeholder,
+html .p-password-input::placeholder {
   color: var(--color-text-tertiary);
 }
 
-.p-button {
+html .p-button {
   min-height: var(--control-height);
   border-radius: var(--radius-md);
   font-weight: var(--weight-medium);
@@ -298,16 +305,8 @@ a:hover {
     color var(--duration-fast) var(--ease-out);
 }
 
-.p-button:focus-visible {
+html .p-button:focus-visible {
   box-shadow: var(--shadow-focus);
-}
-
-.p-tooltip .p-tooltip-text {
-  background: var(--color-text);
-  color: var(--color-surface);
-  font-size: var(--text-xs);
-  padding: var(--space-1) var(--space-2);
-  border-radius: var(--radius-sm);
 }
 
 .p-checkbox .p-checkbox-box {
@@ -321,49 +320,27 @@ a:hover {
   border-color: var(--color-accent);
 }
 
-.p-progressbar {
-  background: var(--color-surface-sunken);
-  border-radius: var(--radius-full);
-  overflow: hidden;
-}
-
-.p-progressbar .p-progressbar-value {
-  background: var(--color-accent);
-  border-radius: var(--radius-full);
-}
-
-.p-skeleton {
-  background: var(--color-surface-sunken);
-  border-radius: var(--radius-sm);
-}
-
-.p-select,
-.p-dropdown {
+html .p-select {
   background: var(--color-surface);
   border: var(--line-width) solid var(--color-border);
   border-radius: var(--radius-md);
 }
 
-.p-select-overlay { background: var(--color-surface-raised); color: var(--color-text); border-color: var(--color-border); }
-.p-select-option { color: var(--color-text); }
-.p-select-option:not(.p-select-option-selected):hover { background: var(--color-surface-sunken); }
-.p-select-label { color: var(--color-text); }
-.p-paginator { flex-wrap: wrap; background: var(--color-surface); border-radius: var(--radius-lg); color: var(--color-text-secondary); }
-.p-paginator-page-selected { background: var(--color-accent-soft); color: var(--color-accent); }
-.p-password { width: 100%; }
-.p-password-input { width: 100%; min-width: 0; }
-.p-dialog-footer { flex-wrap: wrap; }
-.p-dialog-mask { background: var(--color-overlay); }
-.p-drawer-right { width: min(var(--layout-detail-width), 100vw); }
-.p-drawer-bottom { max-height: 80dvh; padding-bottom: env(safe-area-inset-bottom); }
-.p-dialog-content { min-height: 0; overscroll-behavior: contain; }
+html .p-select-overlay { background: var(--color-surface-raised); color: var(--color-text); border-color: var(--color-border); }
+html .p-select-option { color: var(--color-text); }
+html .p-select-option:not(.p-select-option-selected):hover { background: var(--color-surface-sunken); }
+html .p-select-label { color: var(--color-text); }
+html .p-paginator { flex-wrap: wrap; background: var(--color-surface); border-radius: var(--radius-lg); color: var(--color-text-secondary); }
+html .p-paginator-page-selected { background: var(--color-accent-soft); color: var(--color-accent); }
+html .p-password { width: 100%; }
+html .p-password-input { width: 100%; min-width: 0; }
+html .p-dialog-footer { flex-wrap: wrap; }
+html .p-dialog-mask { background: var(--color-overlay); }
+html .p-drawer-right { width: min(var(--layout-detail-width), 100vw); }
+html .p-drawer-bottom { max-height: 80dvh; padding-bottom: env(safe-area-inset-bottom); }
+html .p-dialog-content { min-height: 0; overscroll-behavior: contain; }
 
 @media (max-width: 860px) {
   .p-button, .p-inputtext, .p-inputnumber-input, .p-select, .p-select-option, .p-paginator-page, .p-paginator-next, .p-paginator-prev { min-height: var(--touch-target); }
   .p-dialog-close-button, .p-drawer-close-button { min-width: var(--touch-target); min-height: var(--touch-target); flex-shrink: 0; }
-}
-
-.p-tag {
-  border-radius: var(--radius-full);
-  font-size: var(--text-xs);
 }

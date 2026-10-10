@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 只对外签发一个目录：更新包缓存。
+  这里刻意收窄到 app_cache_dir()/android-update（对应 android_update.rs 的 UPDATE_DIR）：
+  拿到 content:// 授权的应用能顺着它读文件，把 external-path 或整个 cache-path 交出去，
+  等于让安装流程顺手送出远超「装一个包」所需的访问面。
+  Rust 侧下载目录一旦改名，这里必须同步，否则 FileProvider 会拒绝签发 URI。
+-->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-  <external-path name="my_images" path="." />
-  <cache-path name="my_cache_images" path="." />
+  <cache-path name="android_update" path="android-update/" />
 </paths>

@@ -27,7 +27,11 @@ app.use(PrimeVue, {
     preset: Aura,
     options: {
       darkModeSelector: ".app-dark",
-      cssLayer: false,
+      // 把 PrimeVue 的运行时样式收进低优先级的 CSS layer。
+      // 否则它以 head.appendChild 注入、排在 Vite 样式表之后，会用同特异性
+      // 覆盖 base.css 里的设计令牌适配（实测 .p-button / .p-select / .p-drawer 等）。
+      // 未分层的样式天然优先于任何 layer，这样令牌映射才能稳定生效。
+      cssLayer: { name: "primevue", order: "primevue" },
     },
   },
 });

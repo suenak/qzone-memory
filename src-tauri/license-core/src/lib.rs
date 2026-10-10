@@ -16,6 +16,16 @@ pub const TOKEN_PREFIX: &str = "QZA1";
 pub const PAYLOAD_VERSION: i32 = 1;
 /// 时间回拨容忍窗口（秒）。小于此幅度的系统时间波动视为正常校准。
 pub const CLOCK_ROLLBACK_TOLERANCE_SECONDS: i64 = 3600;
+/// 宽限期上限（天）：十年。`grc` 是**宽容字段**——超出只钳制，不让整张凭证失效，
+/// 否则服务端一旦签发更大的宽限期，全部旧客户端会立刻拒绝合法用户。
+pub const MAX_GRACE_DAYS: i64 = 3650;
+/// 时间戳合理上界：9999-12-31T23:59:59Z。
+///
+/// `iat`/`exp` 超出此值属于畸形数据：签名只能证明字段来自服务端，证明不了服务端没有 bug，
+/// 而畸形的 `exp` 会让整套失效判定失去意义。
+pub const MAX_PLAUSIBLE_TIMESTAMP: i64 = 253_402_300_799;
+/// 序列号上界：2^40。按每天一次心跳也够用三十亿年，超出只可能是畸形值。
+pub const MAX_SERIAL: i64 = 1 << 40;
 
 /// Ed25519 SubjectPublicKeyInfo DER 的固定前缀。
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -96,8 +106,14 @@ impl LicensePayload {
     /// 最后一刻可用的 Unix 时间戳：过期时间 + 离线宽限期。
     ///
     /// 心跳连续失败时客户端靠这个窗口继续运行；超过它才进入受限状态。
+    ///
+    /// 全程饱和运算（与本文件 `account_remaining_days` 的做法保持一致）：畸形的
+    /// `exp`/`grc` 原先会让 `exp + grc.max(0) * 86_400` 在 debug 构建 panic
+    /// （调用点在 Tauri `setup` 阶段，等于建窗即崩），在 release 里回绕成负数，
+    /// 反把合法用户判成 `Restricted`。`grc` 钳到 `MAX_GRACE_DAYS`，不因它拒绝凭证。
     pub fn usable_until(&self) -> i64 {
-        self.exp + self.grc.max(0) * 86_400
+        self.exp
+            .saturating_add(self.grc.clamp(0, MAX_GRACE_DAYS).saturating_mul(86_400))
     }
 
     /// 距离彻底失效还有多少秒，已失效返回负数。
@@ -148,7 +164,26 @@ pub fn decode_payload(signing_input: &str) -> Result<LicensePayload, LicenseErro
     if payload.v != PAYLOAD_VERSION {
         return Err(LicenseError::UnsupportedVersion);
     }
+    check_numeric_bounds(&payload)?;
     Ok(payload)
+}
+
+/// payload 的数值边界检查。
+///
+/// 放在解析阶段而不是业务判定里：越界的 `iat`/`exp`/`sn` 属于「结构不合法」，
+/// 应与 base64/JSON 错误一样直接拒绝，而不是带着回绕后的数字继续参与判定。
+fn check_numeric_bounds(payload: &LicensePayload) -> Result<(), LicenseError> {
+    if !(0..=MAX_PLAUSIBLE_TIMESTAMP).contains(&payload.iat) {
+        return Err(LicenseError::Malformed);
+    }
+    if !(0..=MAX_PLAUSIBLE_TIMESTAMP).contains(&payload.exp) {
+        return Err(LicenseError::Malformed);
+    }
+    // sn 参与持久化的取 max 与防重放比较，负值或天文数字都只可能是脏数据。
+    if !(0..=MAX_SERIAL).contains(&payload.sn) {
+        return Err(LicenseError::Malformed);
+    }
+    Ok(())
 }
 
 /// Ed25519 验签。
@@ -507,6 +542,68 @@ mod tests {
         assert!(!is_stale_serial(5, 5));
         assert!(!is_stale_serial(6, 5));
         assert!(is_stale_serial(4, 5), "旧凭证重放应被识别");
+    }
+
+    #[test]
+    fn clamps_absurd_grace_period_instead_of_overflowing() {
+        let (signing, _) = keys();
+        // 旧写法 `exp + grc.max(0) * 86_400`：debug 构建 panic，release 回绕成负数。
+        let mut value = payload_for(INSTALLATION, NOW);
+        value["grc"] = json!(i64::MAX);
+        let token = issue(&signing, value);
+        let (signing_input, _) = split_token(&token).unwrap();
+        let payload = decode_payload(&signing_input).unwrap();
+
+        // grc 是宽容字段：钳到 MAX_GRACE_DAYS，凭证本身仍然可用。
+        let expected = NOW + 86_400 + MAX_GRACE_DAYS * 86_400;
+        assert_eq!(payload.usable_until(), expected);
+        assert_eq!(status_for(&payload, NOW + 86_400 + 1), LicenseStatus::Grace);
+    }
+
+    #[test]
+    fn negative_grace_period_never_shortens_the_usable_window() {
+        let (signing, _) = keys();
+        let mut value = payload_for(INSTALLATION, NOW);
+        value["grc"] = json!(i64::MIN);
+        let token = issue(&signing, value);
+        let (signing_input, _) = split_token(&token).unwrap();
+        let payload = decode_payload(&signing_input).unwrap();
+
+        assert_eq!(payload.usable_until(), NOW + 86_400);
+        assert_eq!(payload.remaining_seconds(NOW), 86_400);
+    }
+
+    #[test]
+    fn rejects_out_of_range_numeric_fields() {
+        let (signing, verifying) = keys();
+        for (field, bad) in [
+            ("iat", json!(-1)),
+            ("iat", json!(MAX_PLAUSIBLE_TIMESTAMP + 1)),
+            ("exp", json!(-1)),
+            ("exp", json!(MAX_PLAUSIBLE_TIMESTAMP + 1)),
+            ("sn", json!(-1)),
+            ("sn", json!(MAX_SERIAL + 1)),
+        ] {
+            let mut value = payload_for(INSTALLATION, NOW);
+            value[field] = bad;
+            let token = issue(&signing, value);
+            // 上界与下界越界都属于「结构不合法」，与 base64/JSON 错误同一出口。
+            let result = verify_license(&token, &verifying, INSTALLATION, NOW);
+            assert_eq!(result, Err(LicenseError::Malformed));
+        }
+    }
+
+    #[test]
+    fn accepts_boundary_numeric_values() {
+        let (signing, verifying) = keys();
+        let mut value = payload_for(INSTALLATION, NOW);
+        value["sn"] = json!(MAX_SERIAL);
+        value["exp"] = json!(MAX_PLAUSIBLE_TIMESTAMP);
+        let token = issue(&signing, value);
+
+        // 上界本身是合法值：只有越界才拒绝，避免边界写错导致正常凭证被拒。
+        let payload = verify_license(&token, &verifying, INSTALLATION, NOW).expect("边界值应通过");
+        assert_eq!(payload.sn, MAX_SERIAL);
     }
 
     #[test]

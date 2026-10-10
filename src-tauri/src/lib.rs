@@ -3,6 +3,7 @@ mod license;
 mod media_http;
 mod qlogin;
 mod qzone;
+mod updater;
 
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
@@ -53,8 +54,8 @@ pub fn run() {
             qlogin::open_web_login,
             qlogin::check_web_login,
             qlogin::sync_cookies_to_webview,
-            qzone::fetch_first_feeds,
-            qzone::fetch_more_feeds,
+            // fetch_first_feeds / fetch_more_feeds 已删除：归档引擎直接走
+            // qzone::fetch_feeds，这两个命令前端从未调用。
             qzone::open_recycle_password_window,
             qzone::prepare_recycle_password_window,
             qzone::check_recycle_password,
@@ -89,6 +90,9 @@ pub fn run() {
             archive::delete_archived_feeds,
             archive::clear_archived_feeds,
             archive::delete_all_app_data,
+            updater::update_endpoint,
+            updater::fetch_update_manifest,
+            updater::download_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -7,6 +7,12 @@
 //! **本层的校验只服务于体验**（提前提示未激活、支持离线运行），不是安全边界。
 //! 真正的边界在服务端：客户端 GPLv3 开源，任何人都能编译出跳过本模块的版本，
 //! 但无法伪造服务端签发的凭证，也无法使用需要服务端配合的云能力。
+//!
+//! **已知限制（Android，故意保留而非遗漏）**：Android 平台没有可用的 keyring 后端
+//! （见 Cargo.toml 的平台分支），因此移动端凭据以**明文** JSON 落在应用私有目录
+//! `app_data_dir()/license/` 下，只靠「目录私有 + 0600/0700 权限」保护，没有加密。
+//! 这偏离了 AGENTS.md「凭据只进操作系统凭据库」的原则，取舍与原因写在 `write_secret`。
+//! 桌面三平台（Windows 凭据管理器 / macOS Keychain / Linux Secret Service）不受影响。
 
 #[cfg(target_os = "android")]
 use std::path::PathBuf;
@@ -21,7 +27,11 @@ use license_core::{
 };
 
 /// 编译期可通过 `QZA_LICENSE_SERVER` 注入正式域名；未注入时使用占位地址。
-/// 发布前必须替换，否则激活请求会打到不存在的域名。
+/// 发布前必须替换，否则激活请求会打到不存在的域名 —— 而 `license.example.com`
+/// 是 IANA 保留域，不存在任何授权服务，激活永远不可能成功。
+///
+/// 因此这里不能只靠注释约束：回退值会被 `initialize` 写进 `last_error`（见
+/// `license_server_is_placeholder`），源码构建者一激活就能看到「本构建未配置授权服务器」。
 const LICENSE_SERVER_FALLBACK: &str = "https://license.example.com";
 
 /// 凭据库服务名，与 qlogin.rs 的 QQ 会话共用同一命名空间，但使用不同的 account。
@@ -36,6 +46,14 @@ const REQUEST_TIMEOUT_SECONDS: u64 = 20;
 
 pub fn license_server() -> &'static str {
     option_env!("QZA_LICENSE_SERVER").unwrap_or(LICENSE_SERVER_FALLBACK)
+}
+
+/// 本构建是否在使用占位授权服务器地址，即编译期没有注入 `QZA_LICENSE_SERVER`。
+///
+/// 用于把「本构建未配置授权服务器」变成运行时可观测的状态，而不是只写在注释里：
+/// 占位域名下的激活请求永远失败，用户只会看到笼统的网络错误。
+fn license_server_is_placeholder() -> bool {
+    option_env!("QZA_LICENSE_SERVER").is_none()
 }
 
 fn now_seconds() -> i64 {
@@ -109,6 +127,11 @@ fn generate_uuid_v4() -> String {
 ///
 /// 注意：**这不是设备主键**。换网卡、重装系统、BIOS 更新都会让它漂移，
 /// 用来做主键会把老用户误判成新设备并烧光席位。
+///
+/// 覆盖范围要说清楚：桌面三平台能取到稳定标识（Windows `MachineGuid`、Linux
+/// `machine-id`、macOS `IOPlatformUUID`）；**Android 与 iOS 恒为空串**，
+/// 见 `platform_hint` 的非桌面分支。所以「换系统/换主板后凭 hw_hint 找回席位」
+/// 只对桌面端成立，移动端没有任何可比对线索。
 fn hardware_hint() -> String {
     match platform_hint() {
         Some(value) if !value.trim().is_empty() => {
@@ -214,6 +237,9 @@ fn platform_hint() -> Option<String> {
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn platform_hint() -> Option<String> {
     // Android / iOS：沙箱限制下拿不到稳定且合规的硬件标识，改用 installation_id 作为身份。
+    // 推论：移动端的 hw_hint 恒为空串，而协议规定空值不参与匹配，因此
+    // 「换设备后由服务端比对 hw_hint 找回席位」在移动端**不成立** —— 这是平台限制，
+    // 不是待办事项，不要在文档或界面里承诺它。
     None
 }
 
@@ -221,14 +247,44 @@ fn platform_hint() -> Option<String> {
 
 /// Android 的 keyring 后端不存在（见 Cargo.toml 的平台分支），
 /// 因此移动端把凭据放在应用私有目录：其他应用不可读，卸载即清除。
+///
+/// **这是已知限制，不是安全设计**：文件内容是明文（原因见 `write_secret` 的说明）。
+/// 这里额外做三件能真正降低风险的事，而不是假装加密：
+/// 1. 拒绝空账号与任何含路径分隔符/`..` 的账号名，避免将来 account 变成变量后越出目录；
+/// 2. 拒绝把许可证目录写成符号链接或普通文件，防止凭据被重定向到共享位置；
+/// 3. 目录以 0700 创建（`create_dir_all` 的默认模式是 0777 & umask，过于宽松）。
 #[cfg(target_os = "android")]
 fn secret_path(app: &tauri::AppHandle, account: &str) -> Result<PathBuf, String> {
+    if account.is_empty()
+        || account.contains('/')
+        || account.contains('\\')
+        || account.contains("..")
+    {
+        return Err("许可证账号名不合法".to_owned());
+    }
+
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法获取应用数据目录：{error}"))?
         .join("license");
-    std::fs::create_dir_all(&dir).map_err(|error| format!("无法创建许可证目录：{error}"))?;
+
+    match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("许可证目录是符号链接，已拒绝读写".to_owned())
+        }
+        Ok(metadata) if !metadata.is_dir() => return Err("许可证路径已被非目录文件占用".to_owned()),
+        _ => {}
+    }
+
+    if !dir.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(&dir)
+            .map_err(|error| format!("无法创建许可证目录：{error}"))?;
+    }
     Ok(dir.join(format!("{account}.json")))
 }
 
@@ -259,8 +315,33 @@ fn read_secret(app: &tauri::AppHandle, account: &str) -> Result<Option<String>, 
 fn write_secret(app: &tauri::AppHandle, account: &str, value: &str) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
+        // 已知限制（有意保留，不是遗漏）：Android 上 keyring 没有后端可用
+        // （见 Cargo.toml 的平台分支），所以移动端凭据落在 app_data_dir()/license/ 下的
+        // 明文 JSON —— 目录位于 /data/data/<包名>/files 这类应用私有区，其他应用或
+        // 未 root 的进程读不到，但 root、adb 备份与设备取证可以直接取走。
+        //
+        // 这里**没有**做加密，也不假装做了：把 AES 密钥和密文放在同一个应用私有目录，
+        // 只能骗过肉眼，挡不住任何能读到该目录的攻击者。真正的修法是引入
+        // Android Keystore（系统持有的密钥，应用只拿到句柄），需要新增 Android 绑定
+        // 依赖（如 aes-gcm + keystore/JNI 插件），属于独立任务，未纳入本次改动。
+        // 因此退而求其次：文件 0600 创建并在写入后复核权限，目录 0700（见 `secret_path`）。
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let path = secret_path(app, account)?;
-        return std::fs::write(&path, value).map_err(|error| format!("保存许可证失败：{error}"));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("保存许可证失败：{error}"))?;
+        file.write_all(value.as_bytes())
+            .map_err(|error| format!("保存许可证失败：{error}"))?;
+        let _ = file.sync_all();
+        // `OpenOptions::mode` 只对新建文件生效，覆盖旧版本可能留下的宽松权限。
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        return Ok(());
     }
 
     #[cfg(not(target_os = "android"))]
@@ -299,8 +380,12 @@ fn delete_secret(app: &tauri::AppHandle, account: &str) -> Result<(), String> {
 // ------------------------------------------------------------- 本地许可状态
 
 /// 本地持久化的授权状态。token 本身是签名的，被篡改会在验签时暴露。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// 刻意**不派生 `Debug`**，改用下方手写实现：`token` 是签名凭证，等同持有者的授权，
+/// 一旦有人顺手 `dbg!(license)` 或 `{:?}` 就会把完整凭据打进日志文件。
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredLicense {
+    /// 服务端签发的凭证。调试输出里恒为 `<redacted>`。
     token: String,
     /// 历史最大观察时间，用于识别系统时间回拨。
     #[serde(default)]
@@ -314,6 +399,19 @@ struct StoredLicense {
     /// 服务端返回的账号名，仅用于界面展示。
     #[serde(default)]
     username: String,
+}
+
+impl std::fmt::Debug for StoredLicense {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredLicense")
+            .field("token", &"<redacted>")
+            .field("max_seen_time", &self.max_seen_time)
+            .field("max_seen_serial", &self.max_seen_serial)
+            .field("last_heartbeat", &self.last_heartbeat)
+            .field("username", &self.username)
+            .finish()
+    }
 }
 
 #[derive(Default)]
@@ -385,83 +483,198 @@ impl AccessLevel {
     }
 }
 
-fn load_runtime(app: &tauri::AppHandle) -> Runtime {
-    let identity = read_secret(app, CREDENTIAL_DEVICE)
-        .ok()
-        .flatten()
-        .and_then(|text| serde_json::from_str::<DeviceIdentity>(&text).ok());
+/// 凭据读取的三态结果。
+///
+/// `read_secret` 的 `Err` 与 `Ok(None)` 含义完全不同：前者是「暂时读不到」
+/// （Windows 凭据服务被停用、Linux 上没有 Secret Service、macOS keychain 拒绝访问），
+/// 后者才是「确实没有记录」。原先用 `.ok().flatten()` 把两者一起折叠成 `None`，
+/// 于是凭据库一旦不可用，每次启动都会生成全新的 installation_id 并覆盖旧凭据。
+enum Secret {
+    Found(String),
+    Missing,
+    /// 凭据库暂时不可用。这个分支**绝不能**被当作「没有记录」。
+    Unavailable(String),
+}
 
-    let license = read_secret(app, CREDENTIAL_LICENSE)
-        .ok()
-        .flatten()
-        .and_then(|text| serde_json::from_str::<StoredLicense>(&text).ok());
+fn load_secret(app: &tauri::AppHandle, account: &str) -> Secret {
+    match read_secret(app, account) {
+        Ok(Some(text)) => Secret::Found(text),
+        Ok(None) => Secret::Missing,
+        Err(error) => Secret::Unavailable(error),
+    }
+}
 
-    Runtime {
+/// 启动时从凭据库读到的全部状态，附带两个「读不到」的原因，供 `initialize` 区分处理。
+struct LoadedRuntime {
+    identity: Option<DeviceIdentity>,
+    license: Option<StoredLicense>,
+    /// 设备身份读不到的原因（凭据库暂时不可用）。非空时**绝不**生成新身份。
+    device_unavailable: Option<String>,
+    /// 授权凭证读不到的原因，仅用于界面提示。
+    license_unavailable: Option<String>,
+}
+
+fn load_runtime(app: &tauri::AppHandle) -> LoadedRuntime {
+    // 记录存在但 JSON 损坏时仍按「没有记录」处理并重建：损坏的安装标识无法参与验签，
+    // 也无从恢复，重建是唯一能继续使用的路径（代价是一个席位，但不会反复消耗）。
+    let (identity, device_unavailable) = match load_secret(app, CREDENTIAL_DEVICE) {
+        Secret::Found(text) => (serde_json::from_str::<DeviceIdentity>(&text).ok(), None),
+        Secret::Missing => (None, None),
+        Secret::Unavailable(error) => (None, Some(error)),
+    };
+
+    let (license, license_unavailable) = match load_secret(app, CREDENTIAL_LICENSE) {
+        Secret::Found(text) => (serde_json::from_str::<StoredLicense>(&text).ok(), None),
+        Secret::Missing => (None, None),
+        Secret::Unavailable(error) => (None, Some(error)),
+    };
+
+    LoadedRuntime {
         identity,
         license,
-        payload: None,
-        last_error: None,
+        device_unavailable,
+        license_unavailable,
     }
 }
 
 /// 初始化：读取或生成设备身份，并校验本地凭证。
 ///
-/// 时间回拨与旧序列号在此处判定，结果落进 `last_error` 供界面展示。
+/// 时间回拨在此处判定，结果落进 `last_error` 供界面展示。
 /// 在 Tauri setup 阶段调用一次，因此命令守卫无需再关心初始化时机。
+///
+/// 身份与水位必须在函数结束前回写凭据库，否则会出现两个可复现的绕过/失效：
+/// - `max_seen_time` 只写内存副本时，磁盘水位永远停在旧值——先让时钟跑快抬高内存水位、
+///   重启、再回拨，检测就再也不触发；
+/// - `hw_hint` 只写内存副本时，「换主板/换系统后由服务端比对找回席位」这件事永不成立。
+/// 两处写失败都只记日志：本次启动的内存状态依然有效，下次启动会重试。
 pub fn initialize(app: &tauri::AppHandle) {
     let state = LicenseState::global();
-    let mut runtime = load_runtime(app);
+    let loaded = load_runtime(app);
+    let mut runtime = Runtime {
+        identity: loaded.identity,
+        license: loaded.license,
+        payload: None,
+        last_error: None,
+    };
 
-    // hw_hint 每次启动重新采集：它是「installation_id 丢失后找回席位」的唯一线索，
-    // 必须反映当前硬件，而不是首次安装时的快照。
     let current_hint = hardware_hint();
-    let identity = match runtime.identity.take() {
+    let mut last_error: Option<String> = None;
+    // 身份是否变化到需要回写凭据库（新建，或 hw_hint 漂移）。
+    let mut identity_dirty = false;
+
+    // hw_hint 每次启动重新采集：桌面端它是「installation_id 丢失后找回席位」的唯一线索，
+    // 必须反映当前硬件，而不是首次安装时的快照；采集到的新值会随身份一起回写凭据库（原先只改内存，
+    // 服务端永远拿不到这个线索）。移动端 `platform_hint` 恒为 None，这里只是维持空串。
+    let mut identity = match runtime.identity.take() {
         Some(mut existing) => {
-            existing.hw_hint = current_hint;
-            existing
-        }
-        None => {
-            let fresh = DeviceIdentity {
-                hw_hint: current_hint,
-                ..DeviceIdentity::create()
-            };
-            if let Ok(text) = serde_json::to_string(&fresh) {
-                let _ = write_secret(app, CREDENTIAL_DEVICE, &text);
+            if existing.hw_hint != current_hint {
+                existing.hw_hint = current_hint;
+                identity_dirty = true;
             }
-            fresh
+            Some(existing)
         }
+        None => match loaded.device_unavailable.as_deref() {
+            // 凭据库暂时不可用（而**不是**没有记录）。这里若按「没有记录」处理，
+            // 就会生成新的 installation_id 并覆盖旧凭据：每次启动烧掉一个席位，
+            // 数轮之后账号撞上 SEAT_LIMIT，旧身份再无找回入口。
+            // 因此保持身份为空并给出可重试的原因，让激活与心跳明确失败。
+            Some(reason) => {
+                last_error = Some(format!("设备身份暂不可用：{reason}"));
+                None
+            }
+            // 确认是 NoEntry：这才是真正需要新身份的路径。
+            None => {
+                let fresh = DeviceIdentity {
+                    hw_hint: current_hint,
+                    ..DeviceIdentity::create()
+                };
+                identity_dirty = true;
+                Some(fresh)
+            }
+        },
     };
 
     let now = now_seconds();
-    let mut last_error = None;
 
     if let Some(license) = runtime.license.clone() {
         let max_seen_time = license.max_seen_time.max(now);
         if detect_clock_rollback(now, license.max_seen_time) {
             last_error = Some(LicenseError::ClockRollback.message().to_owned());
-        } else if is_stale_serial(0, license.max_seen_serial) {
-            // 占位分支不会触发，保留结构以便未来接入多凭证场景。
         }
+        // 原先此处有个 `is_stale_serial(0, ...)` 的占位分支，恒为 false。
+        // 防重放已改为在写入路径上真正生效，见 `persist_license`。
 
-        match state.public_key {
-            Some(key) => match verify_license(&license.token, &key, &identity.installation_id, now)
-            {
-                Ok(payload) => runtime.payload = Some(payload),
-                Err(error) => last_error = Some(error.message().to_owned()),
-            },
-            None => last_error = Some("内置公钥不可用".to_owned()),
+        // 身份不可用时无法比对 iid，跳过验签（payload 保持为空，由守卫拒绝）；
+        // 水位仍要维护，它与身份无关，落盘后即可挡住「重启再回拨」。
+        if let Some(identity) = identity.as_ref() {
+            match state.public_key {
+                Some(key) => {
+                    match verify_license(&license.token, &key, &identity.installation_id, now) {
+                        Ok(payload) => runtime.payload = Some(payload),
+                        Err(error) => last_error = Some(error.message().to_owned()),
+                    }
+                }
+                None => last_error = Some("内置公钥不可用".to_owned()),
+            }
         }
 
         let mut updated = license;
-        updated.max_seen_time = max_seen_time;
+        if max_seen_time != updated.max_seen_time {
+            updated.max_seen_time = max_seen_time;
+            // 只在确实前进时落盘，避免每次启动都无谓写一次凭据库。
+            match serde_json::to_string(&updated) {
+                Ok(text) => {
+                    if let Err(error) = write_secret(app, CREDENTIAL_LICENSE, &text) {
+                        eprintln!("[license] 水位落盘失败（内存水位仍有效）：{error}");
+                    }
+                }
+                Err(error) => eprintln!("[license] 授权状态序列化失败：{error}"),
+            }
+        }
         runtime.license = Some(updated);
+    } else if let Some(reason) = loaded.license_unavailable.as_deref() {
+        // 凭据确实存在但读不到：不能按「未激活」呈现，否则用户会以为要重新激活，
+        // 而重新激活恰好会再占一个席位。
+        if last_error.is_none() {
+            last_error = Some(format!("授权凭证暂时无法读取：{reason}"));
+        }
     }
 
-    runtime.identity = Some(identity);
+    if let Some(identity) = identity.take() {
+        if identity_dirty {
+            match serde_json::to_string(&identity) {
+                Ok(text) => {
+                    if let Err(error) = write_secret(app, CREDENTIAL_DEVICE, &text) {
+                        eprintln!("[license] 设备身份写回凭据库失败：{error}");
+                        if last_error.is_none() {
+                            last_error = Some(format!("设备身份无法写入系统凭据库：{error}"));
+                        }
+                    }
+                }
+                Err(error) => eprintln!("[license] 设备身份序列化失败：{error}"),
+            }
+        }
+        runtime.identity = Some(identity);
+    }
+
+    // 源码构建未配置授权服务器时明确告知：占位域名下激活请求永远失败，
+    // 静默下去用户只会看到笼统的网络错误。已有更具体的错误时不覆盖。
+    if license_server_is_placeholder() && last_error.is_none() {
+        last_error = Some(format!(
+            "本构建未配置授权服务器，激活请求会发往占位地址 {LICENSE_SERVER_FALLBACK}"
+        ));
+    }
+
     runtime.last_error = last_error;
 
-    if let Ok(mut guard) = state.inner.lock() {
-        *guard = runtime;
+    match state.inner.lock() {
+        Ok(mut guard) => *guard = runtime,
+        // 中毒只说明持锁线程 panic 过。`Runtime` 里没有可能被写坏的内部不变量，
+        // 因此记一条日志后照样写回，好过让整个授权层静默失效。
+        Err(poisoned) => {
+            eprintln!("[license] 授权状态锁已中毒，初始化结果仍会写回");
+            *poisoned.into_inner() = runtime;
+        }
     }
 }
 
@@ -568,7 +781,13 @@ fn access_level(state: &LicenseState) -> Result<AccessLevel, String> {
         .map_err(|_| "授权状态锁不可用".to_owned())?;
 
     if runtime.identity.is_none() {
-        return Err("设备标识尚未初始化".to_owned());
+        // 身份缺失有两种来源：从未初始化，以及凭据库暂时不可用（见 `initialize`）。
+        // 后者是可重试的状态，必须把那里的具体原因透出来，否则用户会以为需要重新激活，
+        // 而重新激活恰好会再占一个席位。
+        return Err(runtime
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "设备标识尚未初始化".to_owned()));
     }
     if let Some(message) = runtime.last_error.as_ref() {
         if runtime.payload.is_none() {
@@ -597,6 +816,14 @@ pub fn require_archive_access() -> Result<(), String> {
 }
 
 /// 本地浏览、搜索和导出不依赖授权状态，包括过期、撤销和未激活。
+///
+/// 注意：本函数**恒为 `Ok(())`**，不提供任何保护。函数名保留是因为 `archive.rs`
+/// 已有 18 处调用，改名会扩散到本次改动范围之外；请把它理解为「这里是本地数据路径」
+/// 的调用点标记，而不是守卫。凡是写本地数据、发起归档或访问腾讯服务端的地方，
+/// 必须改用 `require_archive_access()`。
+///
+/// AGENTS.md 的硬约束：授权失效可以限制「发起新的归档」，但绝不能让用户
+/// 失去磁盘上已有的归档，所以这个位置不该出现真正的判定。
 pub fn require_read_access() -> Result<(), String> {
     Ok(())
 }
@@ -751,6 +978,19 @@ fn persist_license(
         username: String::new(),
     });
 
+    // 防重放：服务端下发的序列号只能前进。原实现里 `is_stale_serial` 在客户端零调用、
+    // `max_seen_serial` 只写不读，PROTOCOL 声称的「还原旧 token 会被识别」从未生效。
+    //
+    // 只拒绝序列号**回退**的情况：服务端对同一席位正常重新签发（心跳、续期、换机重绑）
+    // 会让 sn 递增或至少持平，因此不会被这条规则误伤；首次激活时参照值为 0，
+    // 而 sn 已由 license-core 校验为非负，也不会误判。
+    //
+    // 逃生口：万一服务端重置了序列号（例如席位被删后重绑同一 installation_id），
+    // 提示语必须给出「先退出授权再激活」——退出会清掉本地参照值，避免用户卡在死循环里。
+    if is_stale_serial(payload.sn, previous.max_seen_serial) {
+        return Err("本地凭证序号比服务端下发的更新，请先退出授权后再重新激活".to_owned());
+    }
+
     let stored = StoredLicense {
         token: token.to_owned(),
         max_seen_time: previous.max_seen_time.max(reference_time),
@@ -820,7 +1060,17 @@ pub async fn activate_license(
             .inner
             .lock()
             .map_err(|_| "授权状态锁不可用".to_owned())?;
-        let identity = runtime.identity.clone().ok_or("设备标识尚未初始化")?;
+        let identity = match runtime.identity.clone() {
+            Some(identity) => identity,
+            // 凭据库暂时不可用时（见 `initialize`）给出具体且可重试的原因，
+            // 而不是笼统的「尚未初始化」——后者会让用户以为需要重新激活，从而再占一个席位。
+            None => {
+                return Err(runtime
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "设备标识尚未初始化".to_owned()))
+            }
+        };
         (
             identity.installation_id,
             identity.hw_hint,
@@ -904,7 +1154,16 @@ pub async fn refresh_license(app: tauri::AppHandle) -> Result<LicenseView, Strin
             .inner
             .lock()
             .map_err(|_| "授权状态锁不可用".to_owned())?;
-        let identity = runtime.identity.clone().ok_or("设备标识尚未初始化")?;
+        let identity = match runtime.identity.clone() {
+            Some(identity) => identity,
+            // 同上：区分「凭据库暂不可用」与「尚未初始化」，前者是可重试的状态。
+            None => {
+                return Err(runtime
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "设备标识尚未初始化".to_owned()))
+            }
+        };
         let license = runtime.license.clone().ok_or("软件尚未激活")?;
         (identity.installation_id, license.token)
     };
@@ -963,6 +1222,13 @@ pub async fn refresh_license(app: tauri::AppHandle) -> Result<LicenseView, Strin
             .and_then(|runtime| runtime.license.as_ref().map(|item| item.username.clone()))
             .unwrap_or_default();
         persist_license(&app, &state, token, &display_name, response.server_time)?;
+    }
+
+    // 心跳成功即代表服务端仍然认这个席位，因此无论是否下发新凭证都要清掉上一次的失败原因。
+    // 否则旧的「连接授权服务器超时」会一直留着，在下次 payload 为空时变成用户可见的
+    // 拒绝理由——把「设备已解绑」显示成网络超时，用户会去排查网络。
+    if let Ok(mut runtime) = state.inner.lock() {
+        runtime.last_error = None;
     }
 
     state
@@ -1230,6 +1496,24 @@ mod tests {
         // 未知错误码回落到服务端 message，再回落到通用提示。
         assert_eq!(describe_error(Some("WAT"), Some("自定义"), None), "自定义");
         assert!(!describe_error(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn stored_license_debug_never_leaks_the_token() {
+        // 手写 Debug 的意义就在于此：将来有人把 derive 加回来，这条会立刻失败。
+        let stored = StoredLicense {
+            token: "QZA1.PAYLOAD.SIGNATURE".to_owned(),
+            max_seen_time: 1,
+            max_seen_serial: 2,
+            last_heartbeat: 3,
+            username: "tester".to_owned(),
+        };
+        let rendered = format!("{stored:?}");
+        assert!(
+            !rendered.contains("PAYLOAD"),
+            "调试输出不得包含 token：{rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

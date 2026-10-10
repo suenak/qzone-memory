@@ -53,12 +53,9 @@
   --color-warning-soft: #fdf5e5;
   --color-danger: #bd433d;
   --color-danger-soft: #fdeeed;
-  --color-info: var(--color-accent);
-  --color-info-soft: var(--color-accent-soft);
 
   /* ---------------------------------------------------------- 间距 · 4px 基数 */
 
-  --space-0: 0;
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -110,7 +107,6 @@
   --leading-normal: 1.55;
   --leading-relaxed: 1.75;
 
-  --weight-normal: 400;
   --weight-medium: 500;
   --weight-semibold: 600;
 
@@ -142,23 +138,19 @@
   --duration-base: 200ms;
   --duration-slow: 300ms;
 
-  --z-sticky: 20;
-  --z-drawer: 60;
   --z-modal: 80;
   --z-toast: 100;
 
   /* ---------------------------------------------------------- 密度 *
-   * 由 .density-compact 覆盖，供卡片、列表行复用，
-   * 使「紧凑模式」只需改一处即可全局生效。 */
+   * 由 .density-compact 覆盖。当前只作用于卡片内边距与元素间距——
+   * 列表行高尚未接入，紧凑模式不会压缩列表行。 */
   --density-card-padding: var(--space-5);
-  --density-row-padding: var(--space-3) var(--space-4);
   --density-gap: var(--space-4);
 }
 
 /* 紧凑密度：挂在 <html> 上，由 stores/app.ts 控制。 */
 .density-compact {
   --density-card-padding: var(--space-4);
-  --density-row-padding: var(--space-2) var(--space-3);
   --density-gap: var(--space-3);
 }
 

@@ -1697,6 +1697,68 @@ fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
     })
 }
 
+/// 图片下载体积上限：QQ 图片最大不过几十 MB，超过必然是异常或伪造的响应，
+/// 而图片会整段读进内存，没有上限就等于把进程内存交给对端控制。
+const IMAGE_DOWNLOAD_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 视频下载体积上限。视频同样整段读进内存，所以仍然要设限，
+/// 但要比图片宽松得多——QQ 空间上的视频动辄上百 MB，
+/// 沿用图片的 50 MB 会把正常视频挡在门外。
+const VIDEO_DOWNLOAD_LIMIT_BYTES: u64 = 300 * 1024 * 1024;
+
+/// MP4 由一串 box 组成；顺序跳读头部即可确认文件没有在中途被截断。
+/// 旧实现直接 fs::write 覆盖缓存，网络中断会留下大于 1 KB 的残缺 mp4，
+/// 之后每次请求都会把它当成有效缓存复用，既播不出来也不再重新下载。
+fn is_complete_mp4(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    let mut offset = 0_u64;
+    let mut header = [0_u8; 16];
+    while offset < length {
+        if length - offset < 8 {
+            return false;
+        }
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return false;
+        }
+        let Ok(read) = file.read(&mut header) else {
+            return false;
+        };
+        if read < 8 {
+            return false;
+        }
+        let box_size = match u32::from_be_bytes([header[0], header[1], header[2], header[3]]) {
+            0 => length - offset,
+            1 => {
+                if read < 16 {
+                    return false;
+                }
+                u64::from_be_bytes([
+                    header[8], header[9], header[10], header[11], header[12], header[13],
+                    header[14], header[15],
+                ])
+            }
+            value => u64::from(value),
+        };
+        if box_size < 8 || offset.saturating_add(box_size) > length {
+            return false;
+        }
+        offset += box_size;
+    }
+    true
+}
+
+/// 缓存是否可以直接复用：文件存在、够大，而且是完整（未在下载中断处被截断）的 mp4。
+fn cached_video_is_usable(path: &std::path::Path) -> bool {
+    path.metadata().is_ok_and(|metadata| metadata.len() > 1024) && is_complete_mp4(path)
+}
+
 fn existing_archived_image(image_dir: &std::path::Path, file_stem: &str) -> Option<PathBuf> {
     ["jpg", "png", "gif", "webp", "avif", "bmp"]
         .into_iter()
@@ -1733,11 +1795,14 @@ pub async fn load_archived_image(
         .map_err(|error| format!("无法获取图片归档目录：{error}"))?
         .join("images")
         .join(&auth.uin);
-    fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
     let file_stem = format!("{id}-{picture_index}");
+    // 纯缓存命中不写任何数据，退化为只读的用户也应当能看图；因此守卫要拦在
+    // “带 QQ cookie 的远端下载”之前：命中缓存直接返回，未命中才要求归档写权限。
     if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
         return Ok(path.to_string_lossy().into_owned());
     }
+    crate::license::require_archive_access()?;
+    fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
 
     let pictures_json = {
         let connection = open_database(&app)?;
@@ -1764,7 +1829,6 @@ pub async fn load_archived_image(
     if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
         return Ok(path.to_string_lossy().into_owned());
     }
-    crate::license::require_archive_access()?;
     let client = reqwest::Client::builder()
         .redirect(crate::media_http::redirect_policy())
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -1801,7 +1865,7 @@ pub async fn load_archived_image(
                 Ok(response) if response.status().is_success() => {
                     if response
                         .content_length()
-                        .is_some_and(|length| length > 50 * 1024 * 1024)
+                        .is_some_and(|length| length > IMAGE_DOWNLOAD_LIMIT_BYTES)
                     {
                         last_error = "图片超过 50 MB 安全限制".into();
                         continue;
@@ -1921,6 +1985,7 @@ fn video_cover_url(json: Option<String>) -> Option<String> {
 pub async fn load_archived_video(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
     id: i64,
 ) -> Result<String, String> {
     crate::license::require_read_access()?;
@@ -1930,14 +1995,14 @@ pub async fn load_archived_video(
         .app_cache_dir()
         .map_err(|error| format!("无法获取视频缓存目录：{error}"))?
         .join("videos");
-    fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
     let cache_path = cache_dir.join(format!("{}-{id}.mp4", auth.uin));
-    if cache_path
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() > 1024)
-    {
+    // 纯缓存命中不写任何数据，退化为只读的用户也应当能播放已缓存的视频；
+    // 未命中缓存才会带着 QQ cookie 去远端下载，那一步必须由写权限守卫把关。
+    if cached_video_is_usable(&cache_path) {
         return Ok(cache_path.to_string_lossy().into_owned());
     }
+    crate::license::require_archive_access()?;
+    fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
     let video_json = {
         let connection = open_database(&app)?;
         connection
@@ -1955,7 +2020,17 @@ pub async fn load_archived_video(
     if candidates.is_empty() {
         return Err("该归档没有可用的视频地址".into());
     }
-    crate::license::require_archive_access()?;
+    // 视频与图片共用同一个并发闸门：此前视频完全没有限流，
+    // 同时点开多个视频会一起把整段视频读进内存。
+    let _permit = state
+        .image_downloads
+        .acquire()
+        .await
+        .map_err(|_| "视频下载队列已关闭")?;
+    // 等待许可期间可能有别的任务已经写好同一个缓存，再确认一次避免重复下载。
+    if cached_video_is_usable(&cache_path) {
+        return Ok(cache_path.to_string_lossy().into_owned());
+    }
     let client = reqwest::Client::builder()
         .redirect(crate::media_http::redirect_policy())
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -1991,6 +2066,13 @@ pub async fn load_archived_video(
             }
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > VIDEO_DOWNLOAD_LIMIT_BYTES)
+                    {
+                        last_error = "视频超过 300 MB 安全限制".into();
+                        continue;
+                    }
                     let content_type = response
                         .headers()
                         .get(reqwest::header::CONTENT_TYPE)
@@ -1999,6 +2081,11 @@ pub async fn load_archived_video(
                         .to_ascii_lowercase();
                     match response.bytes().await {
                         Ok(bytes) => {
+                            if bytes.len() as u64 > VIDEO_DOWNLOAD_LIMIT_BYTES {
+                                // 服务端没有返回 content-length 时也要兜住上限。
+                                last_error = "视频超过 300 MB 安全限制".into();
+                                continue;
+                            }
                             let is_mp4 = bytes
                                 .get(4..12)
                                 .is_some_and(|value| value.windows(4).any(|part| part == b"ftyp"));
@@ -2006,8 +2093,23 @@ pub async fn load_archived_video(
                                 || content_type.contains("octet-stream")
                                 || is_mp4
                             {
-                                fs::write(&cache_path, &bytes)
+                                // 先写临时文件再 rename：下载中断只会留下 .part，
+                                // 不会生成“看似有效”的截断 mp4 被后续请求永久复用。
+                                let nonce = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos();
+                                let temporary =
+                                    cache_dir.join(format!("{}-{id}-{nonce}.part", auth.uin));
+                                fs::write(&temporary, &bytes)
                                     .map_err(|error| format!("写入视频缓存失败：{error}"))?;
+                                if let Err(error) = fs::rename(&temporary, &cache_path) {
+                                    let saved = is_complete_mp4(&cache_path);
+                                    let _ = fs::remove_file(&temporary);
+                                    if !saved {
+                                        return Err(format!("保存视频缓存失败：{error}"));
+                                    }
+                                }
                                 return Ok(cache_path.to_string_lossy().into_owned());
                             }
                             last_error = format!(
@@ -2041,6 +2143,17 @@ fn set_progress(state: &ArchiveState, update: impl FnOnce(&mut ArchiveProgress))
     if let Ok(mut progress) = state.progress.lock() {
         update(&mut progress);
     }
+}
+
+/// 归档在真正开始跑之前失败时，把占位用的 running 状态收回 idle。
+/// 这样“会话过期 / 数据库被锁”只会得到一次报错，而不是把状态机永久卡死。
+fn archive_start_failed(state: &ArchiveState, error: String) -> String {
+    set_progress(state, |progress| {
+        progress.status = "idle";
+        progress.retry_at = None;
+        progress.message = format!("归档未能启动：{}", concise_archive_error(&error));
+    });
+    error
 }
 
 fn concise_archive_error(error: &str) -> String {
@@ -2422,6 +2535,9 @@ pub async fn start_feed_archive(
         if progress.status == "running" {
             return Err("已有归档任务正在运行".into());
         }
+        // 在状态切到 running 之前清零取消标记：此后用户按下的“取消”一定属于本轮任务，
+        // 不会出现“锁已释放、取消却被 store(false) 抹掉”的窗口。
+        archive.cancel.store(false, Ordering::Relaxed);
         *progress = ArchiveProgress {
             status: "running",
             pages: 0,
@@ -2432,11 +2548,21 @@ pub async fn start_feed_archive(
             retry_at: None,
         };
     }
-    archive.cancel.store(false, Ordering::Relaxed);
-    let owner_uin = login.qzone_auth().await?.uin;
-    let saved_skip_count = unresolved_skip_count(&app, &owner_uin)?;
+    // 初始化阶段的三次失败都必须把状态复位：否则会话过期或数据库锁定时状态会永久停在
+    // running，应用一直提示“已有归档任务正在运行”，并连带挡住清空归档与删除全部数据。
+    let owner_uin = match login.qzone_auth().await {
+        Ok(auth) => auth.uin,
+        Err(error) => return Err(archive_start_failed(&archive, error)),
+    };
+    let saved_skip_count = match unresolved_skip_count(&app, &owner_uin) {
+        Ok(count) => count,
+        Err(error) => return Err(archive_start_failed(&archive, error)),
+    };
     set_progress(&archive, |progress| progress.skipped = saved_skip_count);
-    let checkpoint = load_checkpoint(&app, &owner_uin)?;
+    let checkpoint = match load_checkpoint(&app, &owner_uin) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Err(archive_start_failed(&archive, error)),
+    };
     let stale_checkpoint = checkpoint
         .as_ref()
         .is_some_and(|value| checkpoint_is_stale(value, now()));
@@ -2509,7 +2635,15 @@ pub async fn start_feed_archive(
                     Ok(details) => {
                         known_skip_advance(&app, &owner_uin, details)?.map(|known| (details, known))
                     }
-                    Err(_) => None,
+                    Err(cursor_error) => {
+                        // 不再静默吞掉解析失败：游标损坏时把真正的原因写进进度消息，
+                        // 否则续传异常只能靠猜，也看不到是哪一步坏掉的。
+                        set_progress(&archive, |progress| {
+                            progress.message =
+                                format!("续传游标无法解析，正在按当前位置继续：{cursor_error}");
+                        });
+                        None
+                    }
                 };
                 if let Some((details, (known_advance, known_error))) = known_skip {
                     if qzone::feed_error_is_transient(&known_error) {
@@ -2886,6 +3020,8 @@ pub async fn retry_archive_skip(
     id: i64,
 ) -> Result<ArchiveSkipRetryResult, String> {
     crate::license::require_archive_access()?;
+    // 单独重试也会写库并占用分页频率额度，必须和归档任务互斥。
+    ensure_archive_idle(&archive)?;
     let owner_uin = login.qzone_auth().await?.uin;
     let connection = open_database(&app)?;
     let (cursor, resolved_at) = connection
@@ -2910,6 +3046,24 @@ pub async fn retry_archive_skip(
     }
     let attempted_at = now();
     match qzone::fetch_feeds(&login, "2", Some(&cursor)).await {
+        Ok(page) if page.feeds.is_empty() => {
+            // 空页不代表已经解决：接口游标失效时同样返回成功但零条记录。
+            // 若把它标记为已解决，这条异常位置会从列表消失、再也无法重试，数据永久缺失。
+            let note = "接口返回空页，未取回任何记录，异常位置已保留，请稍后重试";
+            let connection = open_database(&app)?;
+            connection
+                .execute(
+                    "UPDATE archive_skips SET retry_count=retry_count+1,last_retry_at=?2,error=?3
+                     WHERE id=?1 AND owner_uin=?4",
+                    params![id, attempted_at, note, owner_uin],
+                )
+                .map_err(|error| format!("保存异常重试结果失败：{error}"))?;
+            Ok(ArchiveSkipRetryResult {
+                success: false,
+                message: note.to_string(),
+                recovered_records: 0,
+            })
+        }
         Ok(page) => {
             let recovered_records = page.feeds.len() as u64;
             save_retried_page(&app, &owner_uin, &page.feeds)?;
@@ -2975,8 +3129,7 @@ pub async fn list_archived_feeds(
         .filter(|value| !value.is_empty());
     let sql = format!(
             "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
-              (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
-              (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+              0,0
              FROM archive_dynamics d WHERE d.owner_uin=?1
                AND CASE WHEN ?2='guestbook' THEN
                  (d.category='guestbook' OR EXISTS(SELECT 1 FROM archive_feeds gf
@@ -3018,8 +3171,9 @@ pub async fn list_archived_feeds(
                     video_url: video_urls.first().cloned(),
                     video_urls,
                     video_cover_url: video_cover_url(video_json),
-                    like_count: row.get(9)?,
-                    comment_count: row.get(10)?,
+                    // 计数由下面的 hydrate 统一填充，查询里两列只留 0 占位。
+                    like_count: 0,
+                    comment_count: 0,
                     likes: vec![],
                     comments: vec![],
                 })
@@ -3136,82 +3290,105 @@ pub async fn list_archived_media(
 ) -> Result<ArchiveMediaPage, String> {
     crate::license::require_read_access()?;
     let owner_uin = login.qzone_auth().await?.uin;
-    let connection = open_database(&app)?;
-    let mut year_statement = connection.prepare(
-        "SELECT DISTINCT CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER) FROM archive_dynamics
-         WHERE owner_uin=?1 AND category IN ('self','other') AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
-         ORDER BY 1 DESC",
-    ).map_err(|error| format!("读取媒体年份失败：{error}"))?;
-    let years = year_statement
-        .query_map(params![owner_uin], |row| row.get::<_, i32>(0))
-        .map_err(|error| format!("查询媒体年份失败：{error}"))?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    drop(year_statement);
+    // 与 list_archived_feeds 一致：要解析每条动态的 JSON，必须放到阻塞线程池执行。
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let years = {
+            let mut year_statement = connection.prepare(
+                "SELECT DISTINCT CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER) FROM archive_dynamics
+                 WHERE owner_uin=?1 AND category IN ('self','other') AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
+                 ORDER BY 1 DESC",
+            ).map_err(|error| format!("读取媒体年份失败：{error}"))?;
+            // 必须先把结果绑定到局部变量：块尾表达式的临时值要到块结束才析构，
+            // 而那时 year_statement 已被 drop，借用检查会拒绝（E0597）。
+            let collected = year_statement
+                .query_map(params![owner_uin], |row| row.get::<_, i32>(0))
+                .map_err(|error| format!("查询媒体年份失败：{error}"))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            collected
+        };
 
-    let mut statement = connection.prepare(
-        "SELECT id,published_at,content,author_uin,author_name,pictures_json,video_json FROM archive_dynamics
-         WHERE owner_uin=?1 AND category IN ('self','other')
-           AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
-           AND (?2 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?2)
-         ORDER BY published_at ASC,id ASC",
-    ).map_err(|error| format!("读取媒体归档失败：{error}"))?;
-    let rows = statement
-        .query_map(params![owner_uin, year], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
+        let limit = limit.clamp(1, 100) as usize;
+        let offset = offset as usize;
+        // 前端把“已加载条数”当作下一页的 offset，因此分页单位是“媒体项”而不是“动态行”：
+        // 一条动态会展开成多张照片加至多一个视频，直接用 SQL 的 LIMIT/OFFSET 切行会让
+        // 同一条动态里的照片在相邻两页重复或被跳过。这里保留项级语义，
+        // 但只实例化落在窗口内的媒体项，窗口外的行只累计数量，不再把整个账号的媒体载入内存。
+        let mut statement = connection.prepare(
+            "SELECT id,published_at,content,author_uin,author_name,pictures_json,video_json FROM archive_dynamics
+             WHERE owner_uin=?1 AND category IN ('self','other')
+               AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
+               AND (?2 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?2)
+             ORDER BY published_at ASC,id ASC",
+        ).map_err(|error| format!("读取媒体归档失败：{error}"))?;
+        let mut rows = statement
+            .query(params![owner_uin, year])
+            .map_err(|error| format!("查询媒体归档失败：{error}"))?;
+        let mut total = 0_usize;
+        let mut items = Vec::new();
+        let read_error = |error: rusqlite::Error| format!("读取媒体记录失败：{error}");
+        while let Some(row) = rows.next().map_err(&read_error)? {
+            let pictures_json = row.get::<_, Option<String>>(5).map_err(&read_error)?;
+            let video_json = row.get::<_, Option<String>>(6).map_err(&read_error)?;
+            let pictures = picture_urls(pictures_json);
+            let videos = video_urls(video_json.clone());
+            let row_start = total;
+            total += pictures.len() + usize::from(videos.first().is_some());
+            if total <= offset || items.len() >= limit {
+                // 整行都在窗口之前，或这一页已经取满：只统计条数，不构造媒体项。
+                continue;
+            }
+            let id = row.get::<_, i64>(0).map_err(&read_error)?;
+            let published_at = row.get::<_, i64>(1).map_err(&read_error)?;
+            let content = row.get::<_, Option<String>>(2).map_err(&read_error)?;
+            let author_uin = row.get::<_, Option<String>>(3).map_err(&read_error)?;
+            let author_name = row.get::<_, Option<String>>(4).map_err(&read_error)?;
+            let skip = offset.saturating_sub(row_start);
+            let picture_count = pictures.len();
+            for (picture_index, url) in pictures.into_iter().enumerate() {
+                if picture_index < skip || items.len() >= limit {
+                    continue;
+                }
+                items.push(ArchiveMediaItem {
+                    key: format!("{id}-photo-{picture_index}"),
+                    dynamic_id: id,
+                    media_type: "photo",
+                    picture_index: Some(picture_index),
+                    url,
+                    cover_url: None,
+                    published_at,
+                    author_uin: author_uin.clone(),
+                    author_name: author_name.clone(),
+                    content: content.clone(),
+                });
+            }
+            if let Some(url) = videos.first() {
+                // 视频项排在该行所有照片之后，所以它的行内位置就是照片数量。
+                if picture_count >= skip && items.len() < limit {
+                    items.push(ArchiveMediaItem {
+                        key: format!("{id}-video"),
+                        dynamic_id: id,
+                        media_type: "video",
+                        picture_index: None,
+                        url: url.clone(),
+                        cover_url: video_cover_url(video_json),
+                        published_at,
+                        author_uin: author_uin.clone(),
+                        author_name: author_name.clone(),
+                        content: content.clone(),
+                    });
+                }
+            }
+        }
+        Ok(ArchiveMediaPage {
+            items,
+            total,
+            years,
         })
-        .map_err(|error| format!("查询媒体归档失败：{error}"))?;
-    let mut all = Vec::new();
-    for row in rows {
-        let (id, published_at, content, author_uin, author_name, pictures_json, video_json) =
-            row.map_err(|error| format!("读取媒体记录失败：{error}"))?;
-        for (index, url) in picture_urls(pictures_json).into_iter().enumerate() {
-            all.push(ArchiveMediaItem {
-                key: format!("{id}-photo-{index}"),
-                dynamic_id: id,
-                media_type: "photo",
-                picture_index: Some(index),
-                url,
-                cover_url: None,
-                published_at,
-                author_uin: author_uin.clone(),
-                author_name: author_name.clone(),
-                content: content.clone(),
-            });
-        }
-        let videos = video_urls(video_json.clone());
-        if let Some(url) = videos.first() {
-            all.push(ArchiveMediaItem {
-                key: format!("{id}-video"),
-                dynamic_id: id,
-                media_type: "video",
-                picture_index: None,
-                url: url.clone(),
-                cover_url: video_cover_url(video_json),
-                published_at,
-                author_uin,
-                author_name,
-                content,
-            });
-        }
-    }
-    let total = all.len();
-    let start = (offset as usize).min(total);
-    let end = (start + limit.clamp(1, 100) as usize).min(total);
-    let items = all.drain(start..end).collect();
-    Ok(ArchiveMediaPage {
-        items,
-        total,
-        years,
     })
+    .await
+    .map_err(|error| format!("媒体归档查询任务异常退出：{error}"))?
 }
 
 #[tauri::command]
@@ -3225,8 +3402,7 @@ pub async fn get_archived_feed(
     let connection = open_database(&app)?;
     let mut item = connection.query_row(
         "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
-          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
-          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+          0,0
          FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.id=?2",
         params![owner_uin, id], |row| {
             let video_json = row.get::<_, Option<String>>(8)?;
@@ -3234,7 +3410,8 @@ pub async fn get_archived_feed(
             Ok(ArchiveItem { id: row.get(0)?, owner_uin: row.get(1)?, cell_id: row.get(2)?, published_at: row.get(3)?,
                 content: row.get(4)?, author_uin: row.get(5)?, author_name: row.get(6)?, picture_urls: picture_urls(row.get(7)?),
                 video_url: video_urls.first().cloned(), video_urls, video_cover_url: video_cover_url(video_json),
-                like_count: row.get(9)?, comment_count: row.get(10)?, likes: vec![], comments: vec![] })
+                // 计数统一在下面由评论/点赞查询填充，这里不再跑两个相关子查询。
+                like_count: 0, comment_count: 0, likes: vec![], comments: vec![] })
         },
     ).map_err(|error| match error { rusqlite::Error::QueryReturnedNoRows => "原始动态不存在或已删除".into(), _ => format!("读取原始动态失败：{error}") })?;
     let mut comments = connection
@@ -3487,12 +3664,15 @@ fn html_escape(value: &str) -> String {
 }
 
 fn qzone_text_html(value: Option<&str>) -> String {
+    // 导出时每条动态、每条评论都会调用一次，正则字面量固定，编译一次缓存复用即可。
+    static MENTION_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let text = value
         .unwrap_or("")
         .trim_start_matches(['：', ':'])
         .trim_start();
-    let pattern =
-        regex::Regex::new(r"@\{uin:([^,}]+),nick:([^}]+)\}").expect("fixed mention regex");
+    let pattern = MENTION_PATTERN.get_or_init(|| {
+        regex::Regex::new(r"@\{uin:([^,}]+),nick:([^}]+)\}").expect("fixed mention regex")
+    });
     let mut html = String::new();
     let mut cursor = 0;
     for captures in pattern.captures_iter(text) {
@@ -3521,8 +3701,7 @@ fn archive_items_for_export(
 ) -> Result<Vec<ArchiveItem>, String> {
     let mut statement = connection.prepare(
         "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
-          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
-          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+          0,0
          FROM archive_dynamics d WHERE d.owner_uin=?1
            AND CASE WHEN ?2='guestbook' THEN
              (d.category='guestbook' OR EXISTS(SELECT 1 FROM archive_feeds gf
@@ -3549,8 +3728,9 @@ fn archive_items_for_export(
                 video_url: video_urls.first().cloned(),
                 video_urls,
                 video_cover_url: video_cover_url(video_json),
-                like_count: row.get(9)?,
-                comment_count: row.get(10)?,
+                // 导出路径随后逐条填充评论与点赞，这里不再用子查询预先计数。
+                like_count: 0,
+                comment_count: 0,
                 likes: vec![],
                 comments: vec![],
             })
@@ -3897,7 +4077,8 @@ pub async fn get_interaction_ranking(
 fn ensure_archive_idle(state: &ArchiveState) -> Result<(), String> {
     let progress = state.progress.lock().map_err(|_| "归档状态锁已损坏")?;
     if progress.status == "running" {
-        return Err("归档任务运行时不能删除数据，请先取消任务".into());
+        // 文案覆盖删除、清空与单独重试三类调用点。
+        return Err("归档任务运行时不能修改归档数据，请先取消任务".into());
     }
     Ok(())
 }
@@ -3973,6 +4154,15 @@ pub async fn clear_archived_feeds(
             params![owner_uin],
         )
         .map_err(|error| format!("清空归档频率记录失败：{error}"))?;
+    // 异常跳过记录必须一起清掉：数据都没了，再留着这些位置只会让界面显示
+    // 已经不存在数据的“异常位置”，并在下次归档时把旧的跳过数量重新算进进度。
+    connection
+        .execute(
+            "DELETE FROM archive_skips WHERE owner_uin=?1",
+            params![owner_uin],
+        )
+        .map_err(|error| format!("清空异常跳过记录失败：{error}"))?;
+    set_progress(&state, |progress| progress.skipped = 0);
     Ok(dynamics as u64)
 }
 
@@ -3984,6 +4174,10 @@ pub async fn delete_all_app_data(
 ) -> Result<(), String> {
     ensure_archive_idle(&state)?;
     login.clear_session().await;
+    // 内存里的页面令牌与回收站密码签名也要一并作废：clear_session 只清会话本身，
+    // 而 QzonePageTokenState / RecycleAuthState 是进程级的，不显式清就会留在内存里，
+    // 切换账号后可能被上一个账号的签名复用（本命令持有 AppHandle，可以直接清）。
+    crate::qzone::clear_qq_credential_caches(&app);
     // 归档数据已全部删除，授权凭据没有理由保留；下次使用需重新激活。
     crate::license::purge_local_license(&app);
     let database = database_path(&app)?;
@@ -4301,7 +4495,6 @@ fn parsed_library_page(module: &str, value: &Value) -> ParsedLibraryPage {
 fn library_item_fields(
     module: &str,
     raw: &Value,
-    parent_key: &str,
 ) -> (
     String,
     i64,
@@ -4361,7 +4554,6 @@ fn library_item_fields(
             !lower.contains(".mp4") && !lower.contains(".m3u8")
         })
         .cloned();
-    let _ = parent_key;
     (
         item_key,
         created_at,
@@ -4390,7 +4582,7 @@ fn save_library_page(
     let mut seen = HashSet::new();
     for raw in raw_items {
         let (item_key, created_at, title, summary, author_uin, author_name, cover_url, media_urls) =
-            library_item_fields(module, raw, parent_key);
+            library_item_fields(module, raw);
         if !seen.insert(item_key.clone()) {
             continue;
         }

@@ -26,11 +26,14 @@ const showWebLogin = computed(() => {
   return currentPlatform !== "android" && currentPlatform !== "ios";
 });
 
-/** 扫码流程收敛成四种视觉状态：等待扫码 / 已扫码待确认 / 已过期 / 出错。 */
-const qrState = computed<"waiting" | "scanned" | "expired" | "error">(() => {
+/** 扫码流程收敛成五种视觉状态：等待扫码 / 已扫码待确认 / 已过期 / 出错 / 空档。
+ *  「等待中但既没有二维码、也不在加载」是取图空档，单独归为 idle：
+ *  这种状态必须留一个取图入口，否则用户会停在既没有二维码、也没有任何可点按钮的死路上。 */
+const qrState = computed<"waiting" | "idle" | "scanned" | "expired" | "error">(() => {
   if (status.value === "scanned") return "scanned";
   if (status.value === "expired") return "expired";
   if (status.value === "error") return "error";
+  if (!qrImage.value && !loading.value) return "idle";
   return "waiting";
 });
 
@@ -133,8 +136,8 @@ const webState = computed(() =>
 
       <div class="qzl-actions">
         <Button
-          v-if="qrState === 'expired'"
-          label="刷新二维码"
+          v-if="qrState === 'expired' || qrState === 'idle'"
+          :label="qrState === 'expired' ? '刷新二维码' : '获取二维码'"
           :loading="loading"
           @click="authStore.refreshQrCode"
         >

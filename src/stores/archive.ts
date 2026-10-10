@@ -2,6 +2,13 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { getArchiveProgress, type ArchiveProgress } from "../utils/qzone";
 
+/** 任务进行中时的轮询间隔。 */
+const ACTIVE_INTERVAL_MS = 2000;
+/** 空闲时的轮询间隔。侧边栏需要常驻显示状态，但没任务时没必要每 2 秒问一次。 */
+const IDLE_INTERVAL_MS = 15000;
+/** 本地直写进度后的保护窗口，见 holdProgress()。 */
+const PROGRESS_HOLD_MS = 2500;
+
 /**
  * 归档进度的全局状态。
  *
@@ -13,7 +20,11 @@ export const useArchiveStore = defineStore("archive", () => {
   const error = ref("");
 
   let timer: number | null = null;
-  let refreshing = false;
+  let polling = false;
+  /** 进行中的刷新请求。并发调用共享同一个 Promise，见 refresh()。 */
+  let pending: Promise<void> | null = null;
+  /** holdProgress() 设置的截止时刻。 */
+  let progressHeldUntil = 0;
 
   const running = computed(() => progress.value?.status === "running");
   const limited = computed(() => progress.value?.status === "limited");
@@ -23,31 +34,69 @@ export const useArchiveStore = defineStore("archive", () => {
   /** 是否出现了未解决的跳页记录（断点续传的异常条目）。 */
   const hasSkips = computed(() => (progress.value?.skipped ?? 0) > 0);
 
-  async function refresh() {
-    if (refreshing) return;
-    refreshing = true;
-    try {
-      progress.value = await getArchiveProgress();
-      error.value = "";
-    } catch (reason) {
-      error.value = String(reason);
-    } finally {
-      refreshing = false;
-    }
+  /**
+   * 声明「刚刚本地写入过进度」，在窗口期内不接受轮询响应覆盖。
+   *
+   * 「开始 / 停止归档」会直接写 progress，而轮询请求可能**更早发出**、
+   * 在直写之后才返回旧快照。没有这个窗口，按钮状态会回跳
+   * （「停止备份」变回「备份中…」），用户无法判断任务是否在跑。
+   *
+   * 这个判断必须放在 store 里而不是各页面：侧边栏的轮询与任务页的刷新
+   * 走的是同一份状态，只在页面内做保护挡不住侧边栏那一路。
+   */
+  function holdProgress(ttlMs = PROGRESS_HOLD_MS) {
+    progressHeldUntil = Date.now() + ttlMs;
+  }
+
+  /** 是否仍在保护窗口内。 */
+  function progressHeld() {
+    return Date.now() < progressHeldUntil;
+  }
+
+  /**
+   * 拉取一次进度。
+   *
+   * 并发调用时**共享同一个进行中的 Promise**,而不是直接返回 undefined——
+   * 否则紧跟「开始/停止归档」的那次刷新会被丢弃，调用方读到的仍是旧状态。
+   */
+  function refresh(): Promise<void> {
+    if (pending) return pending;
+    pending = (async () => {
+      try {
+        const snapshot = await getArchiveProgress();
+        if (!progressHeld()) progress.value = snapshot;
+        error.value = "";
+      } catch (reason) {
+        error.value = String(reason);
+      } finally {
+        pending = null;
+      }
+    })();
+    return pending;
+  }
+
+  function schedule() {
+    if (!polling) return;
+    const delay = running.value || limited.value ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
+    timer = window.setTimeout(async () => {
+      if (!polling) return;
+      await refresh();
+      schedule();
+    }, delay);
   }
 
   /** 幂等：重复调用不会叠加计时器。 */
-  function startPolling(intervalMs = 2000) {
-    if (timer !== null) return;
+  function startPolling() {
+    if (polling) return;
+    polling = true;
     void refresh();
-    timer = window.setInterval(() => {
-      void refresh();
-    }, intervalMs);
+    schedule();
   }
 
   function stopPolling() {
+    polling = false;
     if (timer !== null) {
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
       timer = null;
     }
   }
@@ -60,6 +109,8 @@ export const useArchiveStore = defineStore("archive", () => {
     completed,
     hasTask,
     hasSkips,
+    holdProgress,
+    progressHeld,
     refresh,
     startPolling,
     stopPolling,

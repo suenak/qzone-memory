@@ -66,6 +66,34 @@ the server-signed token. Accordingly:
   may restrict starting new archive runs; it must never lock someone out of archives they
   already have on disk.
 
+### Client updates
+
+The client **never installs updates by itself**. It fetches a manifest; if a newer version is
+published it shows a dialog with the release notes and a button that opens the download page, and
+the user downloads and installs manually.
+
+That is a deliberate simplification. An earlier revision did implement in-app installation — the
+official `tauri-plugin-updater` on desktop plus a hand-written APK installer (FileProvider, Kotlin
+plugin, `REQUEST_INSTALL_PACKAGES`) on Android. It was removed: it required maintaining a minisign
+keypair whose loss would permanently strand every installed client, needed Android's
+"install unknown apps" permission, and gave the user no chance to read what had changed before the
+install started.
+
+- **Manifest**: `GET <server>/api/v1/update/latest`, returning `version` / `notes` / `pub_date` /
+  `download_page` / `platforms`. **204 means "no update"** — either nothing is published or the
+  reported client version is already current.
+- The client reads only `version`, `notes` and `download_page`. `platforms` keeps Tauri's field
+  names for possible future use and is not consumed today.
+- The manifest request runs in Rust, with a 10-second timeout and a 512 KiB response limit.
+  It accepts no endpoint argument or QQ credentials from the frontend; WebView CSP stays narrow.
+- Endpoint and fallback download page are constants in `src-tauri/src/updater.rs`, each overridable
+  at compile time via `QZA_UPDATE_ENDPOINT` / `QZA_DOWNLOAD_PAGE`. Their defaults use the reserved
+  `.invalid` domain on purpose so that an unconfigured build ships a visible failure instead of
+  pointing at someone else's host.
+
+Server side, `QZA_DOWNLOAD_PAGE` is what the manifest advertises; publishing no longer requires
+minisign signatures. Release steps: [docs/RELEASE-AUTO-UPDATE.md](docs/RELEASE-AUTO-UPDATE.md).
+
 ### Frontend design system
 
 All styling flows through `src/styles/tokens.css`, which is the single source of design
@@ -117,9 +145,11 @@ variables for the whole app. Non-negotiable rules:
 │       ├── main.rs         # Entry point
 │       ├── lib.rs          # Tauri command registration and setup
 │       ├── license.rs      # Device identity, credentials, HTTP, command guards
+│       ├── media_http.rs   # Credential-safe media requests (domain allowlist)
 │       ├── qlogin.rs       # QQ login (QR code + web)
 │       ├── qzone.rs        # QQ Zone API client
-│       └── archive.rs      # Archiving engine + database
+│       ├── archive.rs      # Archiving engine + database
+│       └── updater.rs      # Update manifest endpoint and download page
 └── src-tauri/capabilities/ # Tauri permission configuration
 ```
 

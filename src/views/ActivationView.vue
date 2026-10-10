@@ -142,7 +142,7 @@ async function confirmRelease() {
   <div>
   <div class="activation-stage">
     <aside class="activation-story">
-      <p class="activation-story__brand"><BookOpen :size="22" :stroke-width="1.8" />空间回忆馆</p>
+      <p class="activation-story__brand"><BookOpen :size="22" :stroke-width="1.8" />拾忆</p>
       <h2>保存你的<br />QQ 空间记录。</h2>
       <p>备份说说、相册和留言，按年份查看已保存的内容。</p>
       <ul><li><BookOpen :size="18" :stroke-width="1.8" /><span>按年份查看说说与照片</span></li><li><ShieldCheck :size="18" :stroke-width="1.8" /><span>本地备份，资料由你保管</span></li></ul>

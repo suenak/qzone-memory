@@ -28,5 +28,20 @@ export function describeLicenseError(reason: unknown, fallback = "授权操作�
 export function diagnosticError(reason: unknown) {
   const message = String(reason ?? "");
   if (/cookie|token|pwd2sig|password|authorization|p_skey|g_tk|skey/i.test(message)) return "详细信息涉及登录或授权凭据，已隐藏。请重新登录或检查授权状态后重试。";
-  return message.slice(0, 1200);
+  return redactPaths(message).slice(0, 1200);
+}
+
+/**
+ * 后端不少错误串直接带着本地绝对路径（例如「无法创建图片归档目录：C:\Users\<name>\...」），
+ * 原样回显会把 Windows 用户名和目录结构贴到界面上，所以统一折叠成占位符。
+ * 只替换路径本身，路径前后的描述文字保留，排查信息不丢。
+ */
+function redactPaths(message: string) {
+  return message
+    // 盘符路径（含 C:\Users\<name>）：碰到引号、换行或中英文标点就停止，避免把后面的中文描述一并吃掉。
+    .replace(/[a-zA-Z]:\\[^\r\n"'<>|?*,;，。；：、（）【】]+/g, "<本地路径>")
+    // UNC 共享路径 \\server\share 同样暴露主机名和目录名。
+    .replace(/\\\\[^\r\n"'<>|?*,;，。；：、（）【】]+/g, "<网络路径>")
+    // macOS / Linux 家目录：保留层级，只把用户名换成 ~。
+    .replace(/\/(?:Users|home)\/[^\s/]+/g, "~");
 }

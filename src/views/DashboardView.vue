@@ -44,11 +44,14 @@ const loading = ref(false);
 const dashboardError = ref("");
 const avatarSources = reactive<Record<string, string>>({});
 let refreshTimer: number | undefined;
+/** 登出或重新加载都会让在途请求作废，否则轮询期间旧账号的概览与排行会写回界面。 */
+let loadSequence = 0;
 const storageText = computed(() => overview.value.databaseBytes < 1024 * 1024 ? `${(overview.value.databaseBytes / 1024).toFixed(1)} KB` : `${(overview.value.databaseBytes / 1024 / 1024).toFixed(1)} MB`);
 const taskSeverity = computed(() => ({ completed: "success", running: "info", error: "danger", cancelled: "warn", limited: "warn", idle: "secondary" }[progress.value.status]));
 const taskText = computed(() => ({ completed: "已完成", running: "备份中", error: "失败", cancelled: "已取消", limited: "稍后继续", idle: "未开始" }[progress.value.status]));
 const formatTime = (seconds: number) => seconds ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(seconds * 1000)) : "时间未知";
-const avatarUrl = (uin: string) => `https://qlogo2.store.qq.com/qzone/${uin}/${uin}/50?${Date.now()}`;
+// 地址必须稳定：loadAvatar 用它 fetch 成 blob，带时间戳只会让每次重新加载都重下一遍头像。
+const avatarUrl = (uin: string) => `https://qlogo2.store.qq.com/qzone/${uin}/${uin}/50`;
 const rankingMax = computed(() => Math.max(1, ...ranking.value.map((item) => item.interactions)));
 
 /* ------------------------------------------------------------------ 展示用派生状态
@@ -113,8 +116,18 @@ async function loadAvatar(uin: string) {
 }
 
 async function loadDashboard() {
-  if (!loggedIn.value) { overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 }; recent.value = []; ranking.value = []; return; }
+  if (!loggedIn.value) {
+    // 登出要把在途请求一并作废：轮询每 2 秒一次，否则已登出账号的概览、排行与年份会写回界面。
+    loadSequence += 1;
+    loading.value = false;
+    overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 };
+    recent.value = [];
+    ranking.value = [];
+    archiveYears.value = [];
+    return;
+  }
   if (loading.value) return;
+  const sequence = ++loadSequence;
   loading.value = true;
   dashboardError.value = "";
   try {
@@ -126,17 +139,21 @@ async function loadDashboard() {
       // 年份跨度取自后端真实的年份列表。带 catch：这一项失败不该拖垮整条加载链。
       listArchiveYears("self").catch(() => [] as number[]),
     ]);
+    if (sequence !== loadSequence) return;
     overview.value = stats; recent.value = items; progress.value = task; ranking.value = ranks;
     archiveYears.value = years.filter((year) => year > 0);
     const avatarUins = [...items.flatMap((item) => item.authorUin ? [item.authorUin] : []), ...ranks.map((item) => item.uin)];
     await Promise.all([...new Set(avatarUins)].map(loadAvatar));
-  } catch (reason) { dashboardError.value = String(reason); }
-  finally { loading.value = false; }
+  } catch (reason) { if (sequence === loadSequence) dashboardError.value = String(reason); }
+  finally { if (sequence === loadSequence) loading.value = false; }
 }
 async function pollDashboard() {
   if (!loggedIn.value || loading.value) return;
+  // 只记录当前序号：轮询期间若发生登出或整块重载，这次结果已经过期，不能写回界面。
+  const sequence = loadSequence;
   try {
     const task = await getArchiveProgress();
+    if (sequence !== loadSequence || !loggedIn.value) return;
     const wasRunning = progress.value.status === "running";
     progress.value = task;
     if (task.status === "running" || wasRunning) await loadDashboard();
@@ -145,10 +162,15 @@ async function pollDashboard() {
   }
 }
 function handleVisibilityChange() {
+  // 回到前台就重新加载；账号与序号的判断统一在 loadDashboard 内处理。
   if (document.visibilityState === "visible") void loadDashboard();
 }
 function primaryAction() { loggedIn.value ? router.push("/tasks") : authStore.openLogin(); }
-watch(loggedIn, loadDashboard);
+watch(loggedIn, () => {
+  // 账号切换先释放上一个账号的头像 blob，否则会一直残留到下次加载。
+  releaseAvatars();
+  void loadDashboard();
+});
 onMounted(() => {
   void loadDashboard();
   refreshTimer = window.setInterval(pollDashboard, 2_000);
@@ -959,6 +981,8 @@ onBeforeUnmount(() => {
 .memory-excerpt time { color: var(--color-warm); font-size: var(--text-xs); }
 .memory-excerpt p { margin-block: var(--space-3); max-width: 60ch; line-height: var(--leading-relaxed); }
 .memory-excerpt a { display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); }
-@media (max-width:860px) { .memory-hero :deep(.qza-card__body) { padding:var(--space-4); } .dashboard-columns { grid-template-columns:minmax(0,1fr); } .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+/* 这两条必须晚于上面的 .memory-hero :deep(.qza-card__body) 默认内边距，才能在这个断点生效；
+   .dashboard-columns 已在上面 860px 块里声明过，这里不再重复。 */
+@media (max-width:860px) { .memory-hero :deep(.qza-card__body) { padding:var(--space-4); } .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 
 </style>

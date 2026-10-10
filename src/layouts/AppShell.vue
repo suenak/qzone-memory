@@ -108,13 +108,16 @@ const navigationGroups: NavGroup[] = [
 
 const allNavigation = navigationGroups.flatMap((group) => group.items);
 
-/** 移动端底部只放最常用的四项，其余进「更多」。 */
-const mobileNavigation = [
-  allNavigation[0],
-  allNavigation[1],
-  allNavigation[3],
-  allNavigation[8],
-];
+/**
+ * 移动端底部只放最常用的四项，其余进「更多」。
+ *
+ * 用路径定位而不是数组下标：原先的 allNavigation[0]/[1]/[3]/[8] 与导航分组
+ * 强耦合，只要在分组里插入一项，底栏内容就会静默换成另一组页面。
+ */
+const MOBILE_DESTINATIONS = ["/", "/archives", "/albums", "/tasks"];
+const mobileNavigation = MOBILE_DESTINATIONS.map((path) =>
+  allNavigation.find((item) => item.to === path),
+).filter((item): item is NavItem => Boolean(item));
 const mobileMoreNavigation = allNavigation.filter((item) => !mobileNavigation.includes(item));
 
 const moreActive = computed(() =>
@@ -257,7 +260,7 @@ onBeforeUnmount(() => {
       <div class="sidebar__brand">
         <span class="brand-mark" aria-hidden="true"><BookOpen :size="20" :stroke-width="1.8" /></span>
         <span class="brand-text">
-          <strong>空间回忆馆</strong>
+          <strong>拾忆</strong>
           <small>QQ 空间本地备份</small>
         </span>
       </div>

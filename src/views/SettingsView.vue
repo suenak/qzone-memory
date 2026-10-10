@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { describeError, describeLicenseError } from "../utils/uiError";
 import { storeToRefs } from "pinia";
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { getVersion } from "@tauri-apps/api/app";
 import {
@@ -37,6 +37,7 @@ import {
   setArchiveInterval,
 } from "../utils/appSettings";
 import { clearArchivedFeeds, deleteAllAppData } from "../utils/qzone";
+import { useUpdateStore } from "../stores/update";
 
 const appStore = useAppStore();
 const authStore = useAuthStore();
@@ -50,6 +51,8 @@ const { loggedIn, user } = storeToRefs(authStore);
 const { themeMode, density } = storeToRefs(appStore);
 
 const intervalMs = ref(getArchiveInterval());
+/** 输入框草稿：与持久值分离，避免逐键输入时被归一化改写。 */
+const intervalInputSeconds = ref(intervalMs.value / 1000);
 const privacyVisible = ref(false);
 const deleteVisible = ref(false);
 const clearVisible = ref(false);
@@ -58,10 +61,23 @@ const clearing = ref(false);
 const error = ref("");
 const appVersion = ref("");
 
-watch(intervalMs, (value) => {
-  intervalMs.value = setArchiveInterval(value);
-});
-const intervalSeconds = computed({ get: () => intervalMs.value / 1000, set: (value: number) => { intervalMs.value = setArchiveInterval(value * 1000); } });
+/* ------------------------------------------------------------------ 更新 */
+
+/* 状态与弹窗都在 update store 里：启动时的静默检查发生在设置页之外，
+   两边必须共用同一份状态，否则会出现「启动已经发现新版、进设置页却显示已是最新」。 */
+const updateStore = useUpdateStore();
+
+/* 与 TasksView 同源问题：输入框一旦直接绑到带 clamp 的 setter，用户想输 10000ms 时，
+ * 第一个 "1" 就被改成 2000，继续输入得到 20000 而不是 10000。这里只保留草稿，
+ * blur / 回车时才归一化并保存。 */
+function commitIntervalInput() {
+  const seconds = typeof intervalInputSeconds.value === "number" && Number.isFinite(intervalInputSeconds.value)
+    ? intervalInputSeconds.value
+    : intervalMs.value / 1000;
+  const normalized = setArchiveInterval(seconds * 1000);
+  intervalMs.value = normalized;
+  intervalInputSeconds.value = normalized / 1000;
+}
 
 onMounted(async () => {
   try {
@@ -129,18 +145,25 @@ async function deleteEverything() {
   error.value = "";
   try {
     await deleteAllAppData();
-    resetAppSettings();
-    intervalMs.value = DEFAULT_ARCHIVE_INTERVAL;
-    await authStore.logout();
-    await licenseStore.refresh();
-    deleteVisible.value = false;
-    toast.success("本地数据已全部删除");
   } catch (reason) {
+    // 只有主体删除失败才算失败：此时数据未删净，用户可以按提示重试。
     error.value = String(reason);
     toast.error("删除失败，请稍后重试");
-  } finally {
     deleting.value = false;
+    return;
   }
+  /* 主体已经删净（后端已清理数据库、缓存、会话与本地授权），后续三步都只是收尾：
+   * 它们各自兜错并降级为提示，否则会把「其实删成功」报成失败，用户再点一次就会
+   * 在空库上重复执行删除路径。 */
+  deleteVisible.value = false;
+  toast.success("本地数据已全部删除");
+  deleting.value = false;
+  try { resetAppSettings(); intervalMs.value = DEFAULT_ARCHIVE_INTERVAL; intervalInputSeconds.value = DEFAULT_ARCHIVE_INTERVAL / 1000; }
+  catch (reason) { console.warn("重置本地设置失败", reason); }
+  try { await authStore.logout(); }
+  catch (reason) { toast.error(describeError(reason, "数据已删除，但退出 QQ 登录未完成，请手动退出。")); }
+  try { await licenseStore.refresh(); }
+  catch (reason) { toast.error(describeError(reason, "数据已删除，但授权状态刷新失败，可稍后重试。")); }
 }
 
 /* ------------------------------------------------------------ 授权席位 */
@@ -313,7 +336,7 @@ async function refreshSeats() {
         </div>
         <div class="interval-control">
           <InputNumber
-            v-model="intervalSeconds"
+            v-model="intervalInputSeconds"
             aria-label="每页读取间隔（秒）"
             :min="MIN_ARCHIVE_INTERVAL / 1000"
             :max="MAX_ARCHIVE_INTERVAL / 1000"
@@ -323,6 +346,8 @@ async function refreshSeats() {
             suffix=" 秒"
             show-buttons
             button-layout="horizontal"
+            @blur="commitIntervalInput"
+            @keydown.enter="commitIntervalInput"
           ><template #incrementicon><Plus :size="15" :stroke-width="1.8" /></template><template #decrementicon><Minus :size="15" :stroke-width="1.8" /></template></InputNumber>
           <small>{{ archiveStore.running ? '停止备份后可调整' : '建议 3–5 秒，下次备份生效' }}</small>
         </div>
@@ -383,6 +408,21 @@ async function refreshSeats() {
             <dd>GPLv3</dd>
           </div>
         </dl>
+
+        <div class="about__update">
+          <div class="about__update-text">
+            <strong>应用更新</strong>
+            <small>{{ updateStore.message || `当前版本 v${appVersion || "未知"}` }}</small>
+          </div>
+          <Button
+            :label="updateStore.checking ? '检查中…' : '检查更新'"
+            severity="secondary"
+            outlined
+            size="small"
+            :loading="updateStore.checking"
+            @click="updateStore.check()"
+          />
+        </div>
 
         <p class="about__notice">
           本软件为非官方工具。备份内容保存在本机，不会上传至开发者服务器。
@@ -554,12 +594,6 @@ async function refreshSeats() {
   max-width: 52ch;
 }
 
-.setting-row__mono {
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
-  color: var(--color-text-tertiary) !important;
-}
-
 /* --------------------------------------------------------- 分段控件 */
 
 .segmented {
@@ -691,8 +725,36 @@ async function refreshSeats() {
   font-size: var(--text-2xs);
 }
 
-.about__notice {
+.about__update {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
   padding: var(--space-3) var(--space-4);
+  border: var(--line-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.about__update-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.about__update-text strong {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.about__update-text small {
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+}
+
+.about__notice {  padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-md);
   background: var(--color-surface-sunken);
   font-size: var(--text-xs);

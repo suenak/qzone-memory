@@ -29,7 +29,7 @@ import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import StatTile from "../components/ui/StatTile.vue";
 import {
-  cancelFeedArchive, listArchiveSkips, retryArchiveSkip, startFeedArchive,
+  cancelFeedArchive, getArchiveProgress, listArchiveSkips, retryArchiveSkip, startFeedArchive,
   type ArchiveProgress, type ArchiveSkipItem, type ArchiveStatus,
 } from "../utils/qzone";
 import { useArchiveStore } from "../stores/archive";
@@ -115,24 +115,60 @@ const statsLoading = computed(() => !archiveStore.hasTask && !archiveStore.error
 const intervalDraft = ref(getArchiveInterval());
 const intervalHint = computed(() => `每页等待 ${(intervalDraft.value / 1000).toFixed(1)} 秒，较长的间隔可减少频繁请求。`);
 
-watch(intervalDraft, (value) => { intervalDraft.value = setArchiveInterval(value); });
-const intervalSeconds = computed({ get: () => intervalDraft.value / 1000, set: (value: number) => { intervalDraft.value = setArchiveInterval(value * 1000); } });
+/* 输入框绑到 `intervalInputValue` 草稿：若直接绑到带 clamp 的 setter，用户想输 10000ms 时，
+ * 第一个 "1" 会被改成 2000，后续输入得到 20000 而不是 10000。
+ * 这里只保留用户输入的原始值，blur / 回车时才归一化并保存。 */
+const intervalInputValue = ref(intervalDraft.value / 1000);
+/** 归一化并保存：只在提交（blur / 回车）时执行，输入过程中不篡改用户输入。 */
+function commitIntervalInput() {
+  const seconds = typeof intervalInputValue.value === "number" && Number.isFinite(intervalInputValue.value)
+    ? intervalInputValue.value
+    : intervalDraft.value / 1000;
+  const normalized = setArchiveInterval(seconds * 1000);
+  intervalDraft.value = normalized;
+  intervalInputValue.value = normalized / 1000;
+}
 
+/* 刚由 start / cancel 写入的进度在此刻之前视为权威：侧边栏轮询是「更早发出」的请求，
+ * 它的响应回来时不能把按钮状态改回旧值（「停止备份」变回「备份中」）。
+ * archive.ts 是父任务负责的文件，这里不引入跨文件的新接口，只在组件内做短 TTL 保护。 */
+const PROGRESS_FRESH_MS = 2500;
+let progressFreshAt = 0;
+function markProgressFresh() { progressFreshAt = Date.now(); }
+function progressIsFresh() { return Date.now() - progressFreshAt < PROGRESS_FRESH_MS; }
+
+/** 取一次最新进度；已有在飞请求时返回同一个 Promise，调用方 await 到的一定是新值。
+ *  不走 archiveStore.refresh()：它遇到在飞请求会直接 return，调用方随后读到的还是旧值。 */
+let refreshPromise: Promise<void> | null = null;
 async function refresh() {
-  if (refreshing.value) return;
+  if (refreshPromise) return refreshPromise;
   refreshing.value = true;
-  try {
-    await archiveStore.refresh();
-    if (!loggedIn.value) { skips.value = []; return; }
-    try { skips.value = await listArchiveSkips(); skipsError.value = ""; }
-    catch (reason) { skipsError.value = describeError(reason, "跳页记录读取失败，请刷新重试。"); }
-  } finally { refreshing.value = false; }
+  refreshPromise = (async () => {
+    try {
+      try {
+        const snapshot = await getArchiveProgress();
+        // 旧轮询响应在 start/cancel 写入之后才返回：丢弃，避免按钮状态回跳。
+        if (!progressIsFresh()) { archiveStore.progress = snapshot; archiveStore.error = ""; }
+      } catch (reason) {
+        // 落在与 store 相同的错误面上，进度读取失败时模板照旧给出提示。
+        archiveStore.error = String(reason);
+      }
+      if (!loggedIn.value) { skips.value = []; return; }
+      try { skips.value = await listArchiveSkips(); skipsError.value = ""; }
+      catch (reason) { skipsError.value = describeError(reason, "跳页记录读取失败，请刷新重试。"); }
+    } finally { refreshing.value = false; refreshPromise = null; }
+  })();
+  return refreshPromise;
 }
 async function start() {
   if (!loggedIn.value || starting.value || running.value || rateWaiting.value || !licenseStore.canArchive) return;
   starting.value = true;
   actionError.value = "";
-  try { archiveStore.progress = await startFeedArchive(getArchiveInterval()); }
+  try {
+    archiveStore.progress = await startFeedArchive(getArchiveInterval());
+    // 紧接其后的 refresh（含侧边栏轮询）不得用旧快照覆盖刚拿到的状态。
+    markProgressFresh();
+  }
   catch (reason) { actionError.value = describeError(reason, "未能开始备份，请重试。"); }
   finally { starting.value = false; await refresh(); }
 }
@@ -140,7 +176,10 @@ async function cancel() {
   if (stopping.value) return;
   stopping.value = true;
   actionError.value = "";
-  try { await cancelFeedArchive(); }
+  try {
+    await cancelFeedArchive();
+    markProgressFresh();
+  }
   catch (reason) { actionError.value = describeError(reason, "未能停止备份，请重试。"); }
   finally { stopping.value = false; await refresh(); }
 }
@@ -168,9 +207,11 @@ function offsetLabel(item: ArchiveSkipItem) {
 onMounted(async () => {
   // 进度与侧边栏共用 stores/archive.ts 这一份轮询，本页不再自建定时器。
   archiveStore.startPolling();
-  await refresh();
   currentTime.value = Date.now();
+  // 定时器必须在第一个 await 之前建立：否则 await 期间用户切走页面时，
+  // onBeforeUnmount 清理的 timer 还是 undefined，定时器会带着已卸载组件一直跑。
   timer = setInterval(() => { currentTime.value = Date.now(); }, 1000);
+  await refresh();
 });
 watch(() => archiveStore.progress?.status, (status, previous) => {
   if (previous === "running" && status !== "running") void refresh();
@@ -299,9 +340,10 @@ onBeforeUnmount(() => clearInterval(timer));
               <Calendar :size="15" :stroke-width="1.8" aria-hidden="true" />
               每页间隔
             </label>
+            <!-- 只更新草稿，blur / 回车时才归一化保存：输入过程中不篡改用户输入。 -->
             <InputNumber
               input-id="archive-interval"
-              v-model="intervalSeconds"
+              v-model="intervalInputValue"
               :min="MIN_ARCHIVE_INTERVAL / 1000"
               :max="MAX_ARCHIVE_INTERVAL / 1000"
               :step="0.5"
@@ -309,6 +351,8 @@ onBeforeUnmount(() => clearInterval(timer));
               suffix=" 秒"
               :disabled="running"
               show-buttons
+              @blur="commitIntervalInput"
+              @keydown.enter="commitIntervalInput"
             />
             <small>{{ intervalHint }}</small>
           </div>
@@ -631,6 +675,7 @@ onBeforeUnmount(() => clearInterval(timer));
 }
 
 /* ------------------------------------------------------------ 统计网格 */
+/* 统计网格 / 操作区 / 状态面板的主规则集中在文件末尾，这里只保留注释锚点。 */
 
 /* ------------------------------------------------------------ 操作区 */
 
@@ -887,6 +932,12 @@ onBeforeUnmount(() => clearInterval(timer));
 
   .ghost-button {
     justify-content: center;
+    /* 原先这条写在文件末尾重复的同断点媒体查询里，现合并到本块。 */
+    min-height: var(--touch-target);
+  }
+
+  .notice {
+    flex-wrap: wrap;
   }
 
   .interval-field {
@@ -916,10 +967,6 @@ onBeforeUnmount(() => clearInterval(timer));
   .ghost-button {
     justify-content: center;
   }
-
-  .notice {
-    flex-wrap: wrap;
-  }
 }
 
 .status-panel {
@@ -944,6 +991,5 @@ onBeforeUnmount(() => clearInterval(timer));
   display: flex;
   align-items: center;
   gap: var(--space-2); flex-wrap:wrap; }
-@media (max-width:860px) { .action-bar { align-items:stretch; } .interval-field { width:100%; } .notice { flex-wrap:wrap; } .ghost-button { min-height:var(--touch-target); } }
 
 </style>

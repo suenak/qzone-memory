@@ -26,27 +26,32 @@ pub fn media_url(value: &str) -> Result<Url, String> {
             return Err("媒体地址必须使用 HTTPS".to_owned());
         }
     }
-    if url.scheme() != "https" || url.host_str().is_none() {
+    // host_str() 实测在 url 2.x 下不会返回空串（`https://` 与 `https://:443/a` 直接解析失败），
+    // 显式判空是为了让这条防线不依赖 url crate 的具体行为。
+    if url.scheme() != "https" || url.host_str().is_none_or(str::is_empty) {
         return Err("媒体地址必须使用 HTTPS".to_owned());
     }
     Ok(url)
 }
 
+/// 判断一次重定向是否放行。
+/// reqwest 的 `previous()` 保存整条链：**首位是初始 URL，末位才是本次重定向的来源**
+/// （reqwest 自身判断跨主重定向时用的也是末位）。取首位会让
+/// “起始于 qpic.cn → 第三方” 这类链被当成非凭证来源而放行，显式防线随之失效。
+fn redirect_is_allowed(previous: &[Url], destination: &Url) -> bool {
+    let credential_origin = previous.last().is_some_and(accepts_qq_credentials);
+    destination.scheme() == "https"
+        && destination.username().is_empty()
+        && destination.password().is_none()
+        && !(credential_origin && !accepts_qq_credentials(destination))
+}
+
 pub fn redirect_policy() -> Policy {
     Policy::custom(|attempt| {
-        let destination = attempt.url();
         if attempt.previous().len() >= 5 {
             return attempt.error("媒体重定向次数过多");
         }
-        let credential_origin = attempt
-            .previous()
-            .first()
-            .is_some_and(accepts_qq_credentials);
-        if destination.scheme() != "https"
-            || !destination.username().is_empty()
-            || destination.password().is_some()
-            || (credential_origin && !accepts_qq_credentials(destination))
-        {
+        if !redirect_is_allowed(attempt.previous(), attempt.url()) {
             return attempt.error("媒体重定向目标不安全");
         }
         attempt.follow()
@@ -101,6 +106,33 @@ mod tests {
         ] {
             assert!(media_url(value).is_err());
         }
+    }
+
+    #[test]
+    fn third_party_redirect_is_rejected_when_the_chain_started_on_qpic() {
+        // 起始 qpic.cn：previous 的末位就是 qpic.cn，因此这是凭证来源，第三方目标必须被拒绝。
+        let from_qpic = [Url::parse("https://a.qpic.cn/a.jpg").unwrap()];
+        let third_party = Url::parse("https://example.com/a.jpg").unwrap();
+        assert!(!redirect_is_allowed(&from_qpic, &third_party));
+        // 同一来源下的 QQ 域名仍然放行。
+        assert!(redirect_is_allowed(
+            &from_qpic,
+            &Url::parse("https://img.qq.com/a.jpg").unwrap()
+        ));
+        // 非 QQ 起始则保持原有的宽松行为。
+        let from_cdn = [Url::parse("https://cdn.example.com/a.jpg").unwrap()];
+        assert!(redirect_is_allowed(&from_cdn, &third_party));
+        // 链上有多次跳转时，只有末位（最近一次来源）参与凭证判定。
+        let chained = [
+            Url::parse("https://a.qpic.cn/a.jpg").unwrap(),
+            Url::parse("https://cdn.example.net/b.jpg").unwrap(),
+        ];
+        assert!(redirect_is_allowed(&chained, &third_party));
+        // 目标地址自身携带账号信息时始终拒绝。
+        assert!(!redirect_is_allowed(
+            &from_qpic,
+            &Url::parse("https://user:pass@img.qq.com/a.jpg").unwrap()
+        ));
     }
 
     #[test]

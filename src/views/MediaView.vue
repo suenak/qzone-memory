@@ -52,10 +52,13 @@ const videoError = ref("");
 let imageObserver: IntersectionObserver | undefined;
 let loadObserver: IntersectionObserver | undefined;
 
-const hasMore = computed(() => media.value.length < total.value);
+/** 后端返回空页时置位，表示确实没有下一页。不能用改写 total 的方式表达「到底了」，那会伪造总数。 */
+const exhausted = ref(false);
+const hasMore = computed(() => !exhausted.value && media.value.length < total.value);
 const yearOptions = computed(() => [{ label: "全部年份", value: 0 }, ...years.value.map((year) => ({ label: `${year} 年`, value: year }))]);
 const formatTime = (seconds: number) => seconds ? new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(seconds * 1000)) : "时间未知";
-const avatarUrl = (uin?: string) => uin ? `https://qlogo2.store.qq.com/qzone/${uin}/${uin}/50?${Date.now()}` : "";
+// 模板里以方法调用求值：带时间戳会让详情头与评论头像在每次重渲染时重新发起请求，固定地址交给 HTTP 缓存即可。
+const avatarUrl = (uin?: string) => uin ? `https://qlogo2.store.qq.com/qzone/${uin}/${uin}/50` : "";
 
 /* ------------------------------------------------------------------ 纯 UI 状态
  * 年份分组、灯箱与占位文案都只影响渲染，取数流程与上面完全一致。 */
@@ -126,13 +129,16 @@ async function load(reset = false) {
   const sequence = reset ? ++loadSequence : loadSequence;
   loading.value = true;
   error.value = "";
+  // 切换年份时先清空列表，否则加载期间还会继续渲染上一个年份的媒体。
+  if (reset) { media.value = []; exhausted.value = false; }
   try {
     const page = await listArchivedMedia(PAGE_SIZE, reset ? 0 : media.value.length, selectedYear.value || undefined);
     if (sequence !== loadSequence) return;
     years.value = page.years;
     total.value = page.total;
     media.value = reset ? page.items : [...media.value, ...page.items];
-    if (!page.items.length) total.value = media.value.length;
+    // 空页只说明「没有下一页」：把 total 改写成当前长度会伪造总数，这里用独立标志收尾。
+    if (!page.items.length) exhausted.value = true;
     await nextTick();
     observeImages();
   } catch (reason) { if (sequence === loadSequence) error.value = `读取媒体失败：${String(reason)}`; }

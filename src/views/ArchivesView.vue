@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { describeError, diagnosticError } from "../utils/uiError";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, type Component } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { platform } from "../utils/platform";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -53,6 +53,8 @@ import { loadRemoteImageBlob } from "../utils/archiveImage";
 import { countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, listArchiveYears, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 
 const route = useRoute();
+// 清筛选时要一并改写路由参数，否则 ?q= 会被路由 watcher 写回搜索框。
+const router = useRouter();
 const toast = useToast();
 const records = ref<ArchiveItem[]>([]);
 // 全局搜索会带着 ?q= 跳到本页，初始关键词直接取自路由，避免闪一次空结果。
@@ -90,7 +92,8 @@ const imageLoading = reactive<Record<string, boolean>>({});
 const imageErrors = reactive<Record<string, string>>({});
 const imageFallbackAttempted = reactive<Record<string, boolean>>({});
 const imagePreviewVisible = ref(false);
-usePreviewFocus(imagePreviewVisible, () => { imagePreviewVisible.value = false; });
+// 统一走 closeImagePreview：它还要补做被灯箱跳过的 blob 回收，不能只把可见性置 false。
+usePreviewFocus(imagePreviewVisible, () => closeImagePreview());
 const previewImageUrl = ref("");
 const previewImageName = ref("qzone-image.jpg");
 const savingImage = ref(false);
@@ -191,7 +194,8 @@ async function load() {
       listArchiveYears(category.value),
     ]);
     if (sequence !== loadSequence) return;
-    records.value = items; totalRecords.value = total; selectedIds.value = []; avatarTimestamp.value = Date.now();
+    // 这里不再刷新 avatarTimestamp：load() 会被搜索、翻页、筛选频繁触发，每次重取时间戳都会让整屏头像重新下载。
+    records.value = items; totalRecords.value = total; selectedIds.value = [];
     first.value = items.length;
     years.value = availableYears;
     if (selectedYear.value && !availableYears.includes(selectedYear.value)) selectedYear.value = 0;
@@ -240,12 +244,21 @@ function observeSentinel() {
   }, { rootMargin: "320px 0px" });
   sentinelObserver.observe(element);
 }
+/**
+ * 灯箱（Teleport 到 body）和卡片共用同一批 blob：灯箱正显示或待左右切换的那几张不能被回收，
+ * 否则大图会变白、「保存图片」也会失败。只跳过被灯箱持有的地址，其余照常释放。
+ */
+function isHeldByLightbox(blobUrl: string) {
+  if (!imagePreviewVisible.value) return false;
+  if (previewImageUrl.value === blobUrl) return true;
+  return previewSources.value.some((entry) => entry.source === blobUrl);
+}
 function releaseVideos() {
   imageObserver?.disconnect();
   Object.values(videoSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
   Object.keys(videoSources).forEach((key) => delete videoSources[Number(key)]);
   Object.keys(videoErrors).forEach((key) => delete videoErrors[Number(key)]);
-  Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
+  Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:") && !isHeldByLightbox(url)) URL.revokeObjectURL(url); });
   Object.keys(imageSources).forEach((key) => delete imageSources[key]);
   Object.keys(imageLoading).forEach((key) => delete imageLoading[key]);
   Object.keys(imageErrors).forEach((key) => delete imageErrors[key]);
@@ -290,7 +303,8 @@ async function loadRemoteArchiveImage(url: string) {
 async function handleArchiveImageError(url: string) {
   if (!url || imageLoading[url]) return;
   const source = imageSources[url];
-  if (source?.startsWith("blob:")) URL.revokeObjectURL(source);
+  // 这张图可能正被灯箱显示：此时只解除卡片绑定，不能回收灯箱还在用的 blob。
+  if (source?.startsWith("blob:") && !isHeldByLightbox(source)) URL.revokeObjectURL(source);
   delete imageSources[url];
   if (imageFallbackAttempted[url]) {
     imageErrors[url] = "图片文件无法显示，可点击重试";
@@ -348,7 +362,20 @@ function setImageScale(value: number) {
   imageScale.value = Math.min(5, Math.max(0.5, value));
   if (imageScale.value <= 1) { imageOffset.x = 0; imageOffset.y = 0; }
 }
-function closeImagePreview() { imagePreviewVisible.value = false; imageActionVisible.value = false; resetImageTransform(); }
+/**
+ * 灯箱持有过的地址在 releaseVideos() 里被跳过回收，关灯箱时补上这一步：
+ * 只释放已经不在卡片上的那些，卡片仍在用的由 releaseVideos() 统一管理，避免重复回收。
+ */
+function releaseDetachedPreviewBlobs() {
+  const inUseByCards = new Set(Object.values(imageSources));
+  previewSources.value.forEach((entry) => {
+    if (entry.source.startsWith("blob:") && !inUseByCards.has(entry.source)) URL.revokeObjectURL(entry.source);
+  });
+}
+function closeImagePreview() {
+  imagePreviewVisible.value = false; imageActionVisible.value = false; resetImageTransform();
+  releaseDetachedPreviewBlobs();
+}
 function imageWheel(event: WheelEvent) { setImageScale(imageScale.value * (event.deltaY < 0 ? 1.15 : 0.87)); }
 function toggleImageZoom() { imageScale.value > 1 ? resetImageTransform() : setImageScale(2); }
 function pointerDistance() {
@@ -429,7 +456,18 @@ function toggleVisible() {
 }
 function askDelete() { if (selectedIds.value.length) confirmVisible.value = true; }
 function toggleComments(id: number) { expandedComments.has(id) ? expandedComments.delete(id) : expandedComments.add(id); }
-function clearFilters() { query.value = ""; selectedYear.value = 0; }
+/**
+ * 顶部全局搜索会把 ?q= / ?year= 带到本页。本地清筛选后必须一并清掉路由参数，
+ * 否则路由 watcher 会在 flush 后把关键词写回，用户会看到列表又跳回搜索结果。
+ */
+function dropRouteFilters() {
+  if (!route.query.q && !route.query.year) return;
+  const nextQuery = { ...route.query };
+  delete nextQuery.q;
+  delete nextQuery.year;
+  void router.replace({ query: nextQuery });
+}
+function clearFilters() { query.value = ""; selectedYear.value = 0; dropRouteFilters(); }
 function dismissError() { error.value = ""; }
 async function confirmDelete() {
   deleting.value = true; error.value = "";
@@ -445,10 +483,23 @@ onMounted(() => {
   window.addEventListener("keydown", handlePreviewKeydown);
   void load();
 });
+/** 本页自己重置筛选时置位：让 query 与年份的 watcher 跳过这一次，避免连发两次请求。 */
+let suppressFilterReload = false;
 watch(sentinelEl, () => observeSentinel(), { flush: "post" });
-watch(category, () => { first.value = 0; query.value = ""; selectedYear.value = 0; void load(); });
-watch([selectedYear, descending], () => { first.value = 0; void load(); });
+watch(category, () => {
+  first.value = 0;
+  // 切换分类会同时清掉关键词与年份：静音下面两个 watcher，只由这里发起一次加载。
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = undefined; }
+  suppressFilterReload = true;
+  query.value = "";
+  selectedYear.value = 0;
+  void nextTick(() => { suppressFilterReload = false; });
+  dropRouteFilters();
+  void load();
+});
+watch([selectedYear, descending], () => { if (suppressFilterReload) return; first.value = 0; void load(); });
 watch(query, () => {
+  if (suppressFilterReload) return;
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = setTimeout(() => { first.value = 0; void load(); }, 260);
 });

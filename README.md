@@ -1,4 +1,4 @@
-# 空间回忆馆 · qzone-memory
+# 拾忆 · qzone-memory
 
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-2.0-blue)](https://v2.tauri.app/)
@@ -213,7 +213,7 @@ cargo test --manifest-path src-tauri/license-core/Cargo.toml   # 授权校验逻
 
 客户端的授权页面、凭证校验与接口调用是客户端源码的一部分，因此包含在此。独立的授权管理服务、管理后台、卡密生成、账号数据库、更新服务和服务端私钥不包含在本仓库。内置验签公钥不是私钥。
 
-当前公开的是 2026-10-09 的客户端源码快照，包含本地数据访问与媒体请求安全修复；此次没有上传安装包。分发安装包时，应提供与该安装包对应的源码版本及构建说明，不能用不同版本的源码替代。详见 [GNU GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)。
+本目录已同步至 2026-10-10 的客户端源码，包含本地数据访问、媒体请求安全修复，以及通过原生请求检查更新的功能；不包含授权管理服务。分发安装包时，应提供与该安装包对应的源码版本及构建说明，不能用不同版本的源码替代。详见 [GNU GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)。
 
 构建授权地址可通过 `QZA_LICENSE_SERVER` 设置。仓库默认地址是占位地址，不包含可用账号或管理服务配置。已有数据访问不需要授权；联网备份需要匹配服务端公钥的授权凭证。
 

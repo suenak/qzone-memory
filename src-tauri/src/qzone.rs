@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
@@ -53,6 +53,16 @@ const TOKEN_PROBE_TITLE_PREFIX: &str = "__QZA_QZONETOKEN__";
 #[derive(Clone, Default)]
 pub struct QzonePageTokenState {
     token: Arc<Mutex<Option<(String, String)>>>,
+}
+
+impl QzonePageTokenState {
+    /// 清空进程级页面 token。该 State 的生命周期长于登录会话，登出或切换账号后
+    /// 旧 token 必须立即失效，否则会一直留到进程结束。
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.token.lock() {
+            *guard = None;
+        }
+    }
 }
 
 fn extract_qzone_token(page: &str) -> Option<String> {
@@ -307,7 +317,52 @@ async fn fetch_qzone_token(
 
 #[derive(Clone, Default)]
 pub struct RecycleAuthState {
-    pwd2sig: Arc<Mutex<Option<String>>>,
+    /// (账号 uin, 独立密码签名)。签名与账号绑定，避免登出或切换账号后
+    /// 继续使用上一位账号的回收站凭证。
+    pwd2sig: Arc<Mutex<Option<(String, String)>>>,
+}
+
+impl RecycleAuthState {
+    fn store(&self, uin: &str, token: String) {
+        if uin.is_empty() || token.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.pwd2sig.lock() {
+            *guard = Some((uin.to_owned(), token));
+        }
+    }
+
+    /// 只在签名归属的账号与当前账号一致时返回，否则视为失效。
+    fn cached_for(&self, uin: &str) -> Option<String> {
+        let guard = self.pwd2sig.lock().ok()?;
+        guard
+            .as_ref()
+            .and_then(|(owner, token)| (owner == uin && !token.is_empty()).then(|| token.clone()))
+    }
+
+    /// 清空进程级签名缓存；登出与切换账号时必须调用。
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.pwd2sig.lock() {
+            *guard = None;
+        }
+    }
+}
+
+/// 清空进程级 QQ 凭证缓存（页面 token 与回收站独立密码签名）。
+/// 这两份缓存不受 `QLoginState::clear_session` 管辖，但都属于会话凭证，
+/// 因此登出与账号切换都必须显式清理。
+pub(crate) fn clear_qq_credential_caches(app: &tauri::AppHandle) {
+    app.state::<QzonePageTokenState>().clear();
+    app.state::<RecycleAuthState>().clear();
+}
+
+/// 回收站验证窗口只允许停留在 QQ 域。任意站点被导航进来后，只要发出带
+/// `pwd2sig` 的请求就能污染这份凭证缓存。
+fn is_qq_navigation_target(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str().is_some_and(|host| host.ends_with(".qq.com"))
 }
 
 fn pwd2sig_from_url(value: &str) -> Option<String> {
@@ -319,7 +374,11 @@ fn pwd2sig_from_url(value: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: RecycleAuthState) {
+fn install_recycle_request_listener(
+    window: &tauri::WebviewWindow,
+    state: RecycleAuthState,
+    uin: String,
+) {
     use webview2_com::{
         take_pwstr,
         Microsoft::Web::WebView2::Win32::{ICoreWebView2, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL},
@@ -333,10 +392,13 @@ fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: Recycl
             return;
         };
         unsafe {
+            // 过滤器按 host 收窄：注册 "*" 会让该窗口里任何页面的请求都进入回调，
+            // 于是任意被导航进来的页面只要带上同名字符串就能污染 pwd2sig。
             let _ = webview.AddWebResourceRequestedFilter(
-                &HSTRING::from("*"),
+                &HSTRING::from("https://user.qzone.qq.com/*"),
                 COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
             );
+            let listener_uin = uin.clone();
             let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
                 let Some(args) = args else {
                     return Ok(());
@@ -345,10 +407,18 @@ fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: Recycl
                 let mut raw_uri = PWSTR::null();
                 request.Uri(&mut raw_uri)?;
                 let uri = take_pwstr(raw_uri);
-                if uri.contains("cgi_plist_recycle_v2") {
-                    if let Some(token) = pwd2sig_from_url(&uri) {
-                        if let Ok(mut guard) = state.pwd2sig.lock() {
-                            *guard = Some(token);
+                // 只有 QQ 空间域发出、且路径命中回收站照片接口的请求才允许提取签名；
+                // 用 path 而不是整串匹配，查询串里的同名文本不再能命中。
+                if let Ok(url) = Url::parse(&uri) {
+                    let trusted_host = url.host_str().is_some_and(|host| {
+                        host == "user.qzone.qq.com" || host.ends_with(".qzone.qq.com")
+                    });
+                    if url.scheme() == "https"
+                        && trusted_host
+                        && url.path().contains("cgi_plist_recycle_v2")
+                    {
+                        if let Some(token) = pwd2sig_from_url(&uri) {
+                            state.store(&listener_uin, token);
                         }
                     }
                 }
@@ -726,9 +796,8 @@ pub async fn open_recycle_password_window(
         return Ok(());
     }
     let auth = state.qzone_auth().await?;
-    if let Ok(mut guard) = recycle_state.pwd2sig.lock() {
-        *guard = None;
-    }
+    // 换账号或重新验证时，旧签名的归属已经不成立，先整体作废。
+    recycle_state.clear();
     let page_url = Url::parse(&format!(
         "https://user.qzone.qq.com/{}/photo/recycle",
         auth.uin
@@ -779,15 +848,19 @@ pub async fn open_recycle_password_window(
       })();
     "#;
     let navigation_state = recycle_state.inner().clone();
+    let navigation_uin = auth.uin.clone();
     let builder =
         WebviewWindowBuilder::new(&app, RECYCLE_WINDOW_LABEL, WebviewUrl::External(page_url))
             .title("验证 QQ 空间独立密码")
             .inner_size(960.0, 720.0)
             .on_navigation(move |url| {
+                // 该窗口承载的是 QQ 回收站验证流程；导航目标离开 QQ 域就直接拒绝，
+                // 否则第三方页面可以在同一窗口里构造带 pwd2sig 的请求污染缓存。
+                if !is_qq_navigation_target(&url) {
+                    return false;
+                }
                 if let Some(token) = pwd2sig_from_url(url.as_str()) {
-                    if let Ok(mut guard) = navigation_state.pwd2sig.lock() {
-                        *guard = Some(token);
-                    }
+                    navigation_state.store(&navigation_uin, token);
                 }
                 true
             });
@@ -807,7 +880,7 @@ pub async fn open_recycle_password_window(
         .build()
         .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
     #[cfg(windows)]
-    install_recycle_request_listener(&_window, recycle_state.inner().clone());
+    install_recycle_request_listener(&_window, recycle_state.inner().clone(), auth.uin.clone());
     Ok(())
 }
 
@@ -818,9 +891,7 @@ pub async fn prepare_recycle_password_window(
 ) -> Result<String, String> {
     crate::license::require_archive_access()?;
     let auth = state.qzone_auth().await?;
-    if let Ok(mut guard) = recycle_state.pwd2sig.lock() {
-        *guard = None;
-    }
+    recycle_state.clear();
     Ok(format!(
         "https://user.qzone.qq.com/{}/photo/recycle",
         auth.uin
@@ -830,13 +901,19 @@ pub async fn prepare_recycle_password_window(
 #[tauri::command]
 pub async fn check_recycle_password(
     app: tauri::AppHandle,
+    state: tauri::State<'_, QLoginState>,
     recycle_state: tauri::State<'_, RecycleAuthState>,
 ) -> Result<Option<String>, String> {
     crate::license::require_archive_access()?;
-    if let Ok(guard) = recycle_state.pwd2sig.lock() {
-        if let Some(token) = guard.clone() {
+    // 缓存里的签名属于某一次验证时的账号：账号已登出或已切换时它不再可用，
+    // 否则旧账号的回收站凭证会被继续拿去请求。
+    if let Some(current_uin) = state.qzone_auth().await.map(|auth| auth.uin).ok() {
+        if let Some(token) = recycle_state.cached_for(&current_uin) {
             return Ok(Some(token));
         }
+    } else {
+        // 会话已经不在了，签名的归属无从校验，就地作废。
+        recycle_state.clear();
     }
     let Some(window) = app.get_webview_window(RECYCLE_WINDOW_LABEL) else {
         return Err("独立密码验证窗口已关闭，请重新验证".into());
@@ -1335,6 +1412,11 @@ fn sec_platform(user_agent: &str) -> &'static str {
 fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<Value> {
     headers
         .iter()
+        // Set-Cookie 回显的正是登录凭证本身，不能进入诊断日志。
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            !name.eq_ignore_ascii_case("set-cookie") && !name.eq_ignore_ascii_case("set-cookie2")
+        })
         .map(|(name, value)| {
             json!({
                 "name": name.as_str(),
@@ -1342,6 +1424,81 @@ fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// 诊断日志里允许出现的查询参数。这里用白名单而不是黑名单：`g_tk`、`res_attach`、
+/// `qzonetoken` 这类参数一旦原样落盘就等于把会话交出去，而新参数会不断出现。
+const LOGGABLE_QUERY_PARAMETERS: &[&str] = &[
+    "begin",
+    "begin_time",
+    "beginTime",
+    "count",
+    "day",
+    "dayNum",
+    "end_time",
+    "format",
+    "getappnotification",
+    "getnotifi",
+    "has_get_key",
+    "offset",
+    "outputhtmlfeed",
+    "refresh",
+    "refresh_type",
+    "res_type",
+    "scope",
+    "set",
+    "size",
+    "type",
+    "uin",
+    "useutf8",
+];
+
+/// 响应体在日志里的最长保留长度，超出部分直接丢掉。
+const RESPONSE_BODY_LOG_LIMIT: usize = 512;
+
+fn is_loggable_query_parameter(name: &str) -> bool {
+    LOGGABLE_QUERY_PARAMETERS.contains(&name)
+}
+
+/// 请求地址里只有白名单参数会被保留，凭证类查询参数一律不落盘。
+fn sanitize_request_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return "[请求地址无法解析]".to_owned();
+    };
+    let kept = url
+        .query_pairs()
+        .filter(|(name, _)| is_loggable_query_parameter(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    if !kept.is_empty() {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.extend_pairs(
+            kept.iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        url.set_query(Some(&serializer.finish()));
+    }
+    url.to_string()
+}
+
+/// 响应正文可能回显 cookie 或 `qzonetoken`，落盘前先截断，再抹掉所有凭证赋值。
+fn sanitize_response_body(body: &str) -> String {
+    static CREDENTIAL_ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = CREDENTIAL_ASSIGNMENT.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(p_skey|skey|p_uin|pt4_token|qzonetoken|g_tk|pwd2sig|pt_login_sig|qrsig|ptqrtoken|ptui_loginuin)(["']?\s*[:=]\s*["']?)([^"'&;\s,}<>]+)"#,
+        )
+        .expect("fixed credential redaction regex")
+    });
+    let total = body.chars().count();
+    let truncated: String = body.chars().take(RESPONSE_BODY_LOG_LIMIT).collect();
+    let redacted = pattern.replace_all(&truncated, "${1}${2}[已隐藏]");
+    if total > RESPONSE_BODY_LOG_LIMIT {
+        format!("{redacted}…（已截断，共 {total} 字符）")
+    } else {
+        redacted.into_owned()
+    }
 }
 
 fn log_feed_request_error(
@@ -1357,25 +1514,25 @@ fn log_feed_request_error(
 ) {
     let parameters = query
         .iter()
+        .filter(|(name, _)| is_loggable_query_parameter(name))
         .map(|(name, value)| ((*name).to_owned(), Value::String(value.clone())))
         .collect::<serde_json::Map<String, Value>>();
-    let parsed_body = response_body.and_then(|text| serde_json::from_str::<Value>(text).ok());
-    let body = match (response_body, parsed_body) {
-        (_, Some(value)) => Some(value),
-        (Some(text), None) => Some(json!({
-            "format": "raw",
+    // 无论能否解析成 JSON，正文都只以「截断 + 脱敏」的形式进入日志。
+    let body = response_body.map(|text| {
+        json!({
+            "format": if serde_json::from_str::<Value>(text).is_ok() { "json" } else { "raw" },
             "bytesReceived": text.as_bytes().len(),
-            "content": "非完整 JSON 或非 JSON 响应，原始正文见本诊断块下方"
-        })),
-        (None, None) => None,
-    };
+            "truncated": text.chars().count() > RESPONSE_BODY_LOG_LIMIT,
+            "content": sanitize_response_body(text),
+        })
+    });
     let diagnostic = json!({
         "event": "qzone_archive_request_error",
         "stage": stage,
         "error": error,
         "request": {
             "method": "GET",
-            "url": request_url,
+            "url": sanitize_request_url(request_url),
             "parameters": parameters,
             "headers": {
                 "Accept": "application/json",
@@ -1404,9 +1561,6 @@ fn log_feed_request_error(
     let formatted =
         serde_json::to_string_pretty(&diagnostic).unwrap_or_else(|_| diagnostic.to_string());
     eprintln!("\n================ QZONE ARCHIVE REQUEST ERROR ================\n{formatted}");
-    if let Some(text) = response_body {
-        eprintln!("---------------- RAW RESPONSE BODY ----------------\n{text}\n---------------- END RAW RESPONSE BODY ----------------");
-    }
     eprintln!("================ END QZONE ARCHIVE REQUEST ERROR ================\n");
 }
 
@@ -1961,12 +2115,32 @@ fn decode_history_html(response: &str) -> Result<String, String> {
         .replace("\\\\", "\\"))
 }
 
+/// 解析一页历史卡片会对同一组属性名/标签重复构造正则（30 张卡片可达数百次），
+/// 每次 `Regex::new` 都要重新编译。这里按模式串缓存编译结果。
+fn cached_history_regex(
+    cache: &'static OnceLock<Mutex<HashMap<String, Arc<regex::Regex>>>>,
+    pattern: String,
+) -> Option<Arc<regex::Regex>> {
+    let cache = cache.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().ok()?;
+    if let Some(compiled) = guard.get(&pattern) {
+        return Some(compiled.clone());
+    }
+    let compiled = Arc::new(regex::Regex::new(&pattern).ok()?);
+    guard.insert(pattern, compiled.clone());
+    Some(compiled)
+}
+
+static ATTRIBUTE_PATTERNS: OnceLock<Mutex<HashMap<String, Arc<regex::Regex>>>> = OnceLock::new();
+
 fn history_attribute(markup: &str, name: &str) -> Option<String> {
-    let pattern = regex::Regex::new(&format!(
-        r#"(?is)\b{}\s*=\s*[\"']([^\"']*)[\"']"#,
-        regex::escape(name)
-    ))
-    .ok()?;
+    let pattern = cached_history_regex(
+        &ATTRIBUTE_PATTERNS,
+        format!(
+            r#"(?is)\b{}\s*=\s*[\"']([^\"']*)[\"']"#,
+            regex::escape(name)
+        ),
+    )?;
     pattern
         .captures(markup)
         .and_then(|captures| captures.get(1))
@@ -1994,11 +2168,15 @@ fn history_plain_text(markup: &str) -> String {
         .join(" ")
 }
 
+static ELEMENT_PATTERNS: OnceLock<Mutex<HashMap<String, Arc<regex::Regex>>>> = OnceLock::new();
+
 fn history_elements(markup: &str, tag: &str, class_name: &str) -> Vec<(String, String)> {
-    let pattern = regex::Regex::new(&format!(
-        r#"(?is)<{tag}\b(?P<attrs>[^>]*)>(?P<body>.*?)</{tag}>"#
-    ))
-    .expect("fixed history element regex");
+    let Some(pattern) = cached_history_regex(
+        &ELEMENT_PATTERNS,
+        format!(r#"(?is)<{tag}\b(?P<attrs>[^>]*)>(?P<body>.*?)</{tag}>"#),
+    ) else {
+        return Vec::new();
+    };
     pattern
         .captures_iter(markup)
         .filter_map(|captures| {
@@ -2387,7 +2565,6 @@ pub(crate) async fn fetch_history_messages(
         ("outputhtmlfeed", "1".into()),
         ("scope", "1".into()),
         ("format", "jsonp".into()),
-        ("g_tk", auth.g_tk.to_string()),
         ("g_tk", auth.g_tk.to_string()),
     ];
     let mut last_error = String::new();
@@ -2806,21 +2983,6 @@ async fn fetch_feeds_with_attempts(
             Err(error)
         }
     }
-}
-
-#[tauri::command]
-pub async fn fetch_first_feeds(state: tauri::State<'_, QLoginState>) -> Result<FeedPage, String> {
-    crate::license::require_archive_access()?;
-    fetch_feeds(&state, "1", None).await
-}
-
-#[tauri::command]
-pub async fn fetch_more_feeds(
-    state: tauri::State<'_, QLoginState>,
-    attach_info: String,
-) -> Result<FeedPage, String> {
-    crate::license::require_archive_access()?;
-    fetch_feeds(&state, "2", Some(&attach_info)).await
 }
 
 #[cfg(test)]
