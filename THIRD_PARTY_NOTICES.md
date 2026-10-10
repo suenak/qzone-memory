@@ -2,6 +2,10 @@
 
 拾忆（qzone-memory）基于或参考了以下开源项目。项目名称、作者与许可证归各自权利人所有；这些项目及其作者不对本项目提供背书或担保。
 
+## 直接上游
+
+- [xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive) — GPL-3.0；本分支的直接来源，安装包与界面中仍保留其署名。
+
 ## 主要上游
 
 - [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) — GPL-3.0；本项目的主要上游与二次开发基础。
