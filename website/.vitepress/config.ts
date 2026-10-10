@@ -2,7 +2,7 @@ import { defineConfig } from "vitepress";
 
 export default defineConfig({
   lang: "zh-CN",
-  title: "QQ Zone Restore Archive",
+  title: "拾忆",
   description: "把值得留存的 QQ 空间记忆，安静地保存在你的设备上。",
   base: "/qzone-memory/",
   outDir: "./dist",

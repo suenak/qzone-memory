@@ -116,6 +116,6 @@ nix build
 nix profile install .#qzonearchive
 ```
 
-Linux 用户安装 QQ 客户端时，请按你自己发行版的要求选择 QQ 官方提供的 deb、rpm 或 Flatpak 版本；QQ Zone Restore Archive 本身不绑定或内置 QQ 客户端，只需要登录后扫描 QQ 空间的二维码即可使用。
+Linux 用户安装 QQ 客户端时，请按你自己发行版的要求选择 QQ 官方提供的 deb、rpm 或 Flatpak 版本；拾忆本身不绑定或内置 QQ 客户端，只需要登录后扫描 QQ 空间的二维码即可使用。
 
 从源码构建 Linux 版本可参考[开发](../development/)。
