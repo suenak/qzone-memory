@@ -12,6 +12,15 @@ concurrency:
   group: ci-build-${{ github.ref }}
   cancel-in-progress: true
 
+# 部署常量在构建期由 build.rs 注入（见 src-tauri/build.rs）。仓库里只有占位值，
+# 真实值存在仓库 secret 里。不设置这四项，打出来的包会指向占位地址、无法激活。
+env:
+  QZA_LICENSE_SERVER: ${{ secrets.QZA_LICENSE_SERVER }}
+  QZA_LICENSE_PUBLIC_KEY: ${{ secrets.QZA_LICENSE_PUBLIC_KEY }}
+  QZA_UPDATE_ENDPOINT: ${{ secrets.QZA_UPDATE_ENDPOINT }}
+  QZA_DOWNLOAD_PAGE: ${{ secrets.QZA_DOWNLOAD_PAGE }}
+  QZA_REQUIRE_CONFIG: "1"
+
 jobs:
   windows:
     runs-on: windows-latest

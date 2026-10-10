@@ -90,6 +90,7 @@ fn main() {
     for key in KEYS {
         println!("cargo:rerun-if-env-changed={key}");
     }
+    println!("cargo:rerun-if-env-changed=QZA_REQUIRE_CONFIG");
 
     let placeholder = read_config(CONFIG)
         .unwrap_or_else(|| panic!("缺少 {CONFIG} —— 占位配置应当随仓库一起提供"));
@@ -140,6 +141,20 @@ fn main() {
         for (key, source) in KEYS.iter().zip(sources.iter()) {
             println!("cargo:warning={key} 来自{source}");
         }
+    }
+
+    // 发布流水线设 `QZA_REQUIRE_CONFIG=1`：缺配置就直接失败，而不是安静地产出
+    // 一批指向 `license.example.com`、装上也激活不了的安装包。公开源码里没有
+    // 真实值，谁 clone 下来直接构建都会落到占位值，所以这个开关必须由 CI 显式打开。
+    if all_placeholder
+        && env::var("QZA_REQUIRE_CONFIG").is_ok_and(|flag| !matches!(flag.trim(), "" | "0"))
+    {
+        panic!(
+            "QZA_REQUIRE_CONFIG 已开启，但四项部署配置全部来自占位值 {}。\
+             请设置 QZA_LICENSE_SERVER / QZA_LICENSE_PUBLIC_KEY / QZA_UPDATE_ENDPOINT / \
+             QZA_DOWNLOAD_PAGE，或提供 {LOCAL_CONFIG}。",
+            CONFIG
+        );
     }
 
     let mut generated = String::from(
