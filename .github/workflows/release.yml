@@ -892,7 +892,7 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            ## QQ Zone Restore Archive ${{ github.ref_name }}
+            ## 拾忆 ${{ github.ref_name }}
 
             这是一个本地优先的 QQ 空间恢复归档工具。本版将当前可见说说、旧历史残留和互动记录进行结构化合并，并提供相册、视频、留言板、旧收藏、联系人互动、年份筛选、全文搜索和离线导出。
 

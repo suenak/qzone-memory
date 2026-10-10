@@ -51,10 +51,10 @@ sudo dpkg -i *.deb
 卸载：
 
 ```bash
-sudo apt remove qzonearchive
+sudo apt remove qzone-memory
 ```
 
-> 如果提示找不到包，可用 `dpkg -l | grep qzonearchive` 确认实际安装的包名（一般为 `qzonearchive`）。
+> 如果提示找不到包，可用 `dpkg -l | grep qzone-memory` 确认实际安装的包名（一般为 `qzone-memory`）。
 
 ### Fedora / openSUSE / RHEL 系
 
@@ -65,10 +65,10 @@ sudo rpm -i *.rpm
 卸载：
 
 ```bash
-sudo rpm -e qzonearchive
+sudo rpm -e qzone-memory
 ```
 
-> 如果提示找不到包，可用 `rpm -qa | grep qzonearchive` 确认实际安装的包名（一般为 `qzonearchive`）。
+> 如果提示找不到包，可用 `rpm -qa | grep qzone-memory` 确认实际安装的包名（一般为 `qzone-memory`）。
 
 ### 通用 AppImage（适用于其他 Linux 发行版）
 

@@ -8,7 +8,7 @@ making changes.
 
 ## Project Overview
 
-**QQ Zone Restore Archive** is a cross-platform desktop / mobile tool that archives QQ Zone
+**拾忆 (qzone-memory)** is a cross-platform desktop / mobile tool that archives QQ Zone
 feeds, photos, videos and interaction records to the local machine.
 
 - **Tech stack**: Tauri 2 + Rust backend; Vue 3 + TypeScript + Vite + PrimeVue 4 + Pinia

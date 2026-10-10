@@ -37,8 +37,8 @@ try {
     if (!$nativeText.Contains($localKeyBody)) { throw 'Compiled client does not contain the local licence public key.' }
     $package = Get-Content (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json
     $bundleDir = Join-Path $projectRoot 'src-tauri/target/release/bundle/nsis'
-    $source = Join-Path $bundleDir "QQ Zone Restore Archive_$($package.version)_x64-setup.exe"
-    $destination = Join-Path $bundleDir "QQ Zone Restore Archive_$($package.version)_x64-local-setup.exe"
+    $source = Join-Path $bundleDir "qzone-memory_$($package.version)_x64-setup.exe"
+    $destination = Join-Path $bundleDir "qzone-memory_$($package.version)_x64-local-setup.exe"
     Copy-Item -LiteralPath $source -Destination $destination -Force
     $reportDir = Join-Path $projectRoot 'build-output/local'
     New-Item -ItemType Directory -Force -Path $reportDir | Out-Null

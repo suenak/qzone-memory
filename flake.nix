@@ -1,5 +1,5 @@
 {
-  description = "QQ Zone Restore Archive local QQ space restoration and archive tool";
+  description = "qzone-memory local QQ space restoration and archive tool";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
