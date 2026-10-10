@@ -20,6 +20,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+// Android 没有 keyring 后端，凭据落在应用私有目录，取路径要用 `AppHandle::path()`。
+#[cfg(target_os = "android")]
+use tauri::Manager;
 
 use license_core::{
     detect_clock_rollback, is_stale_serial, status_for, verify_license, LicenseError,
