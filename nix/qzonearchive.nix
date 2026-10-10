@@ -8,17 +8,18 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "qzonearchive";
-  version = "1.1.1";
+  # 跟 Cargo.toml / tauri.conf.json / package.json 保持一致，改版本时四处一起改。
+  version = "1.2.2";
 
   src = lib.cleanSource ../.;
 
   cargoRoot = "src-tauri";
   buildAndTestSubdir = "src-tauri";
 
-  cargoHash = "sha256-y5w16nA9GoW06Q95587pFQ5Qc70CF6VCqqexacFYhT4=";
+  cargoHash = "sha256-+TMaMcJHxReYgDmc6r4YNA0mnY38AmX7m06ftJmb+MA=";
 
   npmDeps = pkgs.fetchNpmDeps {
-    name = "qzonearchive-1.1.1-npm-deps";
+    name = "qzonearchive-1.2.2-npm-deps";
     src = lib.cleanSource ../.;
     hash = "sha256-Z83m9nXg5mmTkXKx0lbwor6eRCBgwjguKVLGkLxRUpk=";
   };
