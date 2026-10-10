@@ -315,9 +315,36 @@ html .p-button:focus-visible {
   background: var(--color-surface);
 }
 
+/*
+ * 选中态必须在这里显式补回来，原因有两个，缺一个就会出现「白底上画白勾」——
+ * 勾选框看着完全没反应：
+ *
+ * 1. PrimeVue 4 把选中态标在**根节点**的 `.p-checkbox-checked` 上，`.p-highlight`
+ *    是 v3 的类名，v4 已经在 DOM 里不再产出它，照着 v3 写规则等于没写；
+ * 2. 上面那条 `.p-checkbox .p-checkbox-box` 未分层，未分层的样式天然优先于任何
+ *    CSS layer，而 PrimeVue 的运行时样式被收进了 `primevue` layer（见 main.ts），
+ *    于是它无条件压过组件库自己的选中背景。
+ *
+ * 图标颜色同样要指定：PrimeVue 给勾号用的是 `--p-checkbox-icon-checked-color`
+ * （白色），底色一旦被压回白，勾就成了隐形的。
+ */
+.p-checkbox-checked .p-checkbox-box,
 .p-checkbox .p-checkbox-box.p-highlight {
   background: var(--color-accent);
   border-color: var(--color-accent);
+}
+
+.p-checkbox-checked:not(.p-disabled):hover .p-checkbox-box {
+  background: var(--color-accent-hover);
+  border-color: var(--color-accent-hover);
+}
+
+.p-checkbox-checked .p-checkbox-box .p-checkbox-icon {
+  color: var(--color-on-accent);
+}
+
+.p-checkbox:not(.p-disabled):has(:focus-visible) .p-checkbox-box {
+  box-shadow: var(--shadow-focus);
 }
 
 html .p-select {
