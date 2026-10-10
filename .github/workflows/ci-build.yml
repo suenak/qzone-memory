@@ -158,7 +158,6 @@ jobs:
         run: |
           unsigned_apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
           signed_apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
-          keytool -genkeypair -keystore "$RUNNER_TEMP/android-test.jks" -alias test -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Temporary CI Test"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
             --ks "$RUNNER_TEMP/release.jks" \
             --ks-key-alias "$ANDROID_KEY_ALIAS" \
