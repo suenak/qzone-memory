@@ -3015,7 +3015,7 @@ pub async fn list_archive_skips(
     login: tauri::State<'_, QLoginState>,
 ) -> Result<Vec<ArchiveSkipItem>, String> {
     crate::license::require_read_access()?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let connection = open_database(&app)?;
     let mut statement = connection
         .prepare(
@@ -3141,6 +3141,59 @@ pub fn cancel_feed_archive(state: tauri::State<'_, ArchiveState>) {
     state.cancel.store(true, Ordering::Relaxed);
 }
 
+/// 本地库里最近写入归档的那个账号。
+///
+/// 存在的理由：读取命令都要先拿到 owner_uin，而它过去只能来自登录会话。会话是易失的
+/// ——Cookie 过期、临时断网、换台机器、卸载重装都会让它拿不到。此时读取命令一旦直接
+/// 报错，用户看到的就是「没有归档」，可 SQLite 里的数据一条没少，他只会以为数据丢了。
+/// AGENTS.md 的硬约束是「授权或登录状态不得让用户失去磁盘上已有的归档」，这里是它的落点。
+fn local_owner_uin(app: &tauri::AppHandle) -> Result<Option<String>, String> {
+    let connection = open_database(app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT owner_uin, MAX(archived_at) AS latest FROM (
+               SELECT owner_uin, archived_at FROM archive_feeds
+               UNION ALL
+               SELECT owner_uin, archived_at FROM archive_dynamics
+             )
+             WHERE owner_uin <> ''
+             GROUP BY owner_uin
+             ORDER BY latest DESC
+             LIMIT 1",
+        )
+        .map_err(|error| format!("读取本地归档账号失败：{error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("读取本地归档账号失败：{error}"))?;
+    match rows
+        .next()
+        .map_err(|error| format!("读取本地归档账号失败：{error}"))?
+    {
+        Some(row) => row
+            .get::<_, String>(0)
+            .map(Some)
+            .map_err(|error| format!("读取本地归档账号失败：{error}")),
+        None => Ok(None),
+    }
+}
+
+/// 读取路径上该展示哪个账号的归档：优先当前会话，没有会话就回退到本地库里记录的账号。
+///
+/// **只用于读取。** 归档、同步、删除这类命令必须继续要求真实会话：它们要么需要 Cookie
+/// 访问腾讯接口，要么会对某个账号的数据做写操作，回退只会把操作落到错误的账号上。
+async fn owner_uin_for_reads(
+    app: &tauri::AppHandle,
+    login: &QLoginState,
+) -> Result<String, String> {
+    match login.qzone_auth().await {
+        Ok(auth) => Ok(auth.uin),
+        Err(session_error) => match local_owner_uin(app)? {
+            Some(uin) => Ok(uin),
+            None => Err(session_error),
+        },
+    }
+}
+
 #[tauri::command]
 pub async fn list_archived_feeds(
     app: tauri::AppHandle,
@@ -3154,7 +3207,7 @@ pub async fn list_archived_feeds(
 ) -> Result<Vec<ArchiveItem>, String> {
     crate::license::require_read_access()?;
     validate_category(&category)?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     tauri::async_runtime::spawn_blocking(move || {
     let connection = open_database(&app)?;
     let order = if descending.unwrap_or(true) { "DESC" } else { "ASC" };
@@ -3285,7 +3338,7 @@ pub async fn list_archive_years(
 ) -> Result<Vec<i32>, String> {
     crate::license::require_read_access()?;
     validate_category(&category)?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
         let mut statement = connection
@@ -3323,7 +3376,7 @@ pub async fn list_archived_media(
     year: Option<i32>,
 ) -> Result<ArchiveMediaPage, String> {
     crate::license::require_read_access()?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     // 与 list_archived_feeds 一致：要解析每条动态的 JSON，必须放到阻塞线程池执行。
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
@@ -3432,7 +3485,7 @@ pub async fn get_archived_feed(
     id: i64,
 ) -> Result<ArchiveItem, String> {
     crate::license::require_read_access()?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let connection = open_database(&app)?;
     let mut item = connection.query_row(
         "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
@@ -3834,7 +3887,7 @@ pub async fn export_archived_html(
 ) -> Result<String, String> {
     crate::license::require_read_access()?;
     validate_category(&category)?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
     if selected.as_ref().is_some_and(HashSet::is_empty) {
         return Err("请先选择需要导出的归档".into());
@@ -3981,7 +4034,7 @@ pub async fn count_archived_feeds(
 ) -> Result<u64, String> {
     crate::license::require_read_access()?;
     validate_category(&category)?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
         let query = query
@@ -4024,7 +4077,7 @@ pub async fn get_archive_overview(
     login: tauri::State<'_, QLoginState>,
 ) -> Result<ArchiveOverview, String> {
     crate::license::require_read_access()?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let database = database_path(&app)?;
     let connection = open_database(&app)?;
     let dynamics = connection
@@ -4072,7 +4125,7 @@ pub async fn get_interaction_ranking(
     limit: u32,
 ) -> Result<Vec<InteractionRank>, String> {
     crate::license::require_read_access()?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let connection = open_database(&app)?;
     let mut statement = connection
         .prepare(
@@ -4252,7 +4305,7 @@ pub async fn list_interactors(
     login: tauri::State<'_, QLoginState>,
 ) -> Result<Vec<Interactor>, String> {
     crate::license::require_read_access()?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let connection = open_database(&app)?;
     let mut statement = connection
         .prepare(
@@ -4300,7 +4353,7 @@ pub async fn list_contact_comment_threads(
     {
         return Err("联系人 QQ 号无效".into());
     }
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
         let pattern = format!("%{uin}%");
@@ -4819,7 +4872,7 @@ pub async fn list_qzone_library(
 ) -> Result<LibraryPage, String> {
     crate::license::require_read_access()?;
     validate_library_module(&module)?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let scope_key = parent_key.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
@@ -4916,7 +4969,7 @@ pub async fn list_qzone_library_years(
 ) -> Result<Vec<i32>, String> {
     crate::license::require_read_access()?;
     validate_library_module(&module)?;
-    let owner_uin = login.qzone_auth().await?.uin;
+    let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
     let scope_key = parent_key.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
