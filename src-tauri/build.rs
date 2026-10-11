@@ -98,35 +98,65 @@ fn is_absolute_http_url(value: &str) -> bool {
 /// 校验内置验签公钥：必须是 base64（标准或 URL-safe，允许缺省 padding）解出来
 /// 恰好 32 字节的 Ed25519 公钥。
 ///
-/// 只判「非空」是不够的 —— 长度不对的公钥会让每一次签名校验都失败，而客户端只会
-/// 笼统地报「激活失败」，排查要一路查回打包机。这里在构建期直接拦下。
-fn is_ed25519_public_key(value: &str) -> bool {
-    let trimmed = value.trim();
-    let mut bytes = 0_usize;
-    // 已累积的 base64 字符数（每次满 4 个出 3 字节）。
-    let mut count = 0_usize;
-    for ch in trimmed.chars() {
-        match ch {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '-' | '/' | '_' => {
-                count += 1;
-                if count == 4 {
-                    bytes += 3;
-                    count = 0;
-                }
-            }
-            // padding 之后不该再有数据字符；缺省 padding 也接受。
+/// 解一小段 base64，返回字节数（构建期只做形状检查，不校验 padding 位）。
+/// 标准与 URL-safe 两套字母表都收，空白跳过。
+fn base64_bytes(value: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for ch in value.chars() {
+        let sextet = match ch {
+            'A'..='Z' => ch as u32 - 'A' as u32,
+            'a'..='z' => ch as u32 - 'a' as u32 + 26,
+            '0'..='9' => ch as u32 - '0' as u32 + 52,
+            '+' | '-' => 62,
+            '/' | '_' => 63,
             '=' => break,
-            _ => return false,
+            c if c.is_whitespace() => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | sextet;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+            acc &= (1 << bits) - 1;
         }
     }
-    match count {
-        0 => {}
-        2 => bytes += 1,
-        3 => bytes += 2,
-        // 只剩 1 个字符无法构成任何 base64 字节。
-        _ => return false,
+    Some(out)
+}
+
+/// 校验内置验签公钥。
+///
+/// **判据必须与运行时接受的格式一致**：`license-core` 的 `public_key_from_pem`
+/// 只认 Ed25519 SPKI PEM（`-----BEGIN PUBLIC KEY-----` + 折行 base64 + DER
+/// `302a300506032b6570032100` + 32 字节裸公钥），仓库 secret 里存的就是 PEM。
+/// 为方便手工填值，32 字节的裸 base64 也接受。
+///
+/// 这里踩过一个大坑：第一版按「32 字节裸 base64」写死了判据，于是 CI 拿着真 PEM
+/// 被判成非法，windows / macOS×2 / android 四个构建全被自己的检查挡下 ——
+/// 而本地 `cargo check` 不带 `QZA_REQUIRE_CONFIG` 时根本不走这段，所以没暴露。
+/// 教训：新增校验必须拿**真实值**跑一次正向用例，只验反向（占位值被拒）是不够的。
+fn is_ed25519_public_key(value: &str) -> bool {
+    /// Ed25519 SPKI 前缀：SEQUENCE(42) → OID 1.3.101.112 → BIT STRING(33)。
+    const SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+
+    let trimmed = value.trim();
+    if trimmed.contains("-----BEGIN") {
+        let body: String = trimmed
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+        return match base64_bytes(&body) {
+            Some(der) => der.len() == SPKI_PREFIX.len() + 32 && der.starts_with(&SPKI_PREFIX),
+            None => false,
+        };
     }
-    bytes == 32
+
+    base64_bytes(trimmed).is_some_and(|raw| raw.len() == 32)
 }
 
 fn main() {
