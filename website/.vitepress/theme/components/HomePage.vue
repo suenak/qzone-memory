@@ -6,7 +6,12 @@ type Platform = "windows" | "macos" | "android" | "ios";
 type ThemeMode = "system" | "light" | "dark";
 
 const githubUrl = "https://github.com/suenak/qzone-memory";
-const releaseUrl = `${githubUrl}/releases/latest`;
+// 官网是全平台下载的唯一入口 —— 它读授权服务端的清单，按当前发布版本给出各平台的真实
+// 文件地址。文档站只负责讲清楚每个平台拿到的是什么，真正的下载动作交给官网，
+// 免得两个页面各说各话（正是「官网与 GitHub Pages 效果不一致」里最难解释的那部分）。
+// GitHub Releases 仍可从页脚的 GitHub 链接进入。
+const siteUrl = "https://qzone.teamxbw.top/";
+const downloadUrl = `${siteUrl}#download`;
 const scrolled = ref(false);
 const selectedPlatform = ref<Platform>("windows");
 const themeMode = ref<ThemeMode>("system");
@@ -231,7 +236,7 @@ npm run tauri:build:windows</code></pre>
                   <p>{{ activePlatform.note }}</p>
                   <div class="tech-specs"><span><small>格式</small>{{ activePlatform.format }}</span><span><small>架构</small>{{ activePlatform.arch }}</span><span><small>系统</small>{{ activePlatform.version }}</span></div>
                 </div>
-                <a class="tech-button tech-button--download" :href="releaseUrl" target="_blank" rel="noreferrer"><span>前往 Release 下载</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7m0 0H8m9 0v9" /></svg></a>
+                <a class="tech-button tech-button--download" :href="downloadUrl"><span>前往官网下载</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7m0 0H8m9 0v9" /></svg></a>
               </div>
             </Transition>
           </div>
@@ -244,7 +249,7 @@ npm run tauri:build:windows</code></pre>
       <div class="tech-shell">
         <div class="tech-brand"><img class="tech-brand__mark" :src="withBase('/qzone-archive-icon.png')" alt="" /><span>拾忆</span></div>
         <p>把个人记忆，留在自己的设备上。</p>
-        <nav aria-label="页脚导航"><a :href="withBase('/intro/')">使用文档</a><a :href="githubUrl">GitHub</a><a :href="`${githubUrl}/blob/main/LICENSE`">许可证</a></nav>
+        <nav aria-label="页脚导航"><a :href="siteUrl">官网</a><a :href="downloadUrl">下载</a><a :href="withBase('/intro/')">使用文档</a><a :href="githubUrl">GitHub</a><a :href="`${githubUrl}/blob/main/LICENSE`">许可证</a></nav>
       </div>
     </footer>
   </div>
