@@ -29,7 +29,7 @@
 - **本地优先**：SQLite 数据库、媒体缓存和导出文件都保存在用户设备；登录会话只进入操作系统安全凭据库
 - **检索与导出**：支持全文搜索、年份筛选、时间排序、批量管理与离线 HTML 导出
 - **现代桌面界面**：浅色 / 深色 / 跟随系统三态主题，统一设计令牌，时间轴式说说浏览，全屏图片灯箱，长列表增量加载
-- **跨平台发行**：提供 Windows、macOS（Intel / Apple 芯片）、Linux、Android、iOS 未签名包与 NixOS 构建
+- **跨平台发行**：提供 Windows、macOS（Intel / Apple 芯片）、Android 与 iOS 未签名包
 
 完整版本历史请查看 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -47,16 +47,16 @@
 
 ## 下载与安装
 
-请从本仓库的 [Releases](https://github.com/suenak/qzone-memory/releases) 下载与系统匹配的安装包：
+官网下载页 [qzone.teamxbw.top](https://qzone.teamxbw.top/) 会按当前发布版本给出各平台入口；也可以直接在本仓库的 [Releases](https://github.com/suenak/qzone-memory/releases) 里取文件：
 
 - Windows：NSIS 安装程序（`.exe`）
 - macOS：Intel `x64` 或 Apple 芯片 `aarch64` 安装镜像（`.dmg`）
-- Linux：AppImage、Debian/Ubuntu `deb`、Fedora/openSUSE `rpm`
 - Android：通用 `apk`
 - iOS：未签名 `ipa`，需要自行签名后安装
-- NixOS：包含 Nix closure 的离线安装包
 
-macOS 包采用临时签名，首次打开若被 Gatekeeper 拦截，请在“系统设置 → 隐私与安全性”中确认打开。iOS 包未签名，不能直接安装或提交 App Store。
+macOS 包采用临时签名且未做公证，首次打开若被 Gatekeeper 拦截，请在「系统设置 → 隐私与安全性」中确认打开。iOS 包未签名，不能直接安装，也不能提交 App Store。
+
+当前版本 **1.2.2**，首次同时提供 macOS、Android 与 iOS 客户端。安装目录名随应用名统一为 `qzone-memory`：从 1.2.1 及更早版本升级前请先卸载旧版，**已经归档的数据不受影响**——它按应用标识符存放（Windows：`%APPDATA%\top.ehre.qzonearchive`），标识符从未变过，卸载也不会删除它。
 
 ## 首次使用
 
@@ -81,7 +81,7 @@ macOS 包采用临时签名，首次打开若被 Gatekeeper 拦截，请在“�
 | 后端数据库 | SQLite (rusqlite) |
 | HTTP 客户端 | reqwest (rustls-tls) |
 | 授权校验 | Ed25519 签名凭证（`license-core`,独立可测） |
-| 打包 | NSIS / DMG / AppImage / deb / rpm / APK / unsigned IPA / Nix closure |
+| 打包 | NSIS / DMG / APK / unsigned IPA |
 
 ## 开发
 
@@ -114,9 +114,18 @@ npm run tauri:build:windows
 # Windows NSIS + MSI
 npm run tauri:build:windows:all
 
+# macOS 安装镜像（需在 macOS 上执行）
+npx tauri build --bundles dmg
+
 # Android APK
 npm run tauri android build
+
+# iOS 未签名 ipa（需在 macOS 上执行，依赖 Xcode 与 CocoaPods）
+npx tauri ios init --ci
+npx tauri ios build --target aarch64 --ci --no-sign
 ```
+
+打包前请确认四项部署常量已经就位（见[自建授权服务](#自建授权服务)）：落到占位值时构建仍会成功，但产物无法激活。CI 会为 Windows、macOS（`x64` 与 `aarch64` 各一个 `.dmg`）、Android 与 iOS 分别出包。
 
 ### 验证
 
@@ -213,11 +222,13 @@ cargo test --manifest-path src-tauri/license-core/Cargo.toml   # 授权校验逻
 
 客户端的授权页面、凭证校验与接口调用是客户端源码的一部分，因此包含在此。独立的授权管理服务、管理后台、卡密生成、账号数据库、更新服务和服务端私钥不包含在本仓库。内置验签公钥不是私钥。
 
-当前公开的是 2026-10-10 的客户端源码；线上分发的安装包是 1.2.1，由这份源码之前的一个版本构建。两者之间的差异只有一处：四项部署常量的注入方式从源码常量改为构建期配置文件（目的就是让公开仓库不含生产值），默认配置下行为完全相同。也就是说这份源码比线上包新一个修订，但功能代码一致。与该安装包逐行对应的源码快照保存在标签 **`source-2026-10-10`**，需要「对应源码」时检出这个标签即可。分发安装包时，应提供与该安装包对应的源码版本及构建说明，不能用不同版本的源码替代。详见 [GNU GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)。
+线上分发的安装包是 **1.2.2**，与它逐行对应的源码就是标签 **`v1.2.2`**；更早的发布各有快照标签（形如 `source-2026-10-10`），需要「对应源码」时检出对应标签即可。分发安装包时，应提供与该安装包对应的源码版本及构建说明，不能用不同版本的源码替代。详见 [GNU GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)。
 
 授权服务器地址、内置验签公钥、更新清单地址与官网下载页这四项部署常量不写在源码里，而是由 `src-tauri/build.rs` 在构建期从配置读出并生成 `qza_config.rs`。取值优先级：编译期环境变量 → `src-tauri/qza.config.local.json`（不入库）→ `src-tauri/qza.config.json`（入库，占位值）。本仓库带的是占位值，所以克隆下来能编译、能运行，但无法激活——这是刻意的：占位构建会明确提示「本构建未配置授权服务器」，而不是让用户对着一个笼统的网络错误猜原因。本仓库不包含服务端私钥、管理后台、卡密生成与账号数据库。已有数据访问不需要授权；联网备份需要匹配服务端公钥的授权凭证。
 
-CI 中的 Android APK 使用每次构建生成的临时测试密钥；该密钥不能用于覆盖安装正式签名的应用。正式发布请使用自行保管的签名密钥，勿提交密钥和密码。
+CI 中的 Android APK 使用仓库 secret 里的正式签名密钥——keystore 与口令都不入库，公开仓库里没有任何签名材料。自行构建出来的 APK 不带签名，需要用自己的 keystore 签一次才能覆盖安装正式版；密钥与口令请不要提交到仓库。
+
+仓库里还保留一份 Nix flake（`nix/qzonearchive.nix`）供 NixOS 用户自行构建。它不在发布流水线内、也不随版本维护（依赖一变动 `cargoHash` 与 `npmDeps.hash` 就会过期），使用前请自行核对。
 
 ## 自建授权服务
 
