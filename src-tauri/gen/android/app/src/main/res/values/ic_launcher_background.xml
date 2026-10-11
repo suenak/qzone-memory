@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-  <color name="ic_launcher_background">#fff</color>
+    <!-- 与品牌蓝一致：前台层已是满幅蓝，这里只是前台层加载失败时的兜底。 -->
+    <color name="ic_launcher_background">#3468C0</color>
 </resources>

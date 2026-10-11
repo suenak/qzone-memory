@@ -11,7 +11,6 @@ import {
   Monitor,
   QrCode,
   RefreshCw,
-  ShieldCheck,
 } from "lucide-vue-next";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
@@ -56,7 +55,7 @@ const webState = computed(() =>
     <template #header>
       <div class="qzl-brand">
         <span class="qzl-brand__mark" aria-hidden="true">
-          <ShieldCheck :size="18" :stroke-width="1.8" />
+          <img class="qzl-brand__logo" src="/branding/shiyi-logo-v2-mark-256.png" alt="" />
         </span>
         <span class="qzl-brand__copy">
           <strong>登录 QQ 空间</strong>
@@ -193,6 +192,15 @@ const webState = computed(() =>
   border-radius: var(--radius-md);
   background: var(--color-accent-soft);
   color: var(--color-accent);
+}
+
+/* 这里放全彩版（蓝笔画 + 琥珀碎片）：底色是浅蓝 tint，与官网导航同一套搭配。
+   侧边栏那块是实心 --color-accent 底，所以那边用白笔画版本 —— 同一个标识两种底，
+   各有各的正确画法。 */
+.qzl-brand__logo {
+  width: 22px;
+  height: auto;
+  display: block;
 }
 
 .qzl-brand__copy {

@@ -6,7 +6,6 @@ import { useRoute, useRouter } from "vue-router";
 import { platform } from "../utils/platform";
 import {
   Bookmark,
-  BookOpen,
   Camera,
   Check,
   ChevronRight,
@@ -258,7 +257,7 @@ onBeforeUnmount(() => {
     <!-- ------------------------------------------------------ 桌面侧边栏 -->
     <aside class="sidebar" :class="{ 'is-collapsed': sidebarCollapsed }">
       <div class="sidebar__brand">
-        <span class="brand-mark" aria-hidden="true"><BookOpen :size="20" :stroke-width="1.8" /></span>
+        <span class="brand-mark" aria-hidden="true"><img class="brand-mark__logo" src="/branding/shiyi-logo-v2-mark-on-blue-256.png" alt="" /></span>
         <span class="brand-text">
           <strong>拾忆</strong>
           <small>QQ 空间本地备份</small>
@@ -464,6 +463,10 @@ onBeforeUnmount(() => {
 .sidebar.is-collapsed { width:var(--layout-sidebar-collapsed); }
 .sidebar__brand { display:flex; align-items:center; gap:var(--space-3); min-height:var(--layout-topbar-height); padding:var(--space-4); }
 .brand-mark { display:grid; place-items:center; flex-shrink:0; width:var(--control-height); height:var(--control-height); border-radius:var(--radius-lg); background:var(--color-accent); color:var(--color-on-accent); }
+/* 品牌图形用拾忆 Logo v2 的「白笔画 + 琥珀碎片」版本 —— 底色已经是 --color-accent，
+   正好与桌面应用图标（蓝底 + 白笔画）同一套处理；图稿本身比画布略高，
+   所以只定高、宽度自适应，别用等比缩放把它压扁。 */
+.brand-mark__logo { height:calc(var(--control-height) * .62); width:auto; display:block; }
 .brand-text { display:flex; flex-direction:column; min-width:0; gap:var(--space-1); }
 .brand-text strong { font-size:var(--text-md); letter-spacing:.025em; }
 .brand-text small { font-size:var(--text-2xs); color:var(--color-text-secondary); white-space:nowrap; }
