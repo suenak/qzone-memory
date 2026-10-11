@@ -97,7 +97,7 @@ onBeforeUnmount(() => {
     <header class="tech-nav" :class="{ 'is-scrolled': scrolled }">
       <div class="tech-nav__inner">
         <a class="tech-brand" :href="withBase('/')" aria-label="拾忆 首页">
-          <img class="tech-brand__mark" :src="withBase('/qzone-archive-icon.png')" alt="" />
+          <img class="tech-brand__mark" :src="withBase('/logo-mark.png')" alt="" />
           <span>拾忆</span>
         </a>
         <nav class="tech-nav__links" aria-label="首页导航">
@@ -247,7 +247,7 @@ npm run tauri:build:windows</code></pre>
 
     <footer class="tech-footer">
       <div class="tech-shell">
-        <div class="tech-brand"><img class="tech-brand__mark" :src="withBase('/qzone-archive-icon.png')" alt="" /><span>拾忆</span></div>
+        <div class="tech-brand"><img class="tech-brand__mark" :src="withBase('/logo-mark.png')" alt="" /><span>拾忆</span></div>
         <p>把个人记忆，留在自己的设备上。</p>
         <nav aria-label="页脚导航"><a :href="siteUrl">官网</a><a :href="downloadUrl">下载</a><a :href="withBase('/intro/')">使用文档</a><a :href="githubUrl">GitHub</a><a :href="`${githubUrl}/blob/main/LICENSE`">许可证</a></nav>
       </div>
