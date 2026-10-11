@@ -90,8 +90,8 @@ html.dark {
 @keyframes marquee { from { transform: translateX(0); } to { transform: translateX(-50%); } }
 
 html.dark .tech-hero__beam { opacity: .2; }
-html.dark .tech-shot { box-shadow: 0 24px 70px rgba(56, 189, 248, .12); }
-html.dark .tech-marquee__track span { border-color: #1e2a38; }
+html.dark .tech-shot { box-shadow: 0 24px 70px rgba(53, 112, 204, .3); }
+html.dark .tech-marquee__track span { border-color: #26324a; }
 
 @media (max-width: 800px) {
   .tech-shell, .tech-nav__inner { width: min(100% - 28px, 1180px); }.tech-nav { height: 60px; }.tech-nav__links { display: none; }.tech-theme { margin-left: auto; }.tech-theme button { width: 30px; height: 30px; }.tech-nav__inner > .tech-button { margin-left: 6px !important; }
