@@ -30,6 +30,22 @@ export const useArchiveStore = defineStore("archive", () => {
   const limited = computed(() => progress.value?.status === "limited");
   const completed = computed(() => progress.value?.status === "completed");
   const hasTask = computed(() => progress.value !== null);
+  /**
+   * 资料同步（相册、照片、视频等）是否在跑。
+   *
+   * 它和归档任务是两条独立路径：归档走 start_feed_archive，资料同步走
+   * sync_qzone_library，后者原先不体现在任何共享状态里，页面内自己管自己。
+   * 后端现在把同步中标记放进进度轮询，这里读出来给全局用。
+   */
+  const syncing = computed(() => progress.value?.librarySyncing === true);
+  /**
+   * 是否有任何任务在往归档数据里写。
+   *
+   * 设置页的清空、删除与退出登录必须以这个为准，不能只看 running ——
+   * 资料同步跑到一半时点清空，后续页会把刚删掉的数据补回去；换号则会把另一个
+   * 账号的数据混进当前账号。
+   */
+  const busy = computed(() => running.value === true || syncing.value);
 
   /** 是否出现了未解决的跳页记录（断点续传的异常条目）。 */
   const hasSkips = computed(() => (progress.value?.skipped ?? 0) > 0);
@@ -77,7 +93,9 @@ export const useArchiveStore = defineStore("archive", () => {
 
   function schedule() {
     if (!polling) return;
-    const delay = running.value || limited.value ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
+    // 资料同步期间也走活跃间隔：设置页要靠这份状态去禁用清空/删除/退出登录，
+    // 15 秒的延迟足够用户点下去。
+    const delay = busy.value || limited.value ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
     timer = window.setTimeout(async () => {
       if (!polling) return;
       await refresh();
@@ -105,6 +123,8 @@ export const useArchiveStore = defineStore("archive", () => {
     progress,
     error,
     running,
+    syncing,
+    busy,
     limited,
     completed,
     hasTask,

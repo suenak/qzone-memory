@@ -124,7 +124,7 @@ function formatDate(seconds: number | null) {
 /* -------------------------------------------------------------- 数据管理 */
 
 async function clearArchiveContent() {
-  if (clearing.value || archiveStore.running) return;
+  if (clearing.value || archiveStore.busy) return;
   clearing.value = true;
   error.value = "";
   try {
@@ -140,7 +140,7 @@ async function clearArchiveContent() {
 }
 
 async function deleteEverything() {
-  if (deleting.value || archiveStore.running) return;
+  if (deleting.value || archiveStore.busy) return;
   deleting.value = true;
   error.value = "";
   try {
@@ -198,7 +198,7 @@ async function confirmAccountAction() {
   finally { accountActionBusy.value = false; }
 }
 async function logout() {
-  if (loggingOut.value || archiveStore.running) return;
+  if (loggingOut.value || archiveStore.busy) return;
   loggingOut.value = true;
   try { await authStore.logout(); toast.success("已退出 QQ 登录。"); }
   catch (reason) { toast.error(describeError(reason, "退出登录失败，请重试。")); }
@@ -298,8 +298,8 @@ async function refreshSeats() {
           outlined
           size="small"
           :loading="loggingOut"
-          :disabled="archiveStore.running"
-          :title="archiveStore.running ? '请先停止备份，再退出登录' : undefined"
+          :disabled="archiveStore.busy"
+          :title="archiveStore.busy ? '请先停止备份或资料同步，再退出登录' : undefined"
           @click="logout"
         />
         <Button v-else label="登录" size="small" @click="authStore.openLogin" />
@@ -342,14 +342,14 @@ async function refreshSeats() {
             :max="MAX_ARCHIVE_INTERVAL / 1000"
             :step="0.5"
             :max-fraction-digits="1"
-            :disabled="archiveStore.running"
+            :disabled="archiveStore.busy"
             suffix=" 秒"
             show-buttons
             button-layout="horizontal"
             @blur="commitIntervalInput"
             @keydown.enter="commitIntervalInput"
           ><template #incrementicon><Plus :size="15" :stroke-width="1.8" /></template><template #decrementicon><Minus :size="15" :stroke-width="1.8" /></template></InputNumber>
-          <small>{{ archiveStore.running ? '停止备份后可调整' : '建议 3–5 秒，下次备份生效' }}</small>
+          <small>{{ archiveStore.busy ? '停止备份或同步后可调整' : '建议 3–5 秒，下次备份生效' }}</small>
         </div>
       </div>
 
@@ -361,7 +361,7 @@ async function refreshSeats() {
             <small>清空当前 QQ 账号的说说、互动和续传记录。保留相册等其他资料、媒体缓存与授权。</small>
           </div>
         </div>
-        <Button label="清空说说" severity="secondary" outlined size="small" :disabled="!loggedIn || archiveStore.running" @click="error = ''; clearVisible = true" />
+        <Button label="清空说说" severity="secondary" outlined size="small" :disabled="!loggedIn || archiveStore.busy" @click="error = ''; clearVisible = true" />
       </div>
 
       <div class="setting-row is-danger">
@@ -372,7 +372,7 @@ async function refreshSeats() {
             <small>清空全部账号的备份、续传记录、媒体缓存与本地登录状态，并退出软件授权。</small>
           </div>
         </div>
-        <Button label="删除所有数据" severity="danger" outlined size="small" :disabled="archiveStore.running" @click="error = ''; deleteVisible = true" />
+        <Button label="删除所有数据" severity="danger" outlined size="small" :disabled="archiveStore.busy" @click="error = ''; deleteVisible = true" />
       </div>
 
       <p v-if="error" class="settings-error" role="alert">{{ describeError(error) }}</p>
@@ -521,7 +521,7 @@ async function refreshSeats() {
       </div>
       <template #footer>
         <Button label="刷新" severity="secondary" text :loading="seatsBusy" @click="refreshSeats" />
-        <Button label="退出本机授权" severity="danger" outlined :disabled="archiveStore.running || seatsBusy" @click="askSignOut" />
+        <Button label="退出本机授权" severity="danger" outlined :disabled="archiveStore.busy || seatsBusy" @click="askSignOut" />
         <Button label="关闭" @click="seatsVisible = false" />
       </template>
     </Dialog>

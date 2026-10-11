@@ -30,7 +30,7 @@ import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import StatTile from "../components/ui/StatTile.vue";
 import {
   cancelFeedArchive, getArchiveProgress, listArchiveSkips, retryArchiveSkip, startFeedArchive,
-  type ArchiveProgress, type ArchiveSkipItem, type ArchiveStatus,
+  IDLE_ARCHIVE_PROGRESS, type ArchiveProgress, type ArchiveSkipItem, type ArchiveStatus,
 } from "../utils/qzone";
 import { useArchiveStore } from "../stores/archive";
 import { useAuthStore } from "../stores/auth";
@@ -41,7 +41,7 @@ const authStore = useAuthStore();
 const archiveStore = useArchiveStore();
 const licenseStore = useLicenseStore();
 const { loggedIn } = storeToRefs(authStore);
-const progress = computed<ArchiveProgress>(() => archiveStore.progress ?? { status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始备份" });
+const progress = computed<ArchiveProgress>(() => archiveStore.progress ?? IDLE_ARCHIVE_PROGRESS);
 const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
 const skipNotice = ref("");

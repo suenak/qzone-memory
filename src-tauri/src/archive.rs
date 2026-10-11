@@ -26,6 +26,12 @@ pub struct ArchiveProgress {
     skipped: u32,
     message: String,
     retry_at: Option<i64>,
+    /// 资料同步（相册、照片、视频等）是否有任务在跑。
+    ///
+    /// 它不来自 `progress` 自身，而是在 `get_archive_progress` 里由
+    /// `ArchiveState::library_sync` 现读现填 —— 单一事实来源，避免两处状态不同步。
+    /// 前端据此在同步期间禁掉清空、删除与退出登录。
+    library_syncing: bool,
 }
 
 impl Default for ArchiveProgress {
@@ -38,6 +44,7 @@ impl Default for ArchiveProgress {
             skipped: 0,
             message: "尚未开始归档".into(),
             retry_at: None,
+            library_syncing: false,
         }
     }
 }
@@ -46,6 +53,32 @@ pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
     image_downloads: tokio::sync::Semaphore,
+    /// 资料同步是否在进行中。
+    ///
+    /// 归档任务有 `progress.status == "running"` 可查，资料同步原先什么标记都没有，
+    /// 于是它一边往归档表里写，设置页一边允许清空/删除/退出登录 —— 清完的数据会被
+    /// 后续页补回来，换号则会把另一个账号的数据写进当前账号。
+    library_sync: AtomicBool,
+}
+
+/// 资料同步进行中的标记，Drop 时自动复位。
+///
+/// 用 RAII 而不是「每条 return 前手动复位」：同步有多条退出路径（缺相册、取页失败、
+/// 会话改变、正常结束），漏掉任何一条都会把状态永久卡在「同步中」，此后清空、删除、
+/// 退出登录全被拒，只能重启应用。
+struct LibrarySyncGuard<'a>(&'a AtomicBool);
+
+impl<'a> LibrarySyncGuard<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for LibrarySyncGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl ArchiveState {
@@ -54,6 +87,7 @@ impl ArchiveState {
             progress: Mutex::new(ArchiveProgress::default()),
             cancel: AtomicBool::new(false),
             image_downloads: tokio::sync::Semaphore::new(4),
+            library_sync: AtomicBool::new(false),
         }
     }
 }
@@ -2556,6 +2590,9 @@ pub async fn start_feed_archive(
             skipped: 0,
             message: "正在准备归档…".into(),
             retry_at: None,
+            // 归档任务与资料同步是两条独立路径，这里只置归档自身的状态；
+            // library_syncing 由 get_archive_progress 现读现填。
+            library_syncing: false,
         };
     }
     // 初始化阶段的三次失败都必须把状态复位：否则会话过期或数据库锁定时状态会永久停在
@@ -3002,11 +3039,15 @@ pub fn get_archive_progress(
     state: tauri::State<'_, ArchiveState>,
 ) -> Result<ArchiveProgress, String> {
     crate::license::require_read_access()?;
-    state
+    let mut progress = state
         .progress
         .lock()
         .map(|value| value.clone())
-        .map_err(|_| "归档状态锁已损坏".into())
+        .map_err(|_| "归档状态锁已损坏".to_string())?;
+    // 资料同步状态现读现填：它只存在这一个原子里，不再往 progress 里同步一份，
+    // 免得两处状态各说各话。
+    progress.library_syncing = state.library_sync.load(Ordering::SeqCst);
+    Ok(progress)
 }
 
 #[tauri::command]
@@ -4162,10 +4203,18 @@ pub async fn get_interaction_ranking(
 }
 
 fn ensure_archive_idle(state: &ArchiveState) -> Result<(), String> {
-    let progress = state.progress.lock().map_err(|_| "归档状态锁已损坏")?;
-    if progress.status == "running" {
-        // 文案覆盖删除、清空与单独重试三类调用点。
-        return Err("归档任务运行时不能修改归档数据，请先取消任务".into());
+    {
+        let progress = state.progress.lock().map_err(|_| "归档状态锁已损坏")?;
+        if progress.status == "running" {
+            // 文案覆盖删除、清空与单独重试三类调用点。
+            return Err("归档任务运行时不能修改归档数据，请先取消任务".into());
+        }
+    }
+    // 资料同步同样在往归档表里写，而且每页都会重新读取当前登录账号：
+    // 清空/删除期间它继续写会把刚删掉的数据补回去，换号时更会把另一个账号的数据
+    // 混进当前账号。归档任务有 progress 可查，资料同步只有这个标记。
+    if state.library_sync.load(Ordering::SeqCst) {
+        return Err("资料同步进行中，请等同步结束或先取消同步，再修改归档数据".into());
     }
     Ok(())
 }
@@ -4729,6 +4778,7 @@ pub async fn sync_qzone_library(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
     page_token: tauri::State<'_, qzone::QzonePageTokenState>,
+    state: tauri::State<'_, ArchiveState>,
     module: String,
     parent_key: Option<String>,
 ) -> Result<LibrarySyncResult, String> {
@@ -4738,7 +4788,14 @@ pub async fn sync_qzone_library(
     if module == "photos" && scope_key.trim().is_empty() {
         return Err("请选择需要同步的相册".into());
     }
+    // 置位「资料同步中」，Drop 时自动复位。设置页据此在同步期间禁掉清空、删除与
+    // 退出登录 —— 这三件事以前都能在同步跑到一半时点下去。
+    let _sync_guard = LibrarySyncGuard::acquire(&state.library_sync);
     let owner_uin = login.qzone_auth().await?.uin;
+    // 会话代数在登录、退出登录与删除数据时都会自增。取页用的是**当前**会话，落库用的是
+    // 任务开始时的账号；两者不一致时继续写就会把另一个账号的动态、相册混进本账号的归档。
+    // 所以每页写入前都要再比一次代数。
+    let session_epoch = login.session_epoch();
     let page_size = qzone::library_page_size(&module);
     let mut offset = 0_usize;
     let mut fetched = 0_usize;
@@ -4780,6 +4837,25 @@ pub async fn sync_qzone_library(
         let page = parsed_library_page(&module, &response);
         remote_total = remote_total.max(page.total);
         let page_len = page.items.len();
+        // 写入前最后一道关卡：会话代数变了就说明中途退出登录/换过账号/删过数据，
+        // 这一页只能丢弃。落库用的仍是任务开始时的 owner_uin，继续写就会串账号。
+        if login.session_epoch() != session_epoch {
+            let _ = save_library_state(
+                &app,
+                &owner_uin,
+                &module,
+                &scope_key,
+                remote_total,
+                fetched,
+                false,
+                Some("同步期间登录状态已改变"),
+            );
+            return Err(
+                "同步期间登录状态已改变（可能退出了登录、切换了账号或删除了数据），\
+                 本次同步已中止。此前已保存的记录保持不变，可重新同步。"
+                    .into(),
+            );
+        }
         saved += save_library_page(
             &app,
             &owner_uin,

@@ -28,14 +28,14 @@ import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import { BookOpen } from "lucide-vue-next";
 import { useArchiveStore } from "../stores/archive";
 import { useAuthStore } from "../stores/auth";
-import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, listArchiveYears, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
+import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, listArchiveYears, IDLE_ARCHIVE_PROGRESS, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
 
 const router = useRouter();
 const authStore = useAuthStore();
 const archiveStore = useArchiveStore();
 const { loggedIn, user } = storeToRefs(authStore);
 const overview = ref<ArchiveOverview>({ dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 });
-const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始备份" });
+const progress = ref<ArchiveProgress>(IDLE_ARCHIVE_PROGRESS);
 const recent = ref<ArchiveItem[]>([]);
 const ranking = ref<InteractionRank[]>([]);
 /** 备份覆盖的年份列表，用于推导回忆跨度。取不到时为空，界面退回时间锚点。 */

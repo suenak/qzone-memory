@@ -82,6 +82,53 @@ fn rust_string_literal(value: &str) -> String {
     out
 }
 
+/// 判据用**值**而不是来源：把随仓库分发的占位值原样抄进 `qza.config.local.json`
+/// 也一样是占位值，而只看来源的实现会把它当成「已配置」放行。
+fn is_placeholder(placeholder: &BTreeMap<String, String>, key: &str, value: &str) -> bool {
+    placeholder.get(key).is_some_and(|shipped| shipped == value)
+}
+
+/// 三项地址必须是 http(s) 绝对地址。打包机上写个 `qza-api.example.com`（少了协议）
+/// 或相对路径都会让运行时拼出废地址，而这种错在构建期完全能看出来。
+fn is_absolute_http_url(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("https://") || value.starts_with("http://")
+}
+
+/// 校验内置验签公钥：必须是 base64（标准或 URL-safe，允许缺省 padding）解出来
+/// 恰好 32 字节的 Ed25519 公钥。
+///
+/// 只判「非空」是不够的 —— 长度不对的公钥会让每一次签名校验都失败，而客户端只会
+/// 笼统地报「激活失败」，排查要一路查回打包机。这里在构建期直接拦下。
+fn is_ed25519_public_key(value: &str) -> bool {
+    let trimmed = value.trim();
+    let mut bytes = 0_usize;
+    // 已累积的 base64 字符数（每次满 4 个出 3 字节）。
+    let mut count = 0_usize;
+    for ch in trimmed.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '-' | '/' | '_' => {
+                count += 1;
+                if count == 4 {
+                    bytes += 3;
+                    count = 0;
+                }
+            }
+            // padding 之后不该再有数据字符；缺省 padding 也接受。
+            '=' => break,
+            _ => return false,
+        }
+    }
+    match count {
+        0 => {}
+        2 => bytes += 1,
+        3 => bytes += 2,
+        // 只剩 1 个字符无法构成任何 base64 字节。
+        _ => return false,
+    }
+    bytes == 32
+}
+
 fn main() {
     println!("cargo:rerun-if-changed={CONFIG}");
     if Path::new(LOCAL_CONFIG).exists() {
@@ -120,7 +167,7 @@ fn main() {
             }
         };
 
-        if source != "占位值" {
+        if !is_placeholder(&placeholder, key, &value) {
             all_placeholder = false;
         }
         sources.push(source);
@@ -146,15 +193,41 @@ fn main() {
     // 发布流水线设 `QZA_REQUIRE_CONFIG=1`：缺配置就直接失败，而不是安静地产出
     // 一批指向 `license.example.com`、装上也激活不了的安装包。公开源码里没有
     // 真实值，谁 clone 下来直接构建都会落到占位值，所以这个开关必须由 CI 显式打开。
-    if all_placeholder
-        && env::var("QZA_REQUIRE_CONFIG").is_ok_and(|flag| !matches!(flag.trim(), "" | "0"))
-    {
-        panic!(
-            "QZA_REQUIRE_CONFIG 已开启，但四项部署配置全部来自占位值 {}。\
-             请设置 QZA_LICENSE_SERVER / QZA_LICENSE_PUBLIC_KEY / QZA_UPDATE_ENDPOINT / \
-             QZA_DOWNLOAD_PAGE，或提供 {LOCAL_CONFIG}。",
-            CONFIG
-        );
+    //
+    // 校验是**逐项**的，不看「四项是否全部为占位值」：只配了其中一项时，旧的
+    // `all_placeholder` 判据已经是 false，构建会一路通过，产出的包却有三项仍指向
+    // 占位地址 —— 装上去激活不了、更新也拉不到，而且这种包与正常包外观完全一样。
+    // 所以每项都要单独过：占位值一律拒绝，三项地址必须是 http(s) 绝对地址，
+    // 公钥必须是 32 字节的 base64 Ed25519 公钥。
+    if env::var("QZA_REQUIRE_CONFIG").is_ok_and(|flag| !matches!(flag.trim(), "" | "0")) {
+        let mut problems: Vec<String> = Vec::new();
+        for ((key, value), source) in resolved.iter().zip(sources.iter()) {
+            let key: &str = key;
+            if is_placeholder(&placeholder, key, value.as_str()) {
+                problems.push(format!("{key} 仍是占位值（来自{source}）"));
+                continue;
+            }
+            if key == "QZA_LICENSE_PUBLIC_KEY" {
+                if !is_ed25519_public_key(value) {
+                    problems.push(format!(
+                        "QZA_LICENSE_PUBLIC_KEY 不是 32 字节的 base64 Ed25519 公钥（来自{source}）"
+                    ));
+                }
+            } else if !is_absolute_http_url(value) {
+                problems.push(format!(
+                    "{key} 不是 http(s) 绝对地址（来自{source}）：{value}"
+                ));
+            }
+        }
+        if !problems.is_empty() {
+            panic!(
+                "QZA_REQUIRE_CONFIG 已开启，但部署配置不完整（{} 项有问题）：\n  - {}\n\
+                 四项都必须给出真实值：QZA_LICENSE_SERVER / QZA_LICENSE_PUBLIC_KEY / \
+                 QZA_UPDATE_ENDPOINT / QZA_DOWNLOAD_PAGE，或提供 {LOCAL_CONFIG}。",
+                problems.len(),
+                problems.join("\n  - ")
+            );
+        }
     }
 
     let mut generated = String::from(

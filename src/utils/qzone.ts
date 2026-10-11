@@ -1,7 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type ArchiveStatus = "idle" | "running" | "completed" | "cancelled" | "limited" | "error";
-export interface ArchiveProgress { status: ArchiveStatus; pages: number; fetched: number; saved: number; skipped: number; message: string; retryAt?: number; }
+export interface ArchiveProgress { status: ArchiveStatus; pages: number; fetched: number; saved: number; skipped: number; message: string; retryAt?: number; librarySyncing: boolean; }
+/**
+ * 后端还没给出进度时的兜底值。
+ *
+ * 收成一份共用常量而不是各页面各写一个字面量：字段是新增的（librarySyncing 就是这样
+ * 加进来的），散落的字面量会在类型检查里逐个报错，也容易漏改其中一处。
+ */
+export const IDLE_ARCHIVE_PROGRESS: ArchiveProgress = { status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始备份", librarySyncing: false };
 export interface ArchiveSkipItem {
   id: number; pageNumber: number; cursorOffset: number; offsetAdvance: number; baseTime: number;
   error: string; skippedAt: number; retryCount: number; lastRetryAt?: number; resolvedAt?: number; recoveredRecords: number;
