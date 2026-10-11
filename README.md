@@ -228,8 +228,6 @@ cargo test --manifest-path src-tauri/license-core/Cargo.toml   # 授权校验逻
 
 CI 中的 Android APK 使用仓库 secret 里的正式签名密钥——keystore 与口令都不入库，公开仓库里没有任何签名材料。自行构建出来的 APK 不带签名，需要用自己的 keystore 签一次才能覆盖安装正式版；密钥与口令请不要提交到仓库。
 
-仓库里还保留一份 Nix flake（`nix/qzonearchive.nix`）供 NixOS 用户自行构建。它不在发布流水线内、也不随版本维护（依赖一变动 `cargoHash` 与 `npmDeps.hash` 就会过期），使用前请自行核对。
-
 ## 自建授权服务
 
 客户端去哪里激活、信任哪把公钥，由四项部署常量决定；它们不写在源码里，而是构建期从配置读出（取值优先级见上一节）。要指向自己的服务端，在本机建一份 `src-tauri/qza.config.local.json`，照 `src-tauri/qza.config.json` 的格式填：

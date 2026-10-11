@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { withBase } from "vitepress";
 
-type Platform = "windows" | "macos" | "android" | "linux";
+type Platform = "windows" | "macos" | "android" | "ios";
 type ThemeMode = "system" | "light" | "dark";
 
 const githubUrl = "https://github.com/suenak/qzone-memory";
@@ -16,7 +16,7 @@ const platforms = [
   { id: "windows", label: "Windows", format: ".exe", arch: "x64", version: "Windows 10+", note: "推荐版本，安装后即可开始归档。" },
   { id: "macos", label: "macOS", format: ".dmg", arch: "Apple / Intel", version: "macOS 11+", note: "请按芯片架构选择对应安装包。" },
   { id: "android", label: "Android", format: ".apk", arch: "arm64", version: "Android 8+", note: "适合在移动设备上查看与管理归档。" },
-  { id: "linux", label: "Linux", format: ".AppImage", arch: "x86_64", version: "主流发行版", note: "无需安装，赋予执行权限后直接运行。" },
+  { id: "ios", label: "iOS", format: ".ipa", arch: "arm64", version: "iOS 14+", note: "未签名 ipa，需自行重签名后安装。" },
 ] as const;
 
 const themeModes: { id: ThemeMode; label: string }[] = [
@@ -72,8 +72,8 @@ onMounted(() => {
 
   const agent = navigator.userAgent.toLowerCase();
   if (agent.includes("android")) selectedPlatform.value = "android";
+  else if (agent.includes("iphone") || agent.includes("ipad")) selectedPlatform.value = "ios";
   else if (agent.includes("mac")) selectedPlatform.value = "macos";
-  else if (agent.includes("linux")) selectedPlatform.value = "linux";
 
   updateScrollState();
   window.addEventListener("scroll", updateScrollState, { passive: true });

@@ -8,7 +8,7 @@
 
 - 发布范围从单一 Windows 扩展到 Windows、macOS（Intel 与 Apple 芯片各一个 `.dmg`）、Android（通用 APK，APK Signature Scheme v2 + v3 签名）与 iOS（未签名 arm64 `.ipa`），全部由同一条流水线从同一份源码构建。
 - macOS 包为临时签名、未做公证，首次打开若被 Gatekeeper 拦截需在「系统设置 → 隐私与安全性」放行；iOS 包未签名，需用 AltStore、SideStore、Sideloadly 等工具自行重签名后安装，也不能提交 App Store。
-- 不再产出 Linux（AppImage / deb / rpm）与 NixOS 闭包包：这两条产物线已从 CI 与发布流程中移除。仓库里的 Nix flake 仍可作为源码构建方式自行使用，但它不在发布流水线内、也不随版本维护。
+- 不再产出 Linux（AppImage / deb / rpm）与 NixOS 闭包包：这两条产物线已从 CI 与发布流程中移除，仓库中用于源码构建的 Nix flake（`flake.nix` 与 `nix/qzonearchive.nix`）一并删除 —— 没人构建的构建脚本只会静默腐化。
 
 **安装包更名**
 
