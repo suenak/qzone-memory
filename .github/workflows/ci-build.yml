@@ -77,60 +77,6 @@ jobs:
           path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 90
-
-  linux:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libdbus-1-dev \
-            pkg-config \
-            patchelf \
-            squashfs-tools \
-            xvfb
-      - name: Prepare world-executable AppRun helper
-        run: |
-          set -euo pipefail
-          arch="$(uname -m)"
-          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
-          mkdir -p "$cache_dir"
-          curl -fL \
-            "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-$arch" \
-            -o "$cache_dir/AppRun-$arch"
-          chmod 0755 "$cache_dir/AppRun-$arch"
-          test "$(stat -c '%a' "$cache_dir/AppRun-$arch")" = "755"
-      - uses: ./.github/actions/qza-config
-      - run: npm ci
-      - run: npx tauri build --bundles appimage,deb,rpm
-      - uses: ./.github/actions/qza-verify
-      - name: Verify AppImage portability and startup
-        run: |
-          set -euo pipefail
-          appimage="$(find src-tauri/target/release/bundle/appimage -type f -name '*.AppImage' -print -quit)"
-          test -n "$appimage"
-          chmod 0755 "$appimage"
-          bash scripts/verify-appimage.sh "$appimage"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: qzonearchive-linux-${{ github.sha }}
-          path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
-          if-no-files-found: error
-          retention-days: 90
-
   android:
     runs-on: ubuntu-latest
     steps:
@@ -233,65 +179,8 @@ jobs:
           path: src-tauri/gen/apple/**/*.ipa
           if-no-files-found: error
           retention-days: 90
-
-  nixos:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v16
-      - uses: ./.github/actions/qza-config
-      # flake 打包源码时会跳过 .gitignore 命中的路径，而 qza.config.local.json 正是
-      # 被忽略的那个，所以必须先强制入索引，否则 nix 沙箱里的 build.rs 读不到它。
-      - name: Stage the deployment config into the flake source
-        run: git add -f src-tauri/qza.config.local.json
-      - name: Build NixOS package
-        run: nix build -L .#qzonearchive
-      - name: Assert the NixOS package carries the real config
-        run: |
-          set -euo pipefail
-          host="$(node -p 'new URL(process.env.QZA_LICENSE_SERVER).host')"
-
-          # wrapGAppsHook4 把真正的可执行文件改名成 .qzonearchive-wrapped，
-          # result/bin/qzonearchive 只是个壳脚本，字符串不在里面。
-          binary="result/bin/.qzonearchive-wrapped"
-          test -x "$binary"
-          if ! grep -qF "$host" "$binary"; then
-            echo "::error::the NixOS binary still carries the placeholder deployment config"
-            exit 1
-          fi
-          echo "deployment config present in the NixOS package: ${host}"
-      - name: Package Nix closure
-        run: |
-          mkdir -p dist/nix
-          store_path="$(readlink -f result)"
-          echo "$store_path" > dist/nix/store-path.txt
-          mapfile -t closure_paths < <(nix-store -qR "$store_path")
-          nix-store --export "${closure_paths[@]}" > dist/nix/qzonearchive.closure
-          cat > dist/nix/install.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          store_path="$(cat "$here/store-path.txt")"
-          if [ -w /nix/store ]; then
-            nix-store --option require-sigs false --import < "$here/qzonearchive.closure"
-          else
-            sudo nix-store --option require-sigs false --import < "$here/qzonearchive.closure"
-          fi
-          nix --extra-experimental-features "nix-command flakes" profile install "$store_path"
-          echo "QzoneArchive installed. Run qzonearchive to start it."
-          EOF
-          chmod +x dist/nix/install.sh
-          tar -czf dist/qzonearchive-nixos-x86_64-linux.tar.gz -C dist/nix .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: qzonearchive-nixos-${{ github.sha }}
-          path: dist/qzonearchive-nixos-x86_64-linux.tar.gz
-          if-no-files-found: error
-          retention-days: 90
-
   publish-nightly:
-    needs: [windows, macos, linux, android, ios, nixos]
+    needs: [windows, macos, android, ios]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     permissions:
@@ -311,20 +200,12 @@ jobs:
           path: artifacts/macos-arm64
       - uses: actions/download-artifact@v7
         with:
-          name: qzonearchive-linux-${{ github.sha }}
-          path: artifacts/linux
-      - uses: actions/download-artifact@v7
-        with:
           name: qzonearchive-android-${{ github.sha }}
           path: artifacts/android
       - uses: actions/download-artifact@v7
         with:
           name: qzonearchive-ios-unsigned-${{ github.sha }}
           path: artifacts/ios-unsigned
-      - uses: actions/download-artifact@v7
-        with:
-          name: qzonearchive-nixos-${{ github.sha }}
-          path: artifacts/nixos
       - name: Publish nightly pre-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -349,12 +230,8 @@ jobs:
           copy_artifact artifacts/windows '*.exe' nightly/QzoneArchive-nightly_x64-setup.exe
           copy_artifact artifacts/macos-x64 '*.dmg' nightly/QzoneArchive-nightly_x64.dmg
           copy_artifact artifacts/macos-arm64 '*.dmg' nightly/QzoneArchive-nightly_aarch64.dmg
-          copy_artifact artifacts/linux '*.AppImage' nightly/QzoneArchive-nightly_amd64.AppImage
-          copy_artifact artifacts/linux '*.deb' nightly/QzoneArchive-nightly_amd64.deb
-          copy_artifact artifacts/linux '*.rpm' nightly/QzoneArchive-nightly_x86_64.rpm
           copy_artifact artifacts/android '*.apk' nightly/QzoneArchive-nightly-universal.apk
           copy_artifact artifacts/ios-unsigned '*.ipa' nightly/QzoneArchive-nightly-ios-arm64-unsigned.ipa
-          copy_artifact artifacts/nixos '*.tar.gz' nightly/qzonearchive-nixos-nightly-x86_64-linux.tar.gz
           ls -lh nightly
           gh release create nightly \
             --repo "$GITHUB_REPOSITORY" \
