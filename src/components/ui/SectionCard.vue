@@ -44,7 +44,7 @@ withDefaults(
   background: var(--color-surface);
   border: var(--line-width) solid var(--color-border);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-xs);
+  box-shadow: none;
   overflow: hidden;
 }
 
@@ -53,7 +53,7 @@ withDefaults(
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-4);
-  padding: var(--density-card-padding, var(--space-5));
+  padding: var(--space-3) var(--density-card-padding);
   border-bottom: var(--line-width) solid var(--color-border);
 }
 
@@ -62,7 +62,7 @@ withDefaults(
 }
 
 .qza-card__title {
-  font-size: var(--text-md);
+  font-size: var(--text-base);
   font-weight: var(--weight-semibold);
 }
 

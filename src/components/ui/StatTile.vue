@@ -44,15 +44,15 @@ withDefaults(
   background: var(--color-surface);
   border: var(--line-width) solid var(--color-border);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-xs);
+  box-shadow: none;
 }
 
 .qza-stat__icon {
   display: grid;
   place-items: center;
   flex-shrink: 0;
-  width: 36px;
-  height: 36px;
+  width: var(--layout-stat-icon);
+  height: var(--layout-stat-icon);
   border-radius: var(--radius-md);
   background: var(--color-surface-sunken);
   color: var(--color-text-secondary);

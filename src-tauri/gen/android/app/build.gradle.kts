@@ -19,7 +19,8 @@ android {
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "top.ehre.qzonearchive"
-        minSdk = 24
+        // 支持 Android 8.0 及以上；发行 APK 包含 ARM / ARM64 / x86 / x86_64。
+        minSdk = 26
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")

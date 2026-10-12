@@ -13,7 +13,7 @@ const router = createRouter({
       path: "/",
       name: "dashboard",
       component: () => import("../views/DashboardView.vue"),
-      meta: { title: "首页" },
+      meta: { title: "恢复概览" },
     },
     {
       path: "/archives",
@@ -67,7 +67,7 @@ const router = createRouter({
       path: "/tasks",
       name: "tasks",
       component: () => import("../views/TasksView.vue"),
-      meta: { title: "备份任务" },
+      meta: { title: "恢复任务" },
     },
     {
       path: "/recycle-bin",

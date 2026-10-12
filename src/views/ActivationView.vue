@@ -9,10 +9,12 @@ import InputText from "primevue/inputtext";
 import Password from "primevue/password";
 import { useLicenseStore, type LicenseSeat } from "../stores/license";
 import { useAppStore } from "../stores/app";
+import { platform } from "../utils/platform";
 
 const store = useLicenseStore();
 const appStore = useAppStore();
 const router = useRouter();
+const mobilePlatform = ["android", "ios"].includes(platform());
 
 type Mode = "activate" | "redeem";
 
@@ -140,11 +142,11 @@ async function confirmRelease() {
 
 <template>
   <div>
-  <div class="activation-stage">
+  <div class="activation-stage" :class="{ 'is-mobile': mobilePlatform }">
     <aside class="activation-story">
-      <p class="activation-story__brand"><BookOpen :size="22" :stroke-width="1.8" />拾忆</p>
-      <h2>保存你的<br />QQ 空间记录。</h2>
-      <p>备份说说、相册和留言，按年份查看已保存的内容。</p>
+      <p class="activation-story__brand"><img src="/branding/shiyi-logo-v2-mark-256.png" alt="" />拾忆</p>
+      <h2>找回有线索的<br />已删说说。</h2>
+      <p>曾有点赞或评论，且记录仍可读取的说说，才有机会找回。已保存的内容随时可查看和导出。</p>
       <ul><li><BookOpen :size="18" :stroke-width="1.8" /><span>按年份查看说说与照片</span></li><li><ShieldCheck :size="18" :stroke-width="1.8" /><span>本地备份，资料由你保管</span></li></ul>
       <div class="activation-themes" role="group" aria-label="界面主题"><button type="button" :aria-pressed="appStore.themeMode === 'light'" @click="appStore.setTheme('light')"><Sun :size="16" :stroke-width="1.8" />浅色</button><button type="button" :aria-pressed="appStore.themeMode === 'dark'" @click="appStore.setTheme('dark')"><Moon :size="16" :stroke-width="1.8" />深色</button><button type="button" :aria-pressed="appStore.themeMode === 'system'" @click="appStore.setTheme('system')"><Monitor :size="16" :stroke-width="1.8" />系统</button></div>
     </aside>
@@ -385,4 +387,31 @@ async function confirmRelease() {
   font-size: var(--text-xl); margin:0 0 var(--space-5); background:var(--color-accent-soft); color:var(--color-accent); }
 .activation-submit { width: 100%; margin-top: var(--space-1); min-height:var(--touch-target); }
 @media(max-width:860px) { .activation-stage { grid-template-columns:minmax(0,1fr); gap:var(--space-6); padding:var(--space-5); align-items:start; justify-items:center; } .activation-story { width:100%; max-width:var(--layout-dialog-width); } .activation-story__brand { margin-bottom:var(--space-4); } .activation-story h2 { font-size:var(--text-2xl); } .activation-story > p:not(.activation-story__brand),.activation-story ul { display:none; } .activation-themes { margin-top:var(--space-4); } .activation-card { padding:var(--space-5); } }
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .activation-stage { height:auto; min-height:calc(100dvh - var(--layout-topbar-height) - var(--space-10)); overflow:visible; padding:var(--space-6) var(--space-4); gap:var(--space-10); }
+.activation-story { padding:var(--space-4); }
+.activation-story__brand { color:var(--color-text); font-family:var(--font-display); }
+.activation-story__brand img { width:var(--space-8); height:var(--space-8); object-fit:contain; }
+.activation-story h2 { font-size:var(--text-3xl); line-height:var(--leading-tight); letter-spacing:normal; }
+.activation-card { border-radius:var(--radius-lg); padding:var(--space-6); box-shadow:var(--shadow-sm); }
+.activation-head h1 { font-size:var(--text-xl); }
+.activation-mark { width:var(--control-height); height:var(--control-height); margin-bottom:var(--space-3); border-radius:var(--radius-md); }
+@media(max-width:600px) { .activation-stage { min-height:0; padding:var(--space-2); gap:var(--space-4); } .activation-story { padding:0; } .activation-story h2 { font-size:var(--text-xl); } .activation-card { padding:var(--space-5); } }
+
+@media(max-width:600px) { .activation-story__brand { margin-bottom:var(--space-2); } .activation-story h2 { font-size:var(--text-lg); } .activation-story h2 br { display:none; } .activation-themes { margin-top:var(--space-2); } }
+.activation-stage.is-mobile { grid-template-columns:minmax(0,1fr); min-height:0; align-items:start; justify-items:center; padding:var(--space-2); gap:var(--space-4); }
+.is-mobile .activation-story { width:100%; max-width:var(--layout-dialog-width); padding:0; }
+.is-mobile .activation-story__brand { margin-bottom:var(--space-2); }
+.is-mobile .activation-story h2 { font-size:var(--text-lg); margin-bottom:var(--space-2); }
+.is-mobile .activation-story h2 br { display:none; }
+.is-mobile .activation-story > p:not(.activation-story__brand),.is-mobile .activation-story ul { display:none; }
+.is-mobile .activation-themes { margin-top:var(--space-2); }
+.is-mobile .activation-card { padding:var(--space-5); }
+@media (orientation:landscape) and (min-width:700px) {
+  .activation-stage.is-mobile { grid-template-columns:minmax(0,1fr) minmax(0,1.4fr); gap:var(--space-5); }
+  .is-mobile .activation-story { padding-top:var(--space-3); }
+  .is-mobile .activation-card { padding:var(--space-4); }
+  .is-mobile .activation-mark { display:none; }
+}
 </style>

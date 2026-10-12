@@ -1001,4 +1001,14 @@ onBeforeUnmount(() => {
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:var(--space-4); }
 @media (max-width:860px) { .qzc-stats { grid-template-columns:minmax(0,1fr); } }
 
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .qzc-page { gap:var(--layout-page-gap); }
+.qzc-grid { grid-template-columns:repeat(auto-fill,minmax(min(100%,var(--layout-contact-cell)),1fr)); gap:var(--density-gap); }
+.qzc-person { border-radius:var(--radius-md); box-shadow:none; }
+.qzc-person:hover { border-color:var(--color-accent-border); box-shadow:var(--shadow-xs); }
+.qzc-person__hit { min-height:var(--density-row-height); }
+.qzc-person__total { font-variant-numeric:tabular-nums; }
+.qzc-toolbar { gap:var(--space-3); }
+@media(max-width:600px) { .qzc-grid { grid-template-columns:minmax(0,1fr); } }
 </style>

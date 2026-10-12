@@ -227,7 +227,7 @@ const webState = computed(() =>
   flex-direction: column;
   align-items: center;
   gap: var(--space-4);
-  max-height: min(520px, calc(100vh - var(--space-16) * 2));
+  max-height: min(520px, calc(100dvh - var(--space-8)));
   overflow-y: auto;
 }
 

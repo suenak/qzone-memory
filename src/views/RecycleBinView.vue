@@ -1480,4 +1480,12 @@ onBeforeUnmount(() => { observer?.disconnect(); observer = undefined; });
 }
 @media (max-width:860px) { .album-list { max-height:calc(var(--space-16) * 3); overflow:auto; } }
 
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .recycle-page { gap:var(--layout-page-gap); }
+.album-item { min-height:var(--density-row-height); border-radius:var(--radius-md); padding:var(--space-3); }
+.photo-card { border-radius:var(--radius-md); box-shadow:none; }
+.mode-notice { border-radius:var(--radius-md); background:var(--color-surface-sunken); }
+.photo-grid { gap:var(--space-3); }
+@media(max-width:600px) { .photo-grid { gap:var(--space-2); } }
 </style>

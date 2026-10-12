@@ -13,6 +13,9 @@ export default defineConfig(async () => ({
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
   build: {
+    // Android 8/9 可更新至兼容此基线的 WebView；不要随 Vite 默认目标漂移。
+    target: ["chrome111", "edge88", "firefox78", "safari14"],
+    cssTarget: ["chrome111", "edge88", "firefox78", "safari14"],
     rollupOptions: {
       output: {
         // 稳定的框架与组件库分别缓存，页面继续按路由懒加载。

@@ -392,7 +392,7 @@ onBeforeUnmount(() => {
           </span>
           <div class="library__copy">
             <p class="library__eyebrow">{{ moduleInfo.kicker }}</p>
-            <h2 class="library__title">{{ moduleInfo.title }}</h2>
+            <h2 class="library__title" :class="{ 'qza-visually-hidden': module !== 'photos' }">{{ moduleInfo.title }}</h2>
             <p class="library__desc">{{ moduleInfo.description }}</p>
           </div>
         </div>
@@ -1520,4 +1520,18 @@ onBeforeUnmount(() => {
 .guest__message.is-collapsed { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
 .tile__summary.is-expanded { display: block; -webkit-line-clamp: unset; }
 .guest__expand { padding-block: var(--space-2); }
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .library { gap:var(--layout-page-gap); }
+.library__head { align-items:center; gap:var(--space-5); }
+.library__title { font-size:var(--text-lg); font-family:var(--font-display); letter-spacing:normal; }
+.library__eyebrow { display:none; }
+.library__badge { width:var(--control-height); height:var(--control-height); border-radius:var(--radius-md); }
+.library__desc { margin-top:var(--space-1); max-width:64ch; }
+.library__action { gap:var(--space-2); }
+.library__toolbar { gap:var(--space-3); }
+.tile { box-shadow:none; border-radius:var(--radius-md); }
+.tile:hover { box-shadow:var(--shadow-xs); }
+.guest { background:var(--color-surface); }
+@media(max-width:600px) { .library__head { gap:var(--space-4); } .library__action { align-items:stretch; } .library__action .btn { width:100%; } }
 </style>

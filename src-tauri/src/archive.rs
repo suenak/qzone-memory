@@ -69,9 +69,10 @@ pub struct ArchiveState {
 struct LibrarySyncGuard<'a>(&'a AtomicBool);
 
 impl<'a> LibrarySyncGuard<'a> {
-    fn acquire(flag: &'a AtomicBool) -> Self {
-        flag.store(true, Ordering::SeqCst);
-        Self(flag)
+    fn acquire(flag: &'a AtomicBool) -> Result<Self, String> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "已有资料同步任务，请等待完成".to_owned())?;
+        Ok(Self(flag))
     }
 }
 
@@ -3919,43 +3920,121 @@ fn archive_items_for_export(
     Ok(items)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveExportResult {
+    records: usize,
+    media_files: usize,
+    missing_media: usize,
+}
+
 #[tauri::command]
 pub async fn export_archived_html(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
     category: String,
     ids: Option<Vec<i64>>,
-) -> Result<String, String> {
+    output_path: String,
+) -> Result<ArchiveExportResult, String> {
     crate::license::require_read_access()?;
     validate_category(&category)?;
     let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
+    let image_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("images")
+        .join(&owner_uin);
+    let video_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("videos");
     let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
     if selected.as_ref().is_some_and(HashSet::is_empty) {
-        return Err("请先选择需要导出的归档".into());
+        return Err("请先选择需要导出的记录".into());
     }
-    let connection = open_database(&app)?;
-    let items = archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
-    if items.is_empty() {
-        return Err("当前分类没有可以导出的归档".into());
-    }
-    let category_name = match category.as_str() {
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let mut items =
+            archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
+        drop(connection);
+        if items.is_empty() {
+            return Err("当前分类没有可以导出的记录".into());
+        }
+        let mut bundle =
+            crate::offline_export::ExportBundle::new(std::path::Path::new(&output_path))?;
+        let mut result = ArchiveExportResult {
+            records: items.len(),
+            media_files: 0,
+            missing_media: 0,
+        };
+        for item in &mut items {
+            for (index, url) in item.picture_urls.iter_mut().enumerate() {
+                let path = existing_archived_image(&image_root, &format!("{}-{index}", item.id));
+                let local = match path {
+                    Some(path) => {
+                        let extension = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .ok_or("图片格式无效")?;
+                        bundle.copy_media(
+                            &image_root,
+                            &path,
+                            &format!("image-{}-{index}.{extension}", item.id),
+                        )?
+                    }
+                    None => None,
+                };
+                if local.is_some() {
+                    result.media_files += 1;
+                } else {
+                    result.missing_media += 1;
+                }
+                *url = local.unwrap_or_default();
+            }
+            if let Some(url) = item.video_url.as_mut() {
+                let path = video_root.join(format!("{owner_uin}-{}.mp4", item.id));
+                let local = if cached_video_is_usable(&path) {
+                    bundle.copy_media(&video_root, &path, &format!("video-{}.mp4", item.id))?
+                } else {
+                    None
+                };
+                if local.is_some() {
+                    result.media_files += 1;
+                } else {
+                    result.missing_media += 1;
+                }
+                *url = local.unwrap_or_default();
+            }
+        }
+        let html = render_export_html(&items, &owner_uin, &category, result.missing_media);
+        bundle.commit(&html)?;
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("导出任务失败：{e}"))?
+}
+
+fn render_export_html(
+    items: &[ArchiveItem],
+    owner_uin: &str,
+    category: &str,
+    missing_media: usize,
+) -> String {
+    let category_name = match category {
         "self" => "本人动态",
         "other" => "其他动态",
         _ => "留言",
     };
     let mut cards = String::new();
-    for item in &items {
+    for item in items {
         let author = item
             .author_name
             .as_deref()
             .or(item.author_uin.as_deref())
             .unwrap_or("QQ 用户");
-        cards.push_str("<article class=\"card\"><header><img class=\"avatar\" src=\"https://qlogo2.store.qq.com/qzone/");
-        let uin = item.author_uin.as_deref().unwrap_or("0");
-        cards.push_str(&html_escape(uin));
-        cards.push('/');
-        cards.push_str(&html_escape(uin));
-        cards.push_str("/50\"><div><strong>");
+        cards.push_str("<article class=\"card\"><header><div><strong>");
         cards.push_str(&html_escape(author));
         cards.push_str("</strong><small>");
         if let Some(author_uin) = &item.author_uin {
@@ -3971,6 +4050,10 @@ pub async fn export_archived_html(
         if !item.picture_urls.is_empty() {
             cards.push_str("<div class=\"pictures\">");
             for url in &item.picture_urls {
+                if url.is_empty() {
+                    cards.push_str("<p>这张图片尚未保存到本机，未包含在本次导出中。</p>");
+                    continue;
+                }
                 cards.push_str("<a href=\"");
                 cards.push_str(&html_escape(url));
                 cards.push_str("\" target=\"_blank\"><img loading=\"lazy\" referrerpolicy=\"no-referrer\" src=\"");
@@ -3980,9 +4063,13 @@ pub async fn export_archived_html(
             cards.push_str("</div>");
         }
         if let Some(video) = &item.video_url {
-            cards.push_str("<p><a class=\"video\" href=\"");
-            cards.push_str(&html_escape(video));
-            cards.push_str("\" target=\"_blank\">▶ 查看视频</a></p>");
+            if video.is_empty() {
+                cards.push_str("<p>这个视频尚未完整保存到本机，未包含在本次导出中。</p>");
+            } else {
+                cards.push_str("<p><a class=\"video\" href=\"");
+                cards.push_str(&html_escape(video));
+                cards.push_str("\" target=\"_blank\">▶ 查看视频</a></p>");
+            }
         }
         cards.push_str("<div class=\"stats\">");
         if !item.likes.is_empty() {
@@ -4058,11 +4145,13 @@ pub async fn export_archived_html(
         }
         cards.push_str("</article>");
     }
-    Ok(format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ 空间恢复归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ 空间恢复归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
-        owner = html_escape(&owner_uin),
-        count = items.len()
-    ))
+    format!(
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ 空间恢复归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ 空间恢复归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · {missing} 个媒体未保存 · 导出时间 <time data-time="{export_time}"></time></p><p class="intro">包含媒体时，请将网页和旁边的 shiyi-media 文件夹一起带走。未保存到本机的媒体不会自动下载。</p>{cards}</main><script>document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
+        owner = html_escape(owner_uin),
+        count = items.len(),
+        missing = missing_media,
+        export_time = now()
+    )
 }
 
 #[tauri::command]
@@ -4202,7 +4291,7 @@ pub async fn get_interaction_ranking(
         .map_err(|error| format!("读取互动排行榜失败：{error}"))
 }
 
-fn ensure_archive_idle(state: &ArchiveState) -> Result<(), String> {
+pub(crate) fn ensure_archive_idle(state: &ArchiveState) -> Result<(), String> {
     {
         let progress = state.progress.lock().map_err(|_| "归档状态锁已损坏")?;
         if progress.status == "running" {
@@ -4790,7 +4879,7 @@ pub async fn sync_qzone_library(
     }
     // 置位「资料同步中」，Drop 时自动复位。设置页据此在同步期间禁掉清空、删除与
     // 退出登录 —— 这三件事以前都能在同步跑到一半时点下去。
-    let _sync_guard = LibrarySyncGuard::acquire(&state.library_sync);
+    let _sync_guard = LibrarySyncGuard::acquire(&state.library_sync)?;
     let owner_uin = login.qzone_auth().await?.uin;
     // 会话代数在登录、退出登录与删除数据时都会自增。取页用的是**当前**会话，落库用的是
     // 任务开始时的账号；两者不一致时继续写就会把另一个账号的动态、相册混进本账号的归档。
@@ -5068,6 +5157,44 @@ pub async fn list_qzone_library_years(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn data_changes_are_blocked_until_library_sync_finishes() {
+        let state = super::ArchiveState::new();
+        let guard = super::LibrarySyncGuard::acquire(&state.library_sync).unwrap();
+        assert!(super::ensure_archive_idle(&state).is_err());
+        assert!(super::LibrarySyncGuard::acquire(&state.library_sync).is_err());
+        drop(guard);
+        assert!(super::ensure_archive_idle(&state).is_ok());
+    }
+
+    #[test]
+    fn offline_export_uses_relative_media_and_marks_missing_files() {
+        let item = super::ArchiveItem {
+            owner_uin: "12345".into(),
+            id: 1,
+            cell_id: "test".into(),
+            published_at: 1,
+            content: Some("<script>alert('x')</script>".into()),
+            author_uin: Some("12345".into()),
+            author_name: Some("测试用户".into()),
+            picture_urls: vec!["shiyi-media-test/image-1.png".into(), String::new()],
+            video_url: Some(String::new()),
+            video_urls: vec![],
+            video_cover_url: None,
+            like_count: 0,
+            comment_count: 0,
+            likes: vec![],
+            comments: vec![],
+        };
+        let html = super::render_export_html(&[item], "12345", "self", 2);
+        assert!(html.contains("src=\"shiyi-media-test/image-1.png\""));
+        assert!(html.contains("这张图片尚未保存"));
+        assert!(html.contains("这个视频尚未完整保存"));
+        assert!(html.contains("2 个媒体未保存"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("https://"));
+        assert!(!html.contains("http://"));
+    }
     use super::{
         advance_feed_cursor, archive_page_delay_ms, canonical_qzone_cell_id, checkpoint_is_stale,
         comment_from_values, interaction_failure_can_finish, library_created_at, merge_comments,

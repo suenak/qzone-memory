@@ -185,7 +185,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="dashboard">
-    <ArchiveHeading title="备份概览" description="查看已保存的说说、照片和互动记录。" :icon="Archive">
+    <ArchiveHeading title="恢复概览" description="查看已保存的说说、照片和互动记录。" :icon="Archive">
       <Button v-if="loggedIn" severity="secondary" outlined :loading="loading" @click="loadDashboard"><RefreshCw :size="16" :stroke-width="1.8" /><span>刷新</span></Button>
     </ArchiveHeading>
     <!-- ------------------------------------------------------ 回忆时光区 -->
@@ -201,7 +201,7 @@ onBeforeUnmount(() => {
           tone="warm"
           :icon="BookOpen"
           title="登录 QQ 空间"
-          description="登录后可备份当前账号的说说、相册和留言。"
+          description="登录后可查找当前账号的历史说说，并保存空间资料。"
         >
           <Button @click="primaryAction">
             <LogIn :size="16" :stroke-width="1.8" />
@@ -221,8 +221,8 @@ onBeforeUnmount(() => {
           compact
           tone="warm"
           :icon="Archive"
-          title="还没有备份内容"
-          description="到「备份任务」开始保存说说。只能恢复服务端仍保留的内容。"
+          title="还没有保存的内容"
+          description="到「恢复任务」开始保存说说。曾有点赞或评论，且记录仍可读取的说说才有机会恢复。"
         >
           <Button severity="secondary" outlined :loading="loading" @click="loadDashboard">
             <RefreshCw :size="16" :stroke-width="1.8" />
@@ -230,7 +230,7 @@ onBeforeUnmount(() => {
           </Button>
           <Button @click="primaryAction">
             <Download :size="16" :stroke-width="1.8" />
-            <span>打开备份任务</span>
+            <span>打开恢复任务</span>
           </Button>
         </EmptyState>
 
@@ -238,13 +238,13 @@ onBeforeUnmount(() => {
           <div class="memory-hero__copy">
             <p class="memory-hero__eyebrow">
               <span class="memory-hero__spark" aria-hidden="true"><Sparkles :size="15" :stroke-width="1.8" /></span>
-              <span>本地备份</span>
+              <span>本地记录</span>
               <span v-if="user" class="memory-hero__account">QQ {{ user.uin }}</span>
             </p>
             <h2 class="memory-hero__title">已保存到本机</h2>
             <p class="memory-hero__lead">
-              已保存 <strong>{{ overview.dynamics.toLocaleString("zh-CN") }}</strong> 条说说、<strong>{{ overview.pictures.toLocaleString("zh-CN") }}</strong> 张照片，已记录
-              <strong>{{ interactionTotal.toLocaleString("zh-CN") }}</strong> 次互动。
+              已保存 <strong>{{ overview.dynamics.toLocaleString("zh-CN") }}</strong> 条说说，包含 <strong>{{ overview.pictures.toLocaleString("zh-CN") }}</strong> 张配图和
+              <strong>{{ interactionTotal.toLocaleString("zh-CN") }}</strong> 次互动记录。
             </p>
             <p v-if="yearSpan" class="memory-hero__stamp">
               <span class="memory-hero__stamp-dot" aria-hidden="true" />
@@ -263,7 +263,7 @@ onBeforeUnmount(() => {
             </Button>
             <Button @click="primaryAction">
               <Download :size="16" :stroke-width="1.8" />
-              <span>打开备份任务</span>
+              <span>打开恢复任务</span>
             </Button>
           </div>
         </template>
@@ -422,15 +422,15 @@ onBeforeUnmount(() => {
           compact
           :icon="MessageSquareQuote"
           :title="loggedIn ? '还没有保存说说' : '尚未登录'"
-          :description="loggedIn ? '先在备份任务里开始一次备份，历史动态会按时间出现在这里。' : '登录 QQ 空间后，这里会显示最近备份的动态。'"
+          :description="loggedIn ? '先在恢复任务里开始一次备份，历史动态会按时间出现在这里。' : '登录 QQ 空间后，这里会显示最近备份的动态。'"
         />
       </SectionCard>
     </div>
 
-    <!-- -------------------------------------------------- 最近备份状态 -->
-    <SectionCard v-if="archiveStore.hasTask" title="最近备份状态">
+    <!-- -------------------------------------------------- 最近任务 -->
+    <SectionCard v-if="archiveStore.hasTask" title="最近任务">
       <template #actions>
-        <Button text size="small" @click="router.push('/tasks')"><span>{{ archiveStore.running ? '查看进度' : '继续备份' }}</span><ChevronRight :size="15" :stroke-width="1.8" /></Button>
+        <Button text size="small" @click="router.push('/tasks')"><span>{{ archiveStore.running ? '查看进度' : '继续恢复' }}</span><ChevronRight :size="15" :stroke-width="1.8" /></Button>
         <span class="status-chip" :class="`is-${taskSeverity ?? 'secondary'}`">
           <span class="status-chip__dot" aria-hidden="true" />
           <span>{{ taskText ?? "状态未知" }}</span>
@@ -464,7 +464,7 @@ onBeforeUnmount(() => {
         <p class="archive-status__message">{{ progress.message }}</p>
 
         <p v-if="archiveStore.hasSkips" class="archive-status__hint">
-          有 {{ archiveStore.progress?.skipped ?? 0 }} 页因为接口失败被跳过，可以在备份任务页里单独重试。
+          有 {{ archiveStore.progress?.skipped ?? 0 }} 页因为接口失败被跳过，可以在恢复任务页里单独重试。
         </p>
       </div>
     </SectionCard>
@@ -788,7 +788,7 @@ onBeforeUnmount(() => {
   gap: var(--space-1);
 }
 
-/* -------------------------------------------------------- 最近备份状态 */
+/* -------------------------------------------------------- 最近任务 */
 
 .status-chip {
   display: inline-flex;
@@ -985,4 +985,30 @@ onBeforeUnmount(() => {
    .dashboard-columns 已在上面 860px 块里声明过，这里不再重复。 */
 @media (max-width:860px) { .memory-hero :deep(.qza-card__body) { padding:var(--space-4); } .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .dashboard { gap:var(--layout-page-gap); }
+.memory-hero__inner { align-items:center; gap:var(--space-4); }
+.memory-hero__title { font-family:var(--font-display); font-size:var(--text-xl); letter-spacing:normal; }
+.memory-hero__lead { font-size:var(--text-sm); line-height:var(--leading-relaxed); }
+.memory-hero__stamp { margin-top:var(--space-2); }
+.memory-hero__eyebrow { margin-bottom:var(--space-2); }
+.memory-hero__actions { align-self:center; }
+.stat-grid { gap:var(--density-gap); }
+.dashboard-columns { gap:var(--layout-page-gap); align-items:start; }
+.rank-row,.recent-item { min-height:var(--density-row-height); padding-block:var(--space-3); }
+.year-index__years { gap:var(--space-2); }
+.year-index__years a { min-height:var(--control-height); padding:var(--space-2) var(--space-3); font-size:var(--text-base); }
+.memory-excerpt { margin-top:var(--space-4); padding:var(--space-3) var(--space-4); background:var(--color-surface-sunken); border-radius:var(--radius-md); }
+@media(min-width:1100px) { .dashboard-columns { grid-template-columns:minmax(0,1fr) minmax(0,1.4fr); } }
+@media(max-width:600px) { .memory-hero__actions { width:100%; } .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+
+@media(min-width:1100px) {
+ .dashboard { display:grid; grid-template-columns:minmax(0,2.2fr) minmax(var(--layout-contact-cell),1fr); align-items:start; }
+ .dashboard > .archive-heading,.dashboard > .memory-hero,.dashboard > .stat-grid { grid-column:1 / -1; }
+ .dashboard > .year-index { grid-column:1; }
+ .dashboard > .dashboard-columns { grid-column:2; grid-row:4 / span 2; display:flex; flex-direction:column; gap:var(--layout-page-gap); }
+ .dashboard-columns > * { width:100%; }
+ .dashboard > .qza-card:last-child:not(.memory-hero):not(.year-index) { grid-column:1; }
+}
 </style>

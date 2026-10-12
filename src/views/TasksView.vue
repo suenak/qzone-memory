@@ -79,11 +79,11 @@ const statusTone = computed<"accent" | "success" | "warning" | "danger" | "neutr
 /** 状态标题：一眼看懂「现在在做什么」。 */
 const statusTitle = computed(() => ({
   idle: "等待开始",
-  running: "正在备份空间动态",
-  completed: "本次备份已完成",
-  cancelled: "备份已停止",
+  running: "正在查找和保存说说",
+  completed: "本次恢复已完成",
+  cancelled: "恢复已停止",
   limited: "请求过于频繁，已暂停",
-  error: "备份未完成",
+  error: "恢复未完成",
 }[progress.value.status]));
 
 /** 状态说明：解释「为什么」以及「下一步」。 */
@@ -91,19 +91,19 @@ const statusDescription = computed(() => ({
   idle: "开始后会逐页读取空间记录，保存到本机。",
   running: "正在读取并保存。请保持应用运行，不要切换 QQ 账号。",
   completed: "本轮读取已结束，可到「说说」查看结果。",
-  cancelled: "已保存的内容会保留，下次可继续备份。",
-  limited: "QQ 空间暂时限制了请求。等待倒计时结束后，点击「继续备份」。",
+  cancelled: "已保存的内容会保留，下次可继续恢复。",
+  limited: "QQ 空间暂时限制了请求。等待倒计时结束后，点击「继续恢复」。",
   error: "已保存的内容会保留。请查看错误提示后重试。",
 }[progress.value.status]));
 
 /** 操作按钮文案：把「现在能不能点、点了会发生什么」写在按钮上。 */
 const startLabel = computed(() => {
-  if (running.value) return "备份中…";
+  if (running.value) return "恢复中…";
   if (rateWaiting.value) return `请等待 ${remainingText.value}`;
-  if (rateLimited.value) return "继续备份";
-  if (progress.value.status === "cancelled" || progress.value.status === "error") return "继续备份";
+  if (rateLimited.value) return "继续恢复";
+  if (progress.value.status === "cancelled" || progress.value.status === "error") return "继续恢复";
   if (progress.value.status === "completed") return "检查新内容";
-  return "开始备份";
+  return "开始恢复";
 });
 
 const skipBadge = computed(() => skips.value.filter((item) => !item.resolvedAt).length);
@@ -130,7 +130,7 @@ function commitIntervalInput() {
 }
 
 /* 刚由 start / cancel 写入的进度在此刻之前视为权威：侧边栏轮询是「更早发出」的请求，
- * 它的响应回来时不能把按钮状态改回旧值（「停止备份」变回「备份中」）。
+ * 它的响应回来时不能把按钮状态改回旧值（「停止恢复」变回「备份中」）。
  * archive.ts 是父任务负责的文件，这里不引入跨文件的新接口，只在组件内做短 TTL 保护。 */
 const PROGRESS_FRESH_MS = 2500;
 let progressFreshAt = 0;
@@ -169,7 +169,7 @@ async function start() {
     // 紧接其后的 refresh（含侧边栏轮询）不得用旧快照覆盖刚拿到的状态。
     markProgressFresh();
   }
-  catch (reason) { actionError.value = describeError(reason, "未能开始备份，请重试。"); }
+  catch (reason) { actionError.value = describeError(reason, "未能开始恢复，请重试。"); }
   finally { starting.value = false; await refresh(); }
 }
 async function cancel() {
@@ -180,7 +180,7 @@ async function cancel() {
     await cancelFeedArchive();
     markProgressFresh();
   }
-  catch (reason) { actionError.value = describeError(reason, "未能停止备份，请重试。"); }
+  catch (reason) { actionError.value = describeError(reason, "未能停止恢复，请重试。"); }
   finally { stopping.value = false; await refresh(); }
 }
 async function retrySkip(item: ArchiveSkipItem) {
@@ -222,11 +222,11 @@ onBeforeUnmount(() => clearInterval(timer));
 
 <template>
   <div class="tasks-page">
-    <ArchiveHeading title="备份任务" description="保存说说和互动记录，离开此页不会中断备份。" :icon="Archive" />
+    <ArchiveHeading title="恢复任务" description="查找说说和互动记录。离开此页不会停止任务。" :icon="Archive" />
     <!-- ------------------------------------------------------- 任务状态卡 -->
     <SectionCard
-      title="空间动态备份"
-      description="从互动记录里逐页取回历史动态，写入本地数据。"
+      title="恢复说说"
+      description="查找仍可读取的互动记录，尝试还原说说并保存到本机。"
     >
       <template #actions>
         <span class="status-chip" :class="`is-${statusTone}`">
@@ -239,9 +239,9 @@ onBeforeUnmount(() => clearInterval(timer));
         </button>
       </template>
 
-      <p v-if="archiveStore.error" class="skip-notice" role="alert">{{ describeError(archiveStore.error, "备份状态读取失败，请刷新进度。") }}</p>
+      <p v-if="archiveStore.error" class="skip-notice" role="alert">{{ describeError(archiveStore.error, "恢复状态读取失败，请刷新进度。") }}</p>
       <p v-if="actionError" class="skip-notice" role="alert">{{ actionError }}</p>
-      <p v-if="loggedIn && !licenseStore.canArchive" class="skip-notice">当前授权仅支持查看和导出，更新授权后可开始备份。</p>
+      <p v-if="loggedIn && !licenseStore.canArchive" class="skip-notice">当前授权仅支持查看和导出，更新授权后可开始恢复。</p>
       <SkeletonBlock v-if="statsLoading" :lines="3" height="18px" />
 
       <template v-else>
@@ -282,7 +282,7 @@ onBeforeUnmount(() => clearInterval(timer));
           </span>
           <div class="notice__copy">
             <strong>{{ remainingText }} 后可继续</strong>
-            <p>进度已保存，等待结束后可继续备份。</p>
+            <p>进度已保存，等待结束后可继续恢复。</p>
           </div>
           <span class="notice__timer">{{ remainingText }}</span>
         </div>
@@ -292,8 +292,8 @@ onBeforeUnmount(() => clearInterval(timer));
             <Clock :size="18" :stroke-width="1.8" />
           </span>
           <div class="notice__copy">
-            <strong>现在可以继续备份</strong>
-            <p>点击「继续备份」，接着读取上次未完成的内容。</p>
+            <strong>现在可以继续恢复</strong>
+            <p>点击「继续恢复」，接着读取上次未完成的内容。</p>
           </div>
         </div>
 
@@ -303,7 +303,7 @@ onBeforeUnmount(() => clearInterval(timer));
           </span>
           <div class="notice__copy">
             <strong>请先登录 QQ 空间</strong>
-            <p>登录后才能创建或继续备份任务。</p>
+            <p>登录后才能创建或继续恢复任务。</p>
           </div>
           <Button label="登录 QQ 空间" size="small" @click="authStore.openLogin" ><template #icon><LogIn :size="16" :stroke-width="1.8" /></template></Button>
         </div>
@@ -320,7 +320,7 @@ onBeforeUnmount(() => clearInterval(timer));
         <div class="action-bar">
           <div class="action-bar__buttons">
             <Button :label="startLabel" :loading="starting" :disabled="running || rateWaiting || !loggedIn || !licenseStore.canArchive" @click="start" ><template #icon><Download :size="16" :stroke-width="1.8" /></template></Button>
-            <Button v-if="running" label="停止备份" severity="secondary" outlined :loading="stopping" @click="cancel" ><template #icon><X :size="16" :stroke-width="1.8" /></template></Button>
+            <Button v-if="running" label="停止恢复" severity="secondary" outlined :loading="stopping" @click="cancel" ><template #icon><X :size="16" :stroke-width="1.8" /></template></Button>
             <button
               class="ghost-button"
               type="button"
@@ -430,7 +430,7 @@ onBeforeUnmount(() => clearInterval(timer));
         </li>
         <li>
           <span class="tips__icon" aria-hidden="true"><Clock :size="16" :stroke-width="1.8" /></span>
-          <span>出现<strong>频繁提示</strong>时建议换个时间再继续。程序支持<strong>断点续传</strong>，可以接着上次的进度继续备份。</span>
+          <span>出现<strong>频繁提示</strong>时建议换个时间再继续。程序支持<strong>断点续传</strong>，可以接着上次的进度继续恢复。</span>
         </li>
         <li>
           <span class="tips__icon" aria-hidden="true"><Archive :size="16" :stroke-width="1.8" /></span>
@@ -992,4 +992,16 @@ onBeforeUnmount(() => clearInterval(timer));
   align-items: center;
   gap: var(--space-2); flex-wrap:wrap; }
 
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .tasks-page { gap:var(--layout-page-gap); }
+.status-panel { background:var(--color-surface-sunken); border:var(--line-width) solid var(--color-border); border-left:var(--selection-marker) solid var(--color-accent); padding:var(--space-4); gap:var(--space-3); }
+.status-panel__icon { width:var(--layout-empty-icon); height:var(--layout-empty-icon); border-radius:var(--radius-md); }
+.status-panel__copy h3 { font-size:var(--text-lg); }
+.action-bar { padding-top:var(--space-3); border-top:var(--line-width) solid var(--color-border); gap:var(--space-2); }
+.engine-message { font-size:var(--text-sm); }
+.skip-item { border-radius:var(--radius-md); padding:var(--space-3); }
+@media(min-width:1000px) { .tasks-page { max-width:var(--layout-section-max); } }
+
+@media(max-width:600px) { .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--space-2); } .status-panel__copy h3 { font-size:var(--text-lg); } }
 </style>

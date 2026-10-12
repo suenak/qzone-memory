@@ -941,4 +941,14 @@ async function refreshSeats() {
   overflow: hidden; overflow-wrap:anywhere; min-width:0; }
 @media (max-width:860px) { .setting-row { flex-wrap:wrap; align-items:flex-start; gap:var(--space-3); } .segmented { flex-wrap:wrap; } .segmented__item { min-height:var(--touch-target); } .interval-control { width:100%; } }
 
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .settings-stack { max-width:var(--layout-section-max); gap:var(--layout-page-gap); }
+.setting-row { min-height:var(--density-row-height); padding-block:var(--space-4); align-items:center; gap:var(--space-4); }
+.setting-row__icon { width:var(--layout-stat-icon); height:var(--layout-stat-icon); background:var(--color-surface-sunken); border:var(--line-width) solid var(--color-border); border-radius:var(--radius-md); }
+.setting-row__label strong { font-size:var(--text-sm); }
+.segmented { border-radius:var(--radius-md); padding:var(--space-1); background:var(--color-surface-sunken); }
+.segmented__item { min-height:var(--control-compact); padding:var(--space-1) var(--space-3); }
+.segmented__item.is-active { background:var(--color-surface); box-shadow:var(--shadow-xs); }
+@media(max-width:600px) { .setting-row { align-items:flex-start; gap:var(--space-3); } .segmented__item { min-height:var(--touch-target); } }
 </style>
