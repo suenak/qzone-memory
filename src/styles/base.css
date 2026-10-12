@@ -371,3 +371,11 @@ html .p-dialog-content { min-height: 0; overscroll-behavior: contain; }
   .p-button, .p-inputtext, .p-inputnumber-input, .p-select, .p-select-option, .p-paginator-page, .p-paginator-next, .p-paginator-prev { min-height: var(--touch-target); }
   .p-dialog-close-button, .p-drawer-close-button { min-width: var(--touch-target); min-height: var(--touch-target); flex-shrink: 0; }
 }
+
+/* 桌面控件统一密度；主按钮的前景色不能被 reset 的 color:inherit 覆盖。 */
+html .p-button:not(.p-button-outlined):not(.p-button-text):not(.p-button-link):not(.p-button-secondary):not(.p-button-danger):not(.p-button-warn):not(.p-button-success) { color:var(--color-on-accent); background:var(--color-accent); border-color:var(--color-accent); }
+html .p-button:not(.p-button-outlined):not(.p-button-text):not(.p-button-link):not(.p-button-secondary):not(.p-button-danger):not(.p-button-warn):not(.p-button-success):enabled:hover { background:var(--color-accent-hover); border-color:var(--color-accent-hover); }
+html .p-select { min-height:var(--control-height); align-items:center; }
+html .p-inputtext,html .p-password-input { min-height:var(--control-height); font-size:var(--text-sm); }
+html .p-button { font-size:var(--text-sm); gap:var(--space-2); }
+@media(forced-colors:active) { :focus-visible { outline-color:Highlight; } html .p-button { forced-color-adjust:auto; } }

@@ -201,7 +201,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -221,7 +221,7 @@ jobs:
 
           sdkmanager \
             "platform-tools" \
-            "platforms;android-35" \
+            "platforms;android-36" \
             "build-tools;35.0.0" \
             "ndk;27.0.12077973"
 
@@ -246,7 +246,16 @@ jobs:
       - uses: ./.github/actions/qza-config
 
       - name: Build Android
-        run: npx tauri android build --target aarch64
+        run: npx tauri android build --target aarch64 armv7 i686 x86_64 --apk
+
+      - name: Verify Android ABI coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+          for ABI in arm64-v8a armeabi-v7a x86 x86_64; do
+            unzip -p "$APK" "lib/$ABI/libqzonearchive_lib.so" > /dev/null
+          done
 
       - uses: ./.github/actions/qza-verify
 
@@ -695,14 +704,14 @@ jobs:
           body: |
             ## 拾忆 ${{ github.ref_name }}
 
-            这是一个本地优先的 QQ 空间恢复归档工具。本版将当前可见说说、旧历史残留和互动记录进行结构化合并，并提供相册、视频、留言板、旧收藏、联系人互动、年份筛选、全文搜索和离线导出。
+            拾忆用于尝试恢复仍有可读取互动记录的已删除说说，并将找到的内容保存到本地。本版更新客户端界面、离线导出和 Android 兼容性。
 
             ### 下载说明
 
             - Windows：下载 `.exe` 安装程序
             - macOS Apple 芯片：下载文件名含 `aarch64` 的 `.dmg`
             - macOS Intel：下载文件名含 `x64` 的 `.dmg`
-            - Android：下载通用 `.apk`
+            - Android：Android 8.0 及以上，下载包含 ARM / ARM64 / x86 / x86_64 的通用 `.apk`。系统 WebView 需要 111 或以上，过旧时会提示更新网页组件。
             - iOS：提供未签名 `.ipa`，需使用 AltStore、SideStore、Sideloadly、TrollStore 等工具自行签名安装，不能直接安装或提交 App Store
 
             ### 重要说明
@@ -711,8 +720,11 @@ jobs:
 
             ### 本版修复
 
-            - 腾讯 WAF 拦截移动端互动接口时，保留并完成当前可见说说与旧历史消息归档，不再让整次任务失败。
-            - 本人说说为空时通过 QQ 资料接口补齐昵称，避免历史卡片已读取但写入 0 条。
+            - 调整 Windows 页面密度、导航、主题和各页面布局，同步移动端内容。
+            - 修复 Android 横屏导航、系统边距、软键盘与返回键行为，调整横屏授权表单。
+            - 离线导出使用本地缓存媒体，不再依赖临时的远程图片和视频地址。
+            - 修复恢复任务、资料同步与退出账号之间的并发问题。
+            - 本机 Windows 原生界面及 Android 16 模拟器页面检查通过；Android 8 验证了安装、启动及旧 WebView 更新提示。其他系统版本和厂商实体设备仍需补充验证。
 
             本项目基于 Gaoshu705/QzoneArchive 进行 GPLv3 二次开发，参考项目与完整免责声明见仓库 README 和 THIRD_PARTY_NOTICES。
         env:

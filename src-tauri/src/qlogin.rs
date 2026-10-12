@@ -975,7 +975,9 @@ pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<Lo
 pub async fn logout_qzone(
     app: tauri::AppHandle,
     state: tauri::State<'_, QLoginState>,
+    archive: tauri::State<'_, crate::archive::ArchiveState>,
 ) -> Result<(), String> {
+    crate::archive::ensure_archive_idle(&archive)?;
     state.clear_session().await;
     // 页面 token 与独立密码签名同样是进程级凭证缓存，登出时必须一并作废，
     // 否则它们会活到进程结束。

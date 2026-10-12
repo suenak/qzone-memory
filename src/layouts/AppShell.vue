@@ -37,6 +37,7 @@ import { useArchiveStore } from "../stores/archive";
 import { useAuthStore } from "../stores/auth";
 import { useToast } from "../composables/useToast";
 import { describeError } from "../utils/uiError";
+import { useMobileViewport } from "../composables/useMobileViewport";
 
 defineProps<{ pageTitle: string }>();
 
@@ -80,7 +81,7 @@ const navigationGroups: NavGroup[] = [
   {
     label: "回忆",
     items: [
-      { label: "首页", icon: LayoutDashboard, to: "/", hint: "备份规模与互动排行" },
+      { label: "恢复概览", icon: LayoutDashboard, to: "/", hint: "已保存的内容与互动记录" },
       { label: "说说", icon: MessageSquareQuote, to: "/archives", hint: "按时间翻阅历史动态" },
       { label: "说说照片与视频", icon: Camera, to: "/media", hint: "动态中的照片与视频" },
     ],
@@ -98,7 +99,7 @@ const navigationGroups: NavGroup[] = [
   {
     label: "管理与设置",
     items: [
-      { label: "备份任务", icon: RefreshCw, to: "/tasks", hint: "进度、停止与继续备份" },
+      { label: "恢复任务", icon: RefreshCw, to: "/tasks", hint: "进度、停止与继续备份" },
       { label: "相册回收站", icon: Trash2, to: "/recycle-bin", hint: "恢复误删的相册照片" },
       { label: "设置", icon: SettingsIcon, to: "/settings", hint: "外观、账号与数据管理" },
     ],
@@ -148,15 +149,20 @@ const themeIcon = computed(() => {
   return found?.icon ?? Monitor;
 });
 
+const searchShortcut = computed(() => platform() === "macos" ? "⌘ K" : "Ctrl K");
+const desktopPlatform = computed(() => !["android", "ios"].includes(platform()));
+const mobilePlatform = computed(() => !desktopPlatform.value);
+const { keyboardVisible } = useMobileViewport(mobilePlatform);
+
 const archiveRunning = computed(() => archiveStore.running);
 const archiveSummary = computed(() => {
   const progress = archiveStore.progress;
   if (!progress) return "";
   if (progress.status === "running") return `已保存 ${progress.saved} 条`;
-  if (progress.status === "completed") return "上次备份已完成";
+  if (progress.status === "completed") return "上次恢复已完成";
   if (progress.status === "limited") return "请求过于频繁，稍后可继续";
-  if (progress.status === "error") return "上次备份未完成";
-  return "备份已停止";
+  if (progress.status === "error") return "上次恢复未完成";
+  return "任务已停止";
 });
 
 function qzoneUrl() {
@@ -205,7 +211,7 @@ function selectTheme(mode: ThemeMode) {
 }
 
 async function logout() {
-  if (logoutLoading.value || archiveStore.running) return;
+  if (logoutLoading.value || archiveStore.busy) return;
   logoutLoading.value = true;
   try {
     accountPopover.value?.hide();
@@ -243,7 +249,7 @@ onMounted(() => document.addEventListener("keydown", handleSearchShortcut));
 onBeforeUnmount(() => document.removeEventListener("keydown", handleSearchShortcut));
 
 onMounted(() => {
-  // 侧边栏需要全局可见的备份状态，因此轮询在这里启停，TasksView 复用同一份数据。
+  // 侧边栏需要全局可见的恢复状态，因此轮询在这里启停，TasksView 复用同一份数据。
   archiveStore.startPolling();
 });
 
@@ -253,14 +259,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="{ 'is-desktop': desktopPlatform, 'is-mobile': mobilePlatform, 'is-keyboard-open': keyboardVisible }">
     <!-- ------------------------------------------------------ 桌面侧边栏 -->
     <aside class="sidebar" :class="{ 'is-collapsed': sidebarCollapsed }">
       <div class="sidebar__brand">
         <span class="brand-mark" aria-hidden="true"><img class="brand-mark__logo" src="/branding/shiyi-logo-v2-mark-on-blue-256.png" alt="" /></span>
         <span class="brand-text">
           <strong>拾忆</strong>
-          <small>QQ 空间本地备份</small>
+          <small>QQ 空间说说恢复</small>
         </span>
       </div>
 
@@ -294,7 +300,7 @@ onBeforeUnmount(() => {
         >
           <span class="sync-chip__dot" />
           <span class="sync-chip__text">
-            <strong>{{ archiveRunning ? "正在备份" : "备份状态" }}</strong>
+            <strong>{{ archiveRunning ? "正在备份" : "恢复状态" }}</strong>
             <small>{{ archiveSummary }}</small>
           </span>
         </RouterLink>
@@ -329,16 +335,16 @@ onBeforeUnmount(() => {
             v-model="searchInput"
             ref="searchElement"
             type="search"
-            placeholder="搜索已备份的说说"
-            aria-label="搜索已备份的说说"
+            placeholder="搜索已保存的说说"
+            aria-label="搜索已保存的说说"
             @keydown.enter.prevent="submitSearch"
           />
-          <kbd>Ctrl K</kbd>
+          <kbd>{{ searchShortcut }}</kbd>
         </label>
 
         <div class="topbar__actions">
           <button class="icon-button mobile-search-toggle" type="button" aria-label="搜索说说" :aria-expanded="mobileSearchVisible" @click="mobileSearchVisible = !mobileSearchVisible"><Search :size="18" :stroke-width="1.8" /></button>
-          <RouterLink to="/tasks" class="toolbar-sync" :class="{ 'is-running': archiveRunning }" :aria-label="archiveRunning ? archiveSummary : '打开备份任务'"><RefreshCw :size="15" :stroke-width="1.8" /><span>{{ archiveRunning ? '正在备份' : '备份任务' }}</span></RouterLink>
+          <RouterLink to="/tasks" class="toolbar-sync" :class="{ 'is-running': archiveRunning }" :aria-label="archiveRunning ? archiveSummary : '打开恢复任务'"><RefreshCw :size="15" :stroke-width="1.8" /><span>{{ archiveRunning ? '正在备份' : '恢复任务' }}</span></RouterLink>
           <button
             class="icon-button"
             type="button"
@@ -425,11 +431,11 @@ onBeforeUnmount(() => {
           <Globe :size="16" :stroke-width="1.8" />
           <span>打开 QQ 空间</span>
         </button>
-        <button type="button" class="popover-menu__item is-danger" :disabled="logoutLoading || archiveStore.running" @click="logout">
+        <button type="button" class="popover-menu__item is-danger" :disabled="logoutLoading || archiveStore.busy" @click="logout">
           <LogOut :size="16" :stroke-width="1.8" />
           <span>{{ logoutLoading ? "正在退出…" : "退出登录" }}</span>
         </button>
-        <small v-if="archiveStore.running">请先停止备份，再退出登录。</small>
+        <small v-if="archiveStore.busy">请先停止恢复任务或等待资料同步结束，再退出登录。</small>
       </div>
     </Popover>
 
@@ -551,4 +557,43 @@ onBeforeUnmount(() => {
  .mobile-nav__item.router-link-active,.mobile-nav__item.is-active { color:var(--color-accent); background:var(--color-accent-soft); }
  .mobile-nav__item:hover { text-decoration:none; } .icon-button,.account-chip { min-height:var(--touch-target); min-width:var(--touch-target); }
 }
+
+/* 桌面工作区：选中轨道和紧凑工具栏，保留系统窗口标题栏。 */
+.nav-item { position:relative; }
+.nav-item.router-link-active { background:var(--color-accent-soft); border-color:transparent; box-shadow:none; }
+.nav-item.router-link-active::before { content:""; position:absolute; left:0; top:var(--space-2); bottom:var(--space-2); width:var(--selection-marker); border-radius:var(--radius-full); background:var(--color-accent); }
+.topbar { background:var(--color-canvas); padding:var(--space-2) var(--space-6); }
+.topbar__title { font-size:var(--text-lg); font-family:var(--font-display); }
+.topbar__subtitle { display:none; }
+.topbar__search { background:var(--color-surface); }
+.content__inner { padding:var(--space-5) var(--space-6) var(--space-8); }
+.sidebar__nav { padding-top:var(--space-2); }
+.sidebar__brand { padding:var(--space-3) var(--space-4); }
+.sync-chip { border:var(--line-width) solid var(--color-border); }
+@media(max-width:860px) and (min-width:700px) {
+ .is-desktop.app-shell { flex-direction:row; }
+ .is-desktop .sidebar { display:flex; width:var(--layout-sidebar-collapsed); }
+ .is-desktop .workspace { height:100%; }
+ .is-desktop .mobile-nav { display:none; }
+ .is-desktop .brand-text,.is-desktop .nav-item__label,.is-desktop .nav-group__label,.is-desktop .sidebar-profile__copy,.is-desktop .sync-chip__text,.is-desktop .sidebar__collapse-text { display:none; }
+ .is-desktop .sidebar__brand,.is-desktop .nav-item,.is-desktop .sidebar-profile,.is-desktop .sync-chip { justify-content:center; padding-inline:var(--space-1); }
+}
+@media(max-width:600px) { .content__inner { padding:var(--space-4); } .topbar { padding-inline:var(--space-4); } }
+
+/* 手机/平板按平台保持触控导航，不能在横屏时误切成桌面侧栏。 */
+.app-shell { padding-top:env(safe-area-inset-top); padding-left:env(safe-area-inset-left); padding-right:env(safe-area-inset-right); }
+.is-mobile.app-shell { flex-direction:column; height:var(--mobile-viewport-height,100%); }
+.is-mobile .sidebar { display:none; }
+.is-mobile .workspace { height:auto; }
+.is-mobile .topbar { flex-wrap:wrap; padding:var(--space-2) var(--space-4); gap:var(--space-2); }
+.is-mobile .topbar__heading { flex:1; }
+.is-mobile .topbar__search { display:none; }
+.is-mobile .topbar__search.is-open { display:flex; order:3; flex-basis:100%; max-width:none; margin:0; }
+.is-mobile .mobile-search-toggle { display:grid; }
+.is-mobile .toolbar-sync,.is-mobile .account-chip__copy { display:none; }
+.is-mobile .mobile-nav { display:flex; align-items:stretch; flex-shrink:0; min-height:calc(var(--layout-mobile-nav-height) + env(safe-area-inset-bottom)); padding-bottom:env(safe-area-inset-bottom); border-top:var(--line-width) solid var(--color-border); background:var(--color-surface); }
+.is-mobile .mobile-nav__item { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:var(--space-1); min-height:var(--touch-target); flex:1; border:0; background:transparent; color:var(--color-text-secondary); font-size:var(--text-2xs); }
+.is-mobile .mobile-nav__item.router-link-active,.is-mobile .mobile-nav__item.is-active { color:var(--color-accent); background:var(--color-accent-soft); }
+.is-mobile.is-keyboard-open .mobile-nav { display:none; }
+.is-mobile .content { overscroll-behavior-y:contain; scroll-padding-block:var(--space-4); }
 </style>

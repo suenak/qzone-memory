@@ -179,7 +179,7 @@ const hasFilter = computed(() => Boolean(query.value.trim()) || selectedYear.val
 const emptyTitle = computed(() => hasFilter.value ? "没有符合条件的说说" : "还没有备份任何说说");
 const emptyDescription = computed(() => hasFilter.value
   ? "试试其他关键词或年份。"
-  : "到「备份任务」开始保存说说。");
+  : "到「恢复任务」开始保存说说。");
 
 async function load() {
   const sequence = ++loadSequence;
@@ -425,15 +425,19 @@ async function exportHtml(selectedOnly: boolean) {
   if (exporting.value || (selectedOnly && !selectedIds.value.length)) return;
   exporting.value = true; error.value = "";
   try {
-    const html = await exportArchivedHtml(category.value, selectedOnly ? selectedIds.value : undefined);
+    const exportCategory = category.value;
+    const exportIds = selectedOnly ? [...selectedIds.value] : undefined;
     const date = new Date().toISOString().slice(0, 10);
     const path = await save({
       defaultPath: `QQ空间恢复备份-${categoryLabel.value}-${date}.html`,
       filters: [{ name: "HTML 网页", extensions: ["html"] }],
     });
     if (!path) return;
-    await writeFile(path, new TextEncoder().encode(html));
-    toast.success(selectedOnly ? `已导出 ${selectedIds.value.length} 条备份记录` : "已导出全部备份记录");
+    const result = await exportArchivedHtml(exportCategory, path, exportIds);
+    const mediaNote = result.mediaFiles > 0 ? "移动时请将网页和旁边的媒体文件夹一起带走。" : "文字和互动记录可离线查看。";
+    const summary = `已导出 ${result.records} 条记录和 ${result.mediaFiles} 个媒体文件。${mediaNote}`;
+    if (result.missingMedia > 0) toast.info(`${summary}另有 ${result.missingMedia} 个媒体尚未保存，已在网页中标注。`);
+    else toast.success(summary);
   } catch (reason) { error.value = `导出失败：${String(reason)}`; }
   finally { exporting.value = false; }
 }
@@ -642,14 +646,14 @@ onBeforeUnmount(() => {
         :icon="CircleAlert"
         tone="danger"
         title="备份读取失败"
-        description="请重试，或到「备份任务」查看当前状态。"
+        description="请重试，或到「恢复任务」查看当前状态。"
       >
         <button type="button" class="ar-btn is-primary" @click="load">
           <RefreshCw :size="16" :stroke-width="1.8" />
           <span>重试</span>
         </button>
         <RouterLink class="ar-btn" to="/tasks">
-          <span>查看备份任务</span>
+          <span>查看恢复任务</span>
         </RouterLink>
       </EmptyState>
       <details class="ar-details">
@@ -667,7 +671,7 @@ onBeforeUnmount(() => {
         </button>
         <RouterLink v-else class="ar-btn is-primary" to="/tasks">
           <RefreshCw :size="16" :stroke-width="1.8" />
-          <span>去备份任务</span>
+          <span>去恢复任务</span>
         </RouterLink>
       </EmptyState>
     </SectionCard>
@@ -2112,4 +2116,17 @@ onBeforeUnmount(() => {
 @media (max-width:1080px) { .ar-timeline.is-cards { grid-template-columns:minmax(0,1fr); } }
 @media (max-width:860px) { .ar-btn,.ar-segment { min-height:var(--touch-target); } .ar-refinements__fields { gap:var(--space-3); } .ar-refinements__fields label { min-height:var(--touch-target); flex-wrap:wrap; } }
 
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .archive-page { gap:var(--layout-page-gap); }
+.ar-toolbar { position:sticky; top:0; z-index:var(--z-toolbar); box-shadow:var(--shadow-xs); }
+.ar-row { gap:var(--space-3); }
+.ar-card { box-shadow:none; border-radius:var(--radius-lg); }
+.ar-card:hover { border-color:var(--color-border-strong); }
+.ar-stamp { font-variant-numeric:tabular-nums; font-size:var(--text-xs); }
+.ar-entry { margin-bottom:var(--space-4); }
+.ar-segment,.ar-btn { min-height:var(--control-height); }
+.ar-search { background:var(--color-surface); }
+.ar-bulk { background:var(--color-accent-soft); border-radius:var(--radius-md); padding:var(--space-2) var(--space-3); }
+@media(max-width:600px) { .ar-toolbar { position:static; } .ar-row { gap:var(--space-2); } .ar-btn,.ar-segment { min-height:var(--touch-target); } }
 </style>

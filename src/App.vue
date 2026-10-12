@@ -292,4 +292,8 @@ async function declineDisclaimer() {
   flex: 0 0 auto;
   margin-top: var(--line-width);
 }
+
+/* 只在新页面进入时轻微淡入，不延迟旧页面退出或后台任务。 */
+.native-page-enter-active { animation:client-page-enter var(--duration-fast) var(--ease-out); }
+@keyframes client-page-enter { from { opacity:0; transform:translateY(var(--space-1)); } to { opacity:1; transform:translateY(0); } }
 </style>

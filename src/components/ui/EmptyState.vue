@@ -42,7 +42,7 @@ withDefaults(
   align-items: center;
   text-align: center;
   gap: var(--space-3);
-  padding: var(--space-12) var(--space-6);
+  padding: var(--space-10) var(--space-5);
 }
 
 .qza-empty.is-compact {
@@ -53,16 +53,16 @@ withDefaults(
 .qza-empty__icon {
   display: grid;
   place-items: center;
-  width: 52px;
-  height: 52px;
+  width: var(--layout-empty-icon);
+  height: var(--layout-empty-icon);
   border-radius: var(--radius-lg);
   background: var(--color-surface-sunken);
   color: var(--color-text-tertiary);
 }
 
 .is-compact .qza-empty__icon {
-  width: 40px;
-  height: 40px;
+  width: var(--control-height);
+  height: var(--control-height);
 }
 
 .qza-empty.is-warm .qza-empty__icon {

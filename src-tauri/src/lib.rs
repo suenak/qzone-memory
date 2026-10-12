@@ -1,6 +1,7 @@
 mod archive;
 mod license;
 mod media_http;
+mod offline_export;
 mod qlogin;
 mod qzone;
 mod updater;

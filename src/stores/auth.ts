@@ -184,12 +184,12 @@ export const useAuthStore = defineStore("auth", () => {
     dialogVisible.value = false;
     try {
       await invoke("logout_qzone");
-    } finally {
       useRecycleSessionStore().clear();
       user.value = undefined;
       qrImage.value = "";
       status.value = "loggedOut";
       message.value = "尚未登录";
+    } finally {
       loading.value = false;
     }
   }

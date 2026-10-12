@@ -121,7 +121,7 @@ const emptyTitle = computed(() => {
 const emptyDescription = computed(() => {
   if (error.value) return "请重试，已保存的内容会保留。";
   if (selectedYear.value) return "换一个年份，或把筛选切回「全部年份」看看全部媒体。";
-  return "到「备份任务」保存说说后，可在这里查看其中的照片和视频。";
+  return "到「恢复任务」保存说说后，可在这里查看其中的照片和视频。";
 });
 
 async function load(reset = false) {
@@ -338,7 +338,7 @@ onBeforeUnmount(() => {
             <Camera :size="20" :stroke-width="1.8" />
           </span>
           <div>
-            <p class="media-head__eyebrow">说说中的照片与视频</p><h2 class="media-head__title">说说照片与视频</h2>
+            <p class="media-head__eyebrow">说说中的照片与视频</p><h2 class="media-head__title qza-visually-hidden">说说照片与视频</h2>
             <p class="media-head__desc">集中浏览说说备份中的照片与视频；QQ 相册内容请在「相册」中查看。</p>
           </div>
         </div>
@@ -453,7 +453,7 @@ onBeforeUnmount(() => {
           <span>重试</span>
         </button>
         <button v-else-if="selectedYear" class="btn" type="button" @click="selectedYear = 0">查看全部年份</button>
-        <RouterLink v-else class="btn" to="/tasks">打开备份任务</RouterLink>
+        <RouterLink v-else class="btn" to="/tasks">打开恢复任务</RouterLink>
       </EmptyState>
     </SectionCard>
 
@@ -1440,6 +1440,18 @@ onBeforeUnmount(() => {
   overflow: hidden; background:var(--color-photo-mat); }
 @media (max-width:600px) { .shot-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--space-2); } .shot__meta { padding:var(--space-2); } }
 
+
+/* Windows 优先的内容密度；触控布局仍共用相同功能和语义。 */
+ .media-page { gap:var(--layout-page-gap); }
+.media-head { align-items:center; gap:var(--space-4); }
+.media-head__title { font-size:var(--text-lg); font-family:var(--font-display); letter-spacing:normal; }
+.media-head__eyebrow { display:none; }
+.media-head__badge { width:var(--control-height); height:var(--control-height); border-radius:var(--radius-md); }
+.media-head__desc { margin-top:var(--space-1); font-size:var(--text-sm); }
+.shot { box-shadow:none; border-radius:var(--radius-md); }
+.shot-grid { gap:var(--space-3); }
+.timeline__marker { font-size:var(--text-lg); font-variant-numeric:tabular-nums; }
+@media(max-width:600px) { .media-head { align-items:flex-start; } .shot-grid { gap:var(--space-2); } }
 </style>
 
 <!-- Dialog 由 PrimeVue 渲染到 body 下，容器尺寸只能在非 scoped 作用域里约束。 -->
