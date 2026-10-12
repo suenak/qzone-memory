@@ -67,7 +67,7 @@ export const loadRecyclePhotoPreview = (imageUrl: string) => invoke<string>("loa
 export type LibraryModule = "albums" | "photos" | "videos" | "guestbook" | "favorites";
 export interface LibraryItem {
   id: number; module: LibraryModule; itemKey: string; parentKey: string; createdAt: number;
-  title: string; summary: string; authorUin?: string; authorName?: string; coverUrl?: string; mediaUrls: string[];
+  title: string; summary: string; authorUin?: string; authorName?: string; coverUrl?: string; mediaUrls: string[]; isVideo: boolean;
 }
 export interface LibraryPage {
   items: LibraryItem[]; total: number; remoteTotal: number; complete: boolean; syncedAt: number; lastError?: string;
@@ -81,3 +81,10 @@ export const listQzoneLibrary = (module: LibraryModule, parentKey?: string, quer
   invoke<LibraryPage>("list_qzone_library", { module, parentKey, query, year, limit, offset });
 export const listQzoneLibraryYears = (module: LibraryModule, parentKey?: string) =>
   invoke<number[]>("list_qzone_library_years", { module, parentKey });
+
+export const loadLibraryMedia = (id: number) => invoke<{path: string; isVideo: boolean}>("load_library_media", {id});
+
+export const listLocalAccounts = () => invoke<{uin: string; selected: boolean}[]>("list_local_accounts");
+export const selectLocalAccount = (uin: string) => invoke<void>("select_local_account", {uin});
+
+export const linkLibraryVideo = (photoId: number, videoId: number) => invoke<void>("link_library_video", {photoId, videoId});

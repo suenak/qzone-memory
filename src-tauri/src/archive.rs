@@ -12,7 +12,6 @@ use std::{
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::Manager;
 
 use crate::{qlogin::QLoginState, qzone};
 
@@ -214,6 +213,7 @@ pub struct LibraryItem {
     author_name: Option<String>,
     cover_url: Option<String>,
     media_urls: Vec<String>,
+    is_video: bool,
 }
 
 #[derive(Serialize)]
@@ -314,11 +314,8 @@ fn archive_page_delay_ms(interval_ms: u64) -> u64 {
 }
 
 fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取应用数据目录：{error}"))?;
-    fs::create_dir_all(&dir).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
+    let dir = crate::account_storage::directory(app)?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("qzone-archive.sqlite3"))
 }
 
@@ -1698,7 +1695,7 @@ fn picture_urls(json: Option<String>) -> Vec<String> {
         .collect()
 }
 
-fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("jpg")
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -1718,7 +1715,7 @@ fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
+pub(crate) fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
     bytes.get(6..10).is_some_and(|size| {
         let width = u16::from_le_bytes([size[0], size[1]]);
         let height = u16::from_le_bytes([size[2], size[3]]);
@@ -1732,19 +1729,10 @@ fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
     })
 }
 
-/// 图片下载体积上限：QQ 图片最大不过几十 MB，超过必然是异常或伪造的响应，
-/// 而图片会整段读进内存，没有上限就等于把进程内存交给对端控制。
-const IMAGE_DOWNLOAD_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
-
-/// 视频下载体积上限。视频同样整段读进内存，所以仍然要设限，
-/// 但要比图片宽松得多——QQ 空间上的视频动辄上百 MB，
-/// 沿用图片的 50 MB 会把正常视频挡在门外。
-const VIDEO_DOWNLOAD_LIMIT_BYTES: u64 = 300 * 1024 * 1024;
-
 /// MP4 由一串 box 组成；顺序跳读头部即可确认文件没有在中途被截断。
 /// 旧实现直接 fs::write 覆盖缓存，网络中断会留下大于 1 KB 的残缺 mp4，
 /// 之后每次请求都会把它当成有效缓存复用，既播不出来也不再重新下载。
-fn is_complete_mp4(path: &std::path::Path) -> bool {
+pub(crate) fn is_complete_mp4(path: &std::path::Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
 
     let Ok(mut file) = fs::File::open(path) else {
@@ -1823,124 +1811,48 @@ pub async fn load_archived_image(
     picture_index: usize,
 ) -> Result<String, String> {
     crate::license::require_read_access()?;
-    let auth = login.qzone_auth().await?;
-    let image_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
-        .join("images")
-        .join(&auth.uin);
-    let file_stem = format!("{id}-{picture_index}");
-    // 纯缓存命中不写任何数据，退化为只读的用户也应当能看图；因此守卫要拦在
-    // “带 QQ cookie 的远端下载”之前：命中缓存直接返回，未命中才要求归档写权限。
-    if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
+    let owner = owner_uin_for_reads(&app, login.inner()).await?;
+    let dir = crate::account_storage::directory(&app)?.join("images");
+    let (pictures, timestamp): (Option<String>, i64) = open_database(&app)?
+        .query_row(
+            "SELECT pictures_json,published_at FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+            params![id, owner],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| "当前账号中不存在这条图片记录")?;
+    let urls = crate::media_store::candidates(
+        picture_url_candidates(pictures)
+            .into_iter()
+            .nth(picture_index)
+            .ok_or("这张图片没有保留可用地址")?,
+        false,
+    );
+    if let Some(path) = crate::media_store::cached(&dir, &urls)? {
         return Ok(path.to_string_lossy().into_owned());
     }
-    crate::license::require_archive_access()?;
-    fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
-
-    let pictures_json = {
-        let connection = open_database(&app)?;
-        connection
-            .query_row(
-                "SELECT pictures_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
-                params![id, auth.uin],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条图片归档".into(),
-                _ => format!("读取图片归档失败：{error}"),
-            })?
+    let auth = match login.qzone_auth().await {
+        Ok(auth) => auth,
+        Err(error) => {
+            return existing_archived_image(&dir, &format!("{id}-{picture_index}"))
+                .map(|p| p.to_string_lossy().into_owned())
+                .ok_or(error)
+        }
     };
-    let candidates = picture_url_candidates(pictures_json)
-        .into_iter()
-        .nth(picture_index)
-        .ok_or("该图片没有保存可用的 QQ 地址")?;
+    crate::license::require_archive_access()?;
+    if auth.uin != owner {
+        return Err("账号已切换，请重新打开图片".into());
+    }
     let _permit = state
         .image_downloads
         .acquire()
         .await
-        .map_err(|_| "图片下载队列已关闭")?;
-    if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
-        return Ok(path.to_string_lossy().into_owned());
+        .map_err(|_| "图片队列已关闭")?;
+    match crate::media_store::download(&dir, &auth, urls, timestamp, false).await {
+        Ok(path) => Ok(path.to_string_lossy().into_owned()),
+        Err(error) => existing_archived_image(&dir, &format!("{id}-{picture_index}"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(error),
     }
-    let client = reqwest::Client::builder()
-        .redirect(crate::media_http::redirect_policy())
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(90))
-        .build()
-        .map_err(|error| format!("创建图片请求客户端失败：{error}"))?;
-    let mut last_error = String::new();
-    for url in candidates {
-        let url = match crate::media_http::media_url(&url) {
-            Ok(url) => url,
-            Err(error) => {
-                last_error = error;
-                continue;
-            }
-        };
-        for (with_cookie, with_referer) in
-            [(true, true), (true, false), (false, true), (false, false)]
-        {
-            let mut request =
-                crate::media_http::request(&client, &url, &auth.cookie_header, with_cookie)
-                    .header(reqwest::header::USER_AGENT, &auth.user_agent)
-                    .header(
-                        reqwest::header::ACCEPT,
-                        "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
-                    )
-                    .header(
-                        reqwest::header::ACCEPT_LANGUAGE,
-                        "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
-                    );
-            if with_referer {
-                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
-            }
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    if response
-                        .content_length()
-                        .is_some_and(|length| length > IMAGE_DOWNLOAD_LIMIT_BYTES)
-                    {
-                        last_error = "图片超过 50 MB 安全限制".into();
-                        continue;
-                    }
-                    match response.bytes().await {
-                        Ok(bytes) => {
-                            let Some(extension) = archived_image_extension(&bytes) else {
-                                last_error = "QQ 返回了非图片内容".into();
-                                continue;
-                            };
-                            if is_qq_missing_image_placeholder(&bytes) {
-                                last_error = "QQ 返回了图片不存在占位图".into();
-                                continue;
-                            }
-                            let path = image_dir.join(format!("{file_stem}.{extension}"));
-                            let nonce = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos();
-                            let temporary = image_dir.join(format!("{file_stem}-{nonce}.part"));
-                            fs::write(&temporary, &bytes)
-                                .map_err(|error| format!("写入图片归档失败：{error}"))?;
-                            if let Err(error) = fs::rename(&temporary, &path) {
-                                if !path.exists() {
-                                    let _ = fs::remove_file(&temporary);
-                                    return Err(format!("保存图片归档失败：{error}"));
-                                }
-                                let _ = fs::remove_file(&temporary);
-                            }
-                            return Ok(path.to_string_lossy().into_owned());
-                        }
-                        Err(error) => last_error = format!("读取图片数据失败：{error}"),
-                    }
-                }
-                Ok(response) => last_error = format!("HTTP {}", response.status()),
-                Err(error) => last_error = format!("请求图片失败：{error}"),
-            }
-        }
-    }
-    Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
 }
 
 fn video_urls(json: Option<String>) -> Vec<String> {
@@ -2024,154 +1936,38 @@ pub async fn load_archived_video(
     id: i64,
 ) -> Result<String, String> {
     crate::license::require_read_access()?;
-    let auth = login.qzone_auth().await?;
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("无法获取视频缓存目录：{error}"))?
-        .join("videos");
-    let cache_path = cache_dir.join(format!("{}-{id}.mp4", auth.uin));
-    // 纯缓存命中不写任何数据，退化为只读的用户也应当能播放已缓存的视频；
-    // 未命中缓存才会带着 QQ cookie 去远端下载，那一步必须由写权限守卫把关。
-    if cached_video_is_usable(&cache_path) {
-        return Ok(cache_path.to_string_lossy().into_owned());
+    let owner = owner_uin_for_reads(&app, login.inner()).await?;
+    let root = crate::account_storage::directory(&app)?;
+    crate::account_storage::migrate_videos(&app, &root, &owner)?;
+    let dir = root.join("videos");
+    let legacy = dir.join(format!("{owner}-{id}.mp4"));
+    let (video, timestamp): (Option<String>, i64) = open_database(&app)?
+        .query_row(
+            "SELECT video_json,published_at FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+            params![id, owner],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| "当前账号中不存在这条视频记录")?;
+    let urls = video_urls(video);
+    if let Some(path) = crate::media_store::cached(&dir, &urls)? {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    if cached_video_is_usable(&legacy) {
+        return Ok(legacy.to_string_lossy().into_owned());
     }
     crate::license::require_archive_access()?;
-    fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
-    let video_json = {
-        let connection = open_database(&app)?;
-        connection
-            .query_row(
-                "SELECT video_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
-                params![id, auth.uin],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条视频归档".into(),
-                _ => format!("读取视频归档失败：{error}"),
-            })?
-    };
-    let candidates = video_urls(video_json);
-    if candidates.is_empty() {
-        return Err("该归档没有可用的视频地址".into());
+    let auth = login.qzone_auth().await?;
+    if auth.uin != owner {
+        return Err("账号已切换，请重新打开视频".into());
     }
-    // 视频与图片共用同一个并发闸门：此前视频完全没有限流，
-    // 同时点开多个视频会一起把整段视频读进内存。
     let _permit = state
         .image_downloads
         .acquire()
         .await
-        .map_err(|_| "视频下载队列已关闭")?;
-    // 等待许可期间可能有别的任务已经写好同一个缓存，再确认一次避免重复下载。
-    if cached_video_is_usable(&cache_path) {
-        return Ok(cache_path.to_string_lossy().into_owned());
-    }
-    let client = reqwest::Client::builder()
-        .redirect(crate::media_http::redirect_policy())
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|error| format!("创建视频请求客户端失败：{error}"))?;
-    let mut last_error = String::new();
-    let mut rejected = false;
-    for url in candidates {
-        let url = match crate::media_http::media_url(&url) {
-            Ok(url) => url,
-            Err(error) => {
-                last_error = error;
-                continue;
-            }
-        };
-        for (with_cookie, with_referer) in
-            [(true, true), (true, false), (false, true), (false, false)]
-        {
-            let mut request =
-                crate::media_http::request(&client, &url, &auth.cookie_header, with_cookie)
-                    .header(reqwest::header::USER_AGENT, &auth.user_agent)
-                    .header(
-                        reqwest::header::ACCEPT,
-                        "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
-                    )
-                    .header(
-                        reqwest::header::ACCEPT_LANGUAGE,
-                        "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
-                    );
-            if with_referer {
-                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
-            }
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    if response
-                        .content_length()
-                        .is_some_and(|length| length > VIDEO_DOWNLOAD_LIMIT_BYTES)
-                    {
-                        last_error = "视频超过 300 MB 安全限制".into();
-                        continue;
-                    }
-                    let content_type = response
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    match response.bytes().await {
-                        Ok(bytes) => {
-                            if bytes.len() as u64 > VIDEO_DOWNLOAD_LIMIT_BYTES {
-                                // 服务端没有返回 content-length 时也要兜住上限。
-                                last_error = "视频超过 300 MB 安全限制".into();
-                                continue;
-                            }
-                            let is_mp4 = bytes
-                                .get(4..12)
-                                .is_some_and(|value| value.windows(4).any(|part| part == b"ftyp"));
-                            if content_type.starts_with("video/")
-                                || content_type.contains("octet-stream")
-                                || is_mp4
-                            {
-                                // 先写临时文件再 rename：下载中断只会留下 .part，
-                                // 不会生成“看似有效”的截断 mp4 被后续请求永久复用。
-                                let nonce = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_nanos();
-                                let temporary =
-                                    cache_dir.join(format!("{}-{id}-{nonce}.part", auth.uin));
-                                fs::write(&temporary, &bytes)
-                                    .map_err(|error| format!("写入视频缓存失败：{error}"))?;
-                                if let Err(error) = fs::rename(&temporary, &cache_path) {
-                                    let saved = is_complete_mp4(&cache_path);
-                                    let _ = fs::remove_file(&temporary);
-                                    if !saved {
-                                        return Err(format!("保存视频缓存失败：{error}"));
-                                    }
-                                }
-                                return Ok(cache_path.to_string_lossy().into_owned());
-                            }
-                            last_error = format!(
-                                "QQ 返回了非视频内容（{}）",
-                                if content_type.is_empty() {
-                                    "未知类型"
-                                } else {
-                                    &content_type
-                                }
-                            );
-                        }
-                        Err(error) => last_error = format!("读取视频数据失败：{error}"),
-                    }
-                }
-                Ok(response) => {
-                    rejected |= response.status() == reqwest::StatusCode::FORBIDDEN;
-                    last_error = format!("HTTP {}", response.status());
-                }
-                Err(error) => last_error = format!("请求视频失败：{error}"),
-            }
-        }
-    }
-    if rejected {
-        Err("QQ 拒绝了视频请求（HTTP 403），该归档的视频临时签名可能已经过期，请重新归档以更新视频地址".into())
-    } else {
-        Err(format!("所有视频地址均加载失败：{last_error}"))
-    }
+        .map_err(|_| "视频队列已关闭")?;
+    crate::media_store::download(&dir, &auth, urls, timestamp, true)
+        .await
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn set_progress(state: &ArchiveState, update: impl FnOnce(&mut ArchiveProgress)) {
@@ -3939,26 +3735,19 @@ pub async fn export_archived_html(
     crate::license::require_read_access()?;
     validate_category(&category)?;
     let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
-    let image_root = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("images")
-        .join(&owner_uin);
-    let video_root = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("videos");
+    let root = crate::account_storage::directory(&app)?;
+    crate::account_storage::migrate_videos(&app, &root, &owner_uin)?;
+    let image_root = root.join("images");
+    let video_root = root.join("videos");
+    let database = root.join("qzone-archive.sqlite3");
     let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
     if selected.as_ref().is_some_and(HashSet::is_empty) {
         return Err("请先选择需要导出的记录".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let connection = open_database(&app)?;
+        let connection = Connection::open(database).map_err(|e| e.to_string())?;
         let mut items =
             archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
-        drop(connection);
         if items.is_empty() {
             return Err("当前分类没有可以导出的记录".into());
         }
@@ -3971,7 +3760,21 @@ pub async fn export_archived_html(
         };
         for item in &mut items {
             for (index, url) in item.picture_urls.iter_mut().enumerate() {
-                let path = existing_archived_image(&image_root, &format!("{}-{index}", item.id));
+                let candidates = connection
+                    .query_row(
+                        "SELECT pictures_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+                        params![item.id, owner_uin],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .map(picture_url_candidates)
+                    .and_then(|v| v.into_iter().nth(index))
+                    .unwrap_or_else(|| vec![url.clone()]);
+                let path = crate::media_store::cached(
+                    &image_root,
+                    &crate::media_store::candidates(candidates, false),
+                )?
+                .or_else(|| existing_archived_image(&image_root, &format!("{}-{index}", item.id)));
                 let local = match path {
                     Some(path) => {
                         let extension = path
@@ -3994,9 +3797,26 @@ pub async fn export_archived_html(
                 *url = local.unwrap_or_default();
             }
             if let Some(url) = item.video_url.as_mut() {
-                let path = video_root.join(format!("{owner_uin}-{}.mp4", item.id));
-                let local = if cached_video_is_usable(&path) {
-                    bundle.copy_media(&video_root, &path, &format!("video-{}.mp4", item.id))?
+                let candidates = connection
+                    .query_row(
+                        "SELECT video_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+                        params![item.id, owner_uin],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .map(video_urls)
+                    .unwrap_or_else(|| vec![url.clone()]);
+                let path = crate::media_store::cached(&video_root, &candidates)?
+                    .unwrap_or_else(|| video_root.join(format!("{owner_uin}-{}.mp4", item.id)));
+                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+                let local = if cached_video_is_usable(&path)
+                    || extension == "webm" && path.metadata().is_ok_and(|m| m.len() > 32)
+                {
+                    bundle.copy_media(
+                        &video_root,
+                        &path,
+                        &format!("video-{}.{extension}", item.id),
+                    )?
                 } else {
                     None
                 };
@@ -4398,39 +4218,18 @@ pub async fn delete_all_app_data(
     state: tauri::State<'_, ArchiveState>,
 ) -> Result<(), String> {
     ensure_archive_idle(&state)?;
+    let root = crate::account_storage::directory(&app)?;
     login.clear_session().await;
-    // 内存里的页面令牌与回收站密码签名也要一并作废：clear_session 只清会话本身，
-    // 而 QzonePageTokenState / RecycleAuthState 是进程级的，不显式清就会留在内存里，
-    // 切换账号后可能被上一个账号的签名复用（本命令持有 AppHandle，可以直接清）。
     crate::qzone::clear_qq_credential_caches(&app);
-    // 归档数据已全部删除，授权凭据没有理由保留；下次使用需重新激活。
-    crate::license::purge_local_license(&app);
-    let database = database_path(&app)?;
-    for path in [
-        database.clone(),
-        PathBuf::from(format!("{}-wal", database.display())),
-        PathBuf::from(format!("{}-shm", database.display())),
-    ] {
-        if path.exists() {
-            fs::remove_file(&path).map_err(|error| format!("删除应用数据库失败：{error}"))?;
-        }
+    if root.exists() {
+        fs::remove_dir_all(&root).map_err(|e| format!("删除当前账号数据失败：{e}"))?;
     }
-    let videos = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("无法获取缓存目录：{error}"))?
-        .join("videos");
-    if videos.exists() {
-        fs::remove_dir_all(videos).map_err(|error| format!("删除视频缓存失败：{error}"))?;
-    }
-    let images = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
-        .join("images");
-    if images.exists() {
-        fs::remove_dir_all(images).map_err(|error| format!("删除图片归档失败：{error}"))?;
-    }
+    // Keep a tombstone to avoid importing this account again from the legacy backup.
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let empty = Connection::open(root.join("qzone-archive.sqlite3")).map_err(|e| e.to_string())?;
+    drop(empty);
+    fs::write(root.join("media-migrated"), b"1").map_err(|e| e.to_string())?;
+    fs::write(root.join("videos-migrated"), b"1").map_err(|e| e.to_string())?;
     if let Ok(mut progress) = state.progress.lock() {
         *progress = ArchiveProgress::default();
     }
@@ -4546,6 +4345,216 @@ pub async fn list_contact_comment_threads(
     .map_err(|error| format!("联系人评论查询任务异常退出：{error}"))?
 }
 
+fn library_is_video(raw: &Value) -> bool {
+    raw.get("is_video").is_some_and(|v| {
+        v.as_bool() == Some(true)
+            || v.as_i64() == Some(1)
+            || v.as_str()
+                .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+    }) || value_i64(raw, &["phototype"]) == 17
+        || raw.get("videoInfo").is_some_and(|v| {
+            value_text(v, &["vid", "videoId", "videoid", "play_url", "video_url"])
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+}
+
+fn is_video_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        ".mp4",
+        ".webm",
+        ".mov",
+        ".m3u8",
+        "video_url",
+        "videoplay",
+        "qqvideo",
+        "playurl",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+fn photo_identity(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    if !url
+        .host_str()
+        .is_some_and(|h| h.ends_with(".photo.store.qq.com") || h.ends_with(".qpic.cn"))
+    {
+        return None;
+    }
+    let start = value.find("/psc?/")?;
+    let token = value[start + 6..].split("!/").next()?;
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
+}
+
+fn resolve_album_video(
+    db: &Connection,
+    owner: &str,
+    item_key: &str,
+    cover: Option<&str>,
+    raw: &Value,
+    timestamp: i64,
+) -> Result<Vec<String>, String> {
+    let linked: Option<String> = db.query_row(
+        "SELECT v.media_json FROM archive_video_links l JOIN archive_library_items v ON v.id=l.video_id AND v.owner_uin=l.owner_uin WHERE l.owner_uin=?1 AND l.photo_key=?2 AND v.module='videos'",
+        params![owner,item_key],|r|r.get(0)).ok();
+    if let Some(media) = linked {
+        let urls = serde_json::from_str::<Vec<String>>(&media)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|u| is_video_url(u))
+            .collect::<Vec<_>>();
+        if !urls.is_empty() {
+            return Ok(urls);
+        }
+    }
+    let mut stmt=db.prepare("SELECT item_key,cover_url,media_json,created_at,raw_json FROM archive_library_items WHERE owner_uin=?1 AND module='videos'").map_err(|e|e.to_string())?;
+    let videos = stmt
+        .query_map([owner], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let vid = value_text(raw, &["vid", "videoId", "videoid"]);
+    let identity = cover.and_then(photo_identity);
+    let mut matches = Vec::new();
+    for (key, thumb, media, time, video_raw) in videos {
+        let same_id = key == item_key || vid.as_ref().is_some_and(|v| *v == key);
+        let same_cover = identity
+            .as_ref()
+            .is_some_and(|i| thumb.as_deref().and_then(photo_identity).as_ref() == Some(i));
+        let video_raw = serde_json::from_str::<Value>(&video_raw).unwrap_or(Value::Null);
+        let same_time = timestamp > 0
+            && timestamp == time
+            && value_text(raw, &["name", "title"])
+                .filter(|s| !s.is_empty())
+                .is_some_and(|title| {
+                    value_text(&video_raw, &["name", "title"]).as_ref() == Some(&title)
+                });
+        if same_id || same_cover || same_time {
+            let urls = serde_json::from_str::<Vec<String>>(&media)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| is_video_url(s))
+                .collect::<Vec<_>>();
+            if !urls.is_empty() {
+                matches.push(urls);
+            }
+        }
+    }
+    // Matching by list rank can open someone else's clip. Require one unique match.
+    if matches.len() == 1 {
+        Ok(matches.remove(0))
+    } else if matches.is_empty() {
+        Err(
+            "未找到这条相册视频的播放地址，请先备份「视频」列表；若仍无法匹配，目前只能查看封面"
+                .into(),
+        )
+    } else {
+        Err("这条视频对应了多个记录，无法确认播放地址，目前只能查看封面".into())
+    }
+}
+
+#[tauri::command]
+pub async fn link_library_video(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+    photo_id: i64,
+    video_id: i64,
+) -> Result<(), String> {
+    crate::license::require_read_access()?;
+    ensure_archive_idle(&state)?;
+    let owner = owner_uin_for_reads(&app, login.inner()).await?;
+    let db = open_database(&app)?;
+    let (key,raw):(String,String)=db.query_row("SELECT item_key,raw_json FROM archive_library_items WHERE owner_uin=?1 AND id=?2 AND module='photos'",params![owner,photo_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|"找不到当前账号的相册视频")?;
+    if !serde_json::from_str::<Value>(&raw).is_ok_and(|v| library_is_video(&v)) {
+        return Err("这条相册记录不是视频".into());
+    }
+    let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM archive_library_items WHERE owner_uin=?1 AND id=?2 AND module='videos')",params![owner,video_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if !exists {
+        return Err("找不到当前账号的视频记录".into());
+    }
+    db.execute_batch("CREATE TABLE IF NOT EXISTS archive_video_links(owner_uin TEXT NOT NULL,photo_key TEXT NOT NULL,video_id INTEGER NOT NULL,PRIMARY KEY(owner_uin,photo_key));").map_err(|e|e.to_string())?;
+    db.execute(
+        "INSERT OR REPLACE INTO archive_video_links VALUES(?1,?2,?3)",
+        params![owner, key, video_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryMedia {
+    path: String,
+    is_video: bool,
+}
+
+#[tauri::command]
+pub async fn load_library_media(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+    id: i64,
+) -> Result<LibraryMedia, String> {
+    crate::license::require_read_access()?;
+    let owner = owner_uin_for_reads(&app, login.inner()).await?;
+    let root = crate::account_storage::directory(&app)?;
+    let db = open_database(&app)?;
+    let (module,key,cover,media,raw,time):(String,String,Option<String>,String,String,i64)=db.query_row(
+        "SELECT module,item_key,cover_url,media_json,raw_json,created_at FROM archive_library_items WHERE owner_uin=?1 AND id=?2",params![owner,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(|_|"当前账号中不存在这条媒体记录")?;
+    if !["photos", "videos"].contains(&module.as_str()) {
+        return Err("这类记录没有可下载的照片或视频".into());
+    }
+    let raw = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
+    let video = module == "videos" || library_is_video(&raw);
+    let mut urls = serde_json::from_str::<Vec<String>>(&media).unwrap_or_default();
+    if video {
+        urls.retain(|u| is_video_url(u));
+        if urls.is_empty() {
+            urls = resolve_album_video(&db, &owner, &key, cover.as_deref(), &raw, time)?;
+        }
+    } else {
+        urls.retain(|u| !is_video_url(u));
+    }
+    drop(db);
+    let dir = root.join(if video { "videos" } else { "images" });
+    let urls = crate::media_store::candidates(urls, video);
+    if let Some(path) = crate::media_store::cached(&dir, &urls)? {
+        return Ok(LibraryMedia {
+            path: path.to_string_lossy().into_owned(),
+            is_video: video,
+        });
+    }
+    crate::license::require_archive_access()?;
+    let auth = login.qzone_auth().await?;
+    if auth.uin != owner {
+        return Err("账号已切换，请重新打开媒体".into());
+    }
+    let _permit = state
+        .image_downloads
+        .acquire()
+        .await
+        .map_err(|_| "媒体下载队列已关闭")?;
+    let path = crate::media_store::download(&dir, &auth, urls, time, video).await?;
+    Ok(LibraryMedia {
+        path: path.to_string_lossy().into_owned(),
+        is_video: video,
+    })
+}
+
 fn validate_library_module(module: &str) -> Result<(), String> {
     match module {
         "albums" | "photos" | "videos" | "guestbook" | "favorites" => Ok(()),
@@ -4646,7 +4655,20 @@ fn html_to_text(value: &str) -> String {
 fn collect_library_media(value: &Value, urls: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
-            for (key, child) in map {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| {
+                let key = key.to_ascii_lowercase();
+                if key.contains("raw") || key.contains("origin") {
+                    0
+                } else if key.contains("url3") || key.contains("video") || key.contains("play") {
+                    1
+                } else if key.contains("pre") || key.contains("thumb") || key.contains("small") {
+                    3
+                } else {
+                    2
+                }
+            });
+            for (key, child) in entries {
                 let normalized = key.to_ascii_lowercase();
                 let is_media_key = matches!(
                     normalized.as_str(),
@@ -4654,6 +4676,13 @@ fn collect_library_media(value: &Value, urls: &mut Vec<String>) {
                         | "pre"
                         | "origin"
                         | "origin_url"
+                        | "rawurl"
+                        | "originurl"
+                        | "url1"
+                        | "url2"
+                        | "url3"
+                        | "playurl"
+                        | "videourl"
                         | "downloadurl"
                         | "download_url"
                         | "coverurl"
@@ -5112,10 +5141,16 @@ pub async fn list_qzone_library(
                     created_at: row.get(4)?, title: row.get(5)?, summary: row.get(6)?, author_uin: row.get(7)?,
                     author_name: row.get(8)?, cover_url: row.get(9)?,
                     media_urls: serde_json::from_str(&media_json).unwrap_or_default(),
+                    is_video: false,
                 })
             }
         ).map_err(|error| format!("查询资料归档失败：{error}"))?;
-        let items = rows.collect::<Result<Vec<_>,_>>().map_err(|error| format!("读取资料归档失败：{error}"))?;
+        let mut items = rows.collect::<Result<Vec<_>,_>>().map_err(|error| format!("读取资料归档失败：{error}"))?;
+        for item in &mut items {
+            item.is_video = item.module == "videos" || connection.query_row(
+                "SELECT raw_json FROM archive_library_items WHERE owner_uin=?1 AND id=?2",
+                params![owner_uin,item.id], |r|r.get::<_,String>(0)).ok().and_then(|v|serde_json::from_str::<Value>(&v).ok()).is_some_and(|raw| library_is_video(&raw));
+        }
         let state = connection.query_row(
             "SELECT remote_total,complete,synced_at,last_error FROM archive_library_state WHERE owner_uin=?1 AND module=?2 AND scope_key=?3",
             params![owner_uin,module,scope_key],
@@ -5153,6 +5188,45 @@ pub async fn list_qzone_library_years(
             .map_err(|error| format!("查询资料归档年份失败：{error}"))?;
         rows.collect::<Result<Vec<_>,_>>().map_err(|error| format!("读取资料归档年份失败：{error}"))
     }).await.map_err(|error| format!("资料归档年份任务异常退出：{error}"))?
+}
+
+#[cfg(test)]
+mod library_media_tests {
+    use super::*;
+    #[test]
+    fn recognizes_album_video_flags() {
+        for value in [
+            json!({"is_video":true}),
+            json!({"is_video":1}),
+            json!({"phototype":17}),
+            json!({"phototype":"17"}),
+        ] {
+            assert!(library_is_video(&value));
+        }
+        assert!(!library_is_video(&json!({"is_video":0,"phototype":0})));
+    }
+    #[test]
+    fn video_resolution_is_account_scoped_and_rejects_ambiguity() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE archive_library_items(owner_uin TEXT,module TEXT,item_key TEXT,cover_url TEXT,media_json TEXT,created_at INTEGER,raw_json TEXT);").unwrap();
+        let cover = "https://a.photo.store.qq.com/psc?/album/picture!/b";
+        for (owner, key) in [("123", "video1"), ("456", "other-account")] {
+            db.execute(
+                "INSERT INTO archive_library_items VALUES(?1,'videos',?2,?3,?4,100,'{}')",
+                params![owner, key, cover, "[\"https://video.qq.com/one.mp4\"]"],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            resolve_album_video(&db, "123", "photo", Some(cover), &json!({}), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(resolve_album_video(&db, "789", "photo", Some(cover), &json!({}), 100).is_err());
+        db.execute("INSERT INTO archive_library_items SELECT owner_uin,module,'duplicate',cover_url,media_json,created_at,raw_json FROM archive_library_items WHERE owner_uin='123'",[]).unwrap();
+        assert!(resolve_album_video(&db, "123", "photo", Some(cover), &json!({}), 100).is_err());
+    }
 }
 
 #[cfg(test)]

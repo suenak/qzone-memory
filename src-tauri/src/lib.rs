@@ -1,6 +1,8 @@
+mod account_storage;
 mod archive;
 mod license;
 mod media_http;
+mod media_store;
 mod offline_export;
 mod qlogin;
 mod qzone;
@@ -50,6 +52,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             exit_app,
+            account_storage::list_local_accounts,
+            account_storage::select_local_account,
             license::get_license_status,
             license::activate_license,
             license::refresh_license,
@@ -93,6 +97,8 @@ pub fn run() {
             archive::get_archive_overview,
             archive::list_interactors,
             archive::list_contact_comment_threads,
+            archive::load_library_media,
+            archive::link_library_video,
             archive::sync_qzone_library,
             archive::list_qzone_library,
             archive::list_qzone_library_years,

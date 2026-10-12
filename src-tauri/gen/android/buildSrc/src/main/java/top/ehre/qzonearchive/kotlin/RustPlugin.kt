@@ -61,6 +61,8 @@ open class RustPlugin : Plugin<Project> {
 
                 for (targetPair in targetsList.withIndex()) {
                     val targetName = targetPair.value
+                    // Simulator architectures are debug-only; universal release builds ARM.
+                    if (profile == "release" && targetName !in listOf("aarch64", "armv7")) continue
                     val targetArch = archList[targetPair.index]
                     val targetArchCapitalized = targetArch.replaceFirstChar { it.uppercase() }
                     val targetBuildTask = project.tasks.maybeCreate(
@@ -75,7 +77,7 @@ open class RustPlugin : Plugin<Project> {
                     }
 
                     buildTask.dependsOn(targetBuildTask)
-                    tasks["merge$targetArchCapitalized${profileCapitalized}JniLibFolders"].dependsOn(
+                    tasks.findByName("merge$targetArchCapitalized${profileCapitalized}JniLibFolders")?.dependsOn(
                         targetBuildTask
                     )
                 }

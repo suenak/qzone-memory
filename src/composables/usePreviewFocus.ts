@@ -50,6 +50,6 @@ export function usePreviewFocus(open: Readonly<Ref<boolean>>, close: () => void)
     const root = overlay();
     (root?.querySelector<HTMLElement>("button:not(:disabled)") ?? root)?.focus({ preventScroll: true });
     document.addEventListener("keydown", keyboard, true);
-  });
+  }, { immediate: true });
   onBeforeUnmount(restore);
 }

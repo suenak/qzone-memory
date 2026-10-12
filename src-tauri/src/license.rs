@@ -1366,12 +1366,6 @@ pub fn sign_out_license(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 由 archive 模块的「删除所有数据」调用，避免删库后仍处于已激活状态。
-pub fn purge_local_license(app: &tauri::AppHandle) {
-    let _ = delete_secret(app, CREDENTIAL_LICENSE);
-    let _ = delete_secret(app, CREDENTIAL_DEVICE);
-}
-
 /// 距离上次成功心跳是否已超过间隔。没有凭证时返回 false——未激活无需心跳。
 fn heartbeat_due() -> bool {
     LicenseState::global()

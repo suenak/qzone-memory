@@ -27,3 +27,12 @@ export async function loadRemoteImageBlob(url: string) {
   if (isQqMissingImagePlaceholder(bytes)) throw new Error("QQ 原图已不存在");
   return URL.createObjectURL(new Blob([buffer], { type: contentType }));
 }
+
+/** Matches the local-time filenames used by the native media store. */
+export function mediaFileName(timestamp: number, suffix: string, extension = "jpg") {
+  const date = new Date(timestamp * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const stamp = timestamp > 0 && Number.isFinite(date.getTime())
+    ? `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}` : "时间未知";
+  return `${stamp}_${suffix.replace(/[<>:"/\\|?*]/g, "_").slice(0,60)}.${extension}`;
+}

@@ -5,7 +5,6 @@ import { useRoute, useRouter } from "vue-router";
 import { platform } from "../utils/platform";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
 import Checkbox from "primevue/checkbox";
 import Dialog from "primevue/dialog";
 import Drawer from "primevue/drawer";
@@ -18,7 +17,6 @@ import {
   SlidersHorizontal,
   Camera,
   ChevronDown,
-  ChevronLeft,
   ChevronRight,
   CircleAlert,
   Download,
@@ -30,11 +28,8 @@ import {
   LoaderCircle,
   MessageCircle,
   MessageSquareQuote,
-  Minus,
   Play,
-  Plus,
   RefreshCw,
-  RotateCcw,
   Search,
   SquareCheck,
   Trash2,
@@ -42,14 +37,14 @@ import {
   Users,
   X,
 } from "lucide-vue-next";
+import ImageViewer from "../components/ImageViewer.vue";
 import QzoneText from "../components/QzoneText.vue";
 import EmptyState from "../components/ui/EmptyState.vue";
 import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import { useToast } from "../composables/useToast";
-import { usePreviewFocus } from "../composables/usePreviewFocus";
-import { loadRemoteImageBlob } from "../utils/archiveImage";
+import { loadRemoteImageBlob, mediaFileName } from "../utils/archiveImage";
 import { countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, listArchiveYears, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 
 const route = useRoute();
@@ -93,17 +88,8 @@ const imageErrors = reactive<Record<string, string>>({});
 const imageFallbackAttempted = reactive<Record<string, boolean>>({});
 const imagePreviewVisible = ref(false);
 // 统一走 closeImagePreview：它还要补做被灯箱跳过的 blob 回收，不能只把可见性置 false。
-usePreviewFocus(imagePreviewVisible, () => closeImagePreview());
 const previewImageUrl = ref("");
 const previewImageName = ref("qzone-image.jpg");
-const savingImage = ref(false);
-const imageScale = ref(1);
-const imageOffset = reactive({ x: 0, y: 0 });
-const imageActionVisible = ref(false);
-const imagePointers = new Map<number, { x: number; y: number }>();
-let imageDragStart: { x: number; y: number; offsetX: number; offsetY: number } | undefined;
-let pinchStart: { distance: number; scale: number } | undefined;
-let longPressTimer: ReturnType<typeof setTimeout> | undefined;
 const expandedComments = reactive(new Set<number>());
 const expandedLikes = reactive(new Set<number>());
 let imageObserver: IntersectionObserver | undefined;
@@ -323,8 +309,8 @@ function imageExtension(url: string) {
 }
 function openImagePreview(sourceUrl: string, originalUrl: string, cellId: string, index: number) {
   previewImageUrl.value = sourceUrl;
-  previewImageName.value = `qzone-${cellId.replace(/[^a-zA-Z0-9_-]/g, "_")}-${index + 1}.${imageExtension(originalUrl)}`;
-  resetImageTransform();
+  previewImageName.value = mediaFileName(records.value.find(item => item.cellId === cellId)?.publishedAt || detailItem.value?.publishedAt || 0, `${cellId}-${index + 1}`, imageExtension(originalUrl));
+
   imagePreviewVisible.value = true;
 }
 /** 灯箱的左右切换需要知道同一条说说里还有哪些已就绪的图片。 */
@@ -351,76 +337,11 @@ function stepImagePreview(step: number) {
   const entry = list[next];
   openImagePreview(entry.source, entry.original, entry.cellId, entry.index);
 }
-function handlePreviewKeydown(event: KeyboardEvent) {
-  if (!imagePreviewVisible.value) return;
-  if (event.key === "Escape") { closeImagePreview(); return; }
-  if (event.key === "ArrowRight") stepImagePreview(1);
-  if (event.key === "ArrowLeft") stepImagePreview(-1);
-}
-function resetImageTransform() { imageScale.value = 1; imageOffset.x = 0; imageOffset.y = 0; }
-function setImageScale(value: number) {
-  imageScale.value = Math.min(5, Math.max(0.5, value));
-  if (imageScale.value <= 1) { imageOffset.x = 0; imageOffset.y = 0; }
-}
-/**
- * 灯箱持有过的地址在 releaseVideos() 里被跳过回收，关灯箱时补上这一步：
- * 只释放已经不在卡片上的那些，卡片仍在用的由 releaseVideos() 统一管理，避免重复回收。
- */
 function releaseDetachedPreviewBlobs() {
-  const inUseByCards = new Set(Object.values(imageSources));
-  previewSources.value.forEach((entry) => {
-    if (entry.source.startsWith("blob:") && !inUseByCards.has(entry.source)) URL.revokeObjectURL(entry.source);
-  });
+  const used = new Set(Object.values(imageSources));
+  previewSources.value.forEach(entry => { if (entry.source.startsWith("blob:") && !used.has(entry.source)) URL.revokeObjectURL(entry.source); });
 }
-function closeImagePreview() {
-  imagePreviewVisible.value = false; imageActionVisible.value = false; resetImageTransform();
-  releaseDetachedPreviewBlobs();
-}
-function imageWheel(event: WheelEvent) { setImageScale(imageScale.value * (event.deltaY < 0 ? 1.15 : 0.87)); }
-function toggleImageZoom() { imageScale.value > 1 ? resetImageTransform() : setImageScale(2); }
-function pointerDistance() {
-  const points = [...imagePointers.values()];
-  return points.length < 2 ? 0 : Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
-}
-function clearLongPress() { if (longPressTimer) clearTimeout(longPressTimer); longPressTimer = undefined; }
-function imagePointerDown(event: PointerEvent) {
-  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-  imagePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  imageDragStart = { x: event.clientX, y: event.clientY, offsetX: imageOffset.x, offsetY: imageOffset.y };
-  if (imagePointers.size === 2) { pinchStart = { distance: pointerDistance(), scale: imageScale.value }; clearLongPress(); }
-  else if (event.pointerType !== "mouse") {
-    clearLongPress();
-    longPressTimer = setTimeout(() => { imageActionVisible.value = true; navigator.vibrate?.(25); }, 550);
-  }
-}
-function imagePointerMove(event: PointerEvent) {
-  const previous = imagePointers.get(event.pointerId);
-  if (!previous) return;
-  if (Math.hypot(event.clientX - previous.x, event.clientY - previous.y) > 7) clearLongPress();
-  imagePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  if (imagePointers.size >= 2 && pinchStart?.distance) setImageScale(pinchStart.scale * pointerDistance() / pinchStart.distance);
-  else if (imageScale.value > 1 && imageDragStart) {
-    imageOffset.x = imageDragStart.offsetX + event.clientX - imageDragStart.x;
-    imageOffset.y = imageDragStart.offsetY + event.clientY - imageDragStart.y;
-  }
-}
-function imagePointerUp(event: PointerEvent) {
-  clearLongPress(); imagePointers.delete(event.pointerId);
-  if (imagePointers.size < 2) pinchStart = undefined;
-  if (!imagePointers.size) imageDragStart = undefined;
-}
-async function savePreviewImage() {
-  if (!previewImageUrl.value || savingImage.value) return;
-  savingImage.value = true; error.value = "";
-  try {
-    const extension = previewImageName.value.split(".").pop() || "jpg";
-    const path = await save({ defaultPath: previewImageName.value, filters: [{ name: "图片", extensions: [extension, "jpg", "png", "webp"] }] });
-    if (!path) return;
-    const response = await window.fetch(previewImageUrl.value);
-    await writeFile(path, new Uint8Array(await response.arrayBuffer()));
-  } catch (reason) { error.value = `保存图片失败：${String(reason)}`; toast.error("保存图片失败，可以重新打开图片再试一次"); }
-  finally { savingImage.value = false; }
-}
+function closeImagePreview() { imagePreviewVisible.value = false; releaseDetachedPreviewBlobs(); }
 async function exportHtml(selectedOnly: boolean) {
   if (exporting.value || (selectedOnly && !selectedIds.value.length)) return;
   exporting.value = true; error.value = "";
@@ -484,7 +405,7 @@ async function confirmDelete() {
   finally { deleting.value = false; }
 }
 onMounted(() => {
-  window.addEventListener("keydown", handlePreviewKeydown);
+
   void load();
 });
 /** 本页自己重置筛选时置位：让 query 与年份的 watcher 跳过这一次，避免连发两次请求。 */
@@ -518,10 +439,10 @@ watch(
 watch(() => route.query.year, (value) => { selectedYear.value = Number(value) || 0; });
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer);
-  clearLongPress();
+
   imageObserver?.disconnect();
   sentinelObserver?.disconnect();
-  window.removeEventListener("keydown", handlePreviewKeydown);
+
   releaseVideos();
 });
 </script>
@@ -836,66 +757,7 @@ onBeforeUnmount(() => {
     </Dialog>
 
     <!-- -------------------------------------------------------------- 灯箱 -->
-    <Teleport to="body">
-      <Transition name="lb">
-        <div v-if="imagePreviewVisible" class="lb" data-qza-preview tabindex="-1" role="dialog" aria-modal="true" aria-label="查看图片" @click.self="closeImagePreview">
-          <button class="lb-close" type="button" aria-label="关闭（Esc）" @click="closeImagePreview">
-            <X :size="18" :stroke-width="1.8" />
-          </button>
-
-          <button v-if="previewSources.length > 1" class="lb-nav is-prev" type="button" aria-label="上一张（←）" @click.stop="stepImagePreview(-1)">
-            <ChevronLeft :size="20" :stroke-width="1.8" />
-          </button>
-          <button v-if="previewSources.length > 1" class="lb-nav is-next" type="button" aria-label="下一张（→）" @click.stop="stepImagePreview(1)">
-            <ChevronRight :size="20" :stroke-width="1.8" />
-          </button>
-
-          <div class="lb-stage" @wheel.prevent="imageWheel" @click.self="closeImagePreview">
-            <img
-              v-if="previewImageUrl"
-              class="lb-image"
-              :class="{ 'is-zoomed': imageScale > 1 }"
-              :src="previewImageUrl"
-              alt="备份图片大图"
-              draggable="false"
-              :style="{ transform: `translate3d(${imageOffset.x}px, ${imageOffset.y}px, 0) scale(${imageScale})` }"
-              @dblclick.prevent="toggleImageZoom"
-              @pointerdown.prevent="imagePointerDown"
-              @pointermove.prevent="imagePointerMove"
-              @pointerup="imagePointerUp"
-              @pointercancel="imagePointerUp"
-            />
-          </div>
-
-          <div class="lb-tools">
-            <button type="button" aria-label="缩小" @click="setImageScale(imageScale / 1.25)"><Minus :size="16" :stroke-width="1.8" /></button>
-            <span>{{ Math.round(imageScale * 100) }}%</span>
-            <button type="button" aria-label="放大" @click="setImageScale(imageScale * 1.25)"><Plus :size="16" :stroke-width="1.8" /></button>
-            <button type="button" aria-label="恢复原始大小" @click="resetImageTransform"><RotateCcw :size="16" :stroke-width="1.8" /></button>
-            <button type="button" aria-label="保存图片" :disabled="savingImage" @click="savePreviewImage">
-              <LoaderCircle v-if="savingImage" class="is-spinning" :size="16" :stroke-width="1.8" />
-              <Download v-else :size="16" :stroke-width="1.8" />
-            </button>
-          </div>
-
-          <p class="lb-tip">
-            <span v-if="previewSources.length > 1">第 {{ previewIndex + 1 }} / {{ previewSources.length }} 张 · 方向键切换 · </span>双击或双指缩放 · 长按保存
-          </p>
-
-          <Transition name="lb-sheet">
-            <div v-if="imageActionVisible" class="lb-sheet-mask" @click.self="imageActionVisible = false">
-              <div class="lb-sheet">
-                <button type="button" :disabled="savingImage" @click="savePreviewImage">
-                  <Download :size="16" :stroke-width="1.8" />
-                  <span>{{ savingImage ? "正在保存…" : "保存图片" }}</span>
-                </button>
-                <button type="button" @click="imageActionVisible = false">取消</button>
-              </div>
-            </div>
-          </Transition>
-        </div>
-      </Transition>
-    </Teleport>
+    <ImageViewer v-if="imagePreviewVisible" :src="previewImageUrl" :name="previewImageName" title="说说照片" :index="previewIndex" :total="previewSources.length" @close="closeImagePreview" @step="stepImagePreview" @saved="toast.success('图片已保存')" @error="toast.error($event)" />
   </div>
 </template>
 
@@ -1801,209 +1663,6 @@ onBeforeUnmount(() => {
 
 /* ------------------------------------------------------------------ 灯箱 */
 
-.lb {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  background: var(--color-overlay);
-  touch-action: none;
-}
-
-.lb-stage {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  overflow: hidden;
-}
-
-.lb-image {
-  display: block;
-  max-width: min(100vw, 1400px);
-  max-height: 100vh;
-  object-fit: contain;
-  transform-origin: center;
-  will-change: transform;
-  touch-action: none;
-  cursor: zoom-in;
-}
-
-.lb-image.is-zoomed {
-  cursor: grab;
-}
-
-.lb-image.is-zoomed:active {
-  cursor: grabbing;
-}
-
-.lb-close {
-  position: absolute;
-  z-index: 2;
-  top: var(--space-5);
-  right: var(--space-5);
-  display: grid;
-  place-items: center;
-  width: 40px;
-  height: 40px;
-  border: var(--line-width) solid var(--color-border-strong);
-  border-radius: var(--radius-full);
-  background: var(--color-surface);
-  color: var(--color-text);
-  box-shadow: var(--shadow-md);
-}
-
-.lb-nav {
-  position: absolute;
-  z-index: 2;
-  top: 50%;
-  display: grid;
-  place-items: center;
-  width: 44px;
-  height: 44px;
-  border: var(--line-width) solid var(--color-border-strong);
-  border-radius: var(--radius-full);
-  background: var(--color-surface);
-  color: var(--color-text);
-  box-shadow: var(--shadow-md);
-  transform: translateY(-50%);
-}
-
-.lb-nav.is-prev {
-  left: var(--space-5);
-}
-
-.lb-nav.is-next {
-  right: var(--space-5);
-}
-
-.lb-close:hover,
-.lb-nav:hover {
-  background: var(--color-surface-sunken);
-}
-
-.lb-tools {
-  position: absolute;
-  z-index: 2;
-  bottom: var(--space-10);
-  left: 50%;
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1);
-  border: var(--line-width) solid var(--color-border);
-  border-radius: var(--radius-full);
-  background: var(--color-surface);
-  box-shadow: var(--shadow-md);
-  transform: translateX(-50%);
-}
-
-.lb-tools button {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--color-text-secondary);
-}
-
-.lb-tools button:hover:not(:disabled) {
-  background: var(--color-surface-sunken);
-  color: var(--color-text);
-}
-
-.lb-tools button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.lb-tools span {
-  min-width: 52px;
-  color: var(--color-text-secondary);
-  font-size: var(--text-xs);
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-}
-
-.lb-tip {
-  position: absolute;
-  z-index: 2;
-  bottom: var(--space-4);
-  left: 50%;
-  padding: var(--space-1) var(--space-3);
-  border-radius: var(--radius-full);
-  background: var(--color-surface);
-  box-shadow: var(--shadow-sm);
-  transform: translateX(-50%);
-  color: var(--color-text-secondary);
-  font-size: var(--text-xs);
-  white-space: nowrap;
-}
-
-.lb-sheet-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 3;
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  background: var(--color-overlay);
-}
-
-.lb-sheet {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  width: min(420px, 100%);
-  padding: var(--space-4);
-  padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom));
-  border-top: var(--line-width) solid var(--color-border);
-  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-  background: var(--color-surface-raised);
-}
-
-.lb-sheet button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  height: 44px;
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--color-text);
-  font-size: var(--text-sm);
-}
-
-.lb-sheet button:hover:not(:disabled) {
-  background: var(--color-surface-sunken);
-}
-
-.lb-enter-active,
-.lb-leave-active {
-  transition: opacity var(--duration-base) var(--ease-out);
-}
-
-.lb-enter-from,
-.lb-leave-to {
-  opacity: 0;
-}
-
-.lb-sheet-enter-active,
-.lb-sheet-leave-active {
-  transition: opacity var(--duration-base) var(--ease-out);
-}
-
-.lb-sheet-enter-from,
-.lb-sheet-leave-to {
-  opacity: 0;
-}
-
 /* -------------------------------------------------------------- 响应式 */
 
 @media (max-width: 1080px) {
@@ -2070,20 +1729,6 @@ onBeforeUnmount(() => {
 
   .ar-pictures.is-2 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .lb-nav.is-prev {
-    left: var(--space-2);
-  }
-
-  .lb-nav.is-next {
-    right: var(--space-2);
-  }
-
-  .lb-tip {
-    white-space: normal;
-    width: min(100%, 320px);
-    text-align: center;
   }
 }
 

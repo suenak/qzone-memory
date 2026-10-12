@@ -87,7 +87,7 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -106,14 +106,18 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
       - uses: ./.github/actions/qza-config
       - run: npm ci
-      - run: npx tauri android build --target aarch64 armv7 i686 x86_64 --apk
+      - run: npx tauri android build --target aarch64 armv7 --apk
       - name: Verify Android ABI coverage
         run: |
           set -euo pipefail
           apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
-          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+          for abi in arm64-v8a armeabi-v7a; do
             unzip -p "$apk" "lib/$abi/libqzonearchive_lib.so" > /dev/null
           done
+          if unzip -Z1 "$apk" | grep -E '^lib/(x86|x86_64)/' > /dev/null; then
+            echo "::error::Release APK must contain ARM and ARM64 only."
+            exit 1
+          fi
       - uses: ./.github/actions/qza-verify
       - name: Restore Android keystore
         env:

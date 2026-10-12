@@ -147,6 +147,7 @@
   --duration-slow: 300ms;
 
   --z-modal: 80;
+  --z-preview: 11000; /* Above native-style PrimeVue modal overlays. */
   --z-toast: 100;
 
   /* ---------------------------------------------------------- 密度 *

@@ -25,13 +25,13 @@
 - **结构化互动**：还原点赞用户、评论、回复人与被回复人，补全可取得的昵称，并提供联系人排行和评论往来视图
 - **深度扫描与续传**：顺序探测历史记录，在最后命中后继续验证空尾；被限流或中断时保留断点和已经写入的数据
 - **资料独立归档**：相册、相册照片、独立视频、留言板与 QQ 空间网页端旧收藏分别分页同步，不与说说混在一起
-- **媒体整理**：按年份浏览说说照片和视频，保留多个可用清晰度候选，过滤头像、点赞图标和空间装饰资源
-- **本地优先**：SQLite 数据库、媒体缓存和导出文件都保存在用户设备；登录会话只进入操作系统安全凭据库
+- **媒体整理**：按年份浏览说说照片和视频，优先尝试原图，按记录时间命名并按内容去重；相册视频可在客户端播放，地址过期时尝试刷新
+- **本地优先**：每个 QQ 账号使用独立数据库和媒体目录，可离线切换查看已保存的账号；旧数据自动迁移并保留原库，登录会话只进入操作系统安全凭据库
 - **检索与导出**：支持全文搜索、年份筛选、时间排序、批量管理与离线 HTML 导出（附带本机已保存的图片和完整视频；未保存的媒体会明确标注）
 - **现代桌面界面**：浅色 / 深色 / 跟随系统三态主题，统一设计令牌，时间轴式说说浏览，全屏图片灯箱，长列表增量加载
 - **跨平台发行**：提供 Windows、macOS（Intel / Apple 芯片）、Android 与 iOS 未签名包
 
-完整版本历史请查看 [CHANGELOG.md](CHANGELOG.md)。
+完整版本历史请查看 [CHANGELOG.md](CHANGELOG.md)。媒体功能和账号数据迁移说明见 [媒体与账号数据](docs/MEDIA-AND-ACCOUNT-STORAGE.md)。
 
 ## 界面设计
 
@@ -51,12 +51,12 @@
 
 - Windows：NSIS 安装程序（`.exe`）
 - macOS：Intel `x64` 或 Apple 芯片 `aarch64` 安装镜像（`.dmg`）
-- Android：Android 8.0 及以上，通用 `apk`（ARM / ARM64 / x86 / x86_64）。系统 WebView 需为 111 或以上；过旧时客户端会提示更新网页组件。
+- Android：Android 8.0 及以上，通用 `apk`（ARM / ARM64；不包含 Intel 架构）。系统 WebView 需为 111 或以上；过旧时客户端会提示更新网页组件。
 - iOS：未签名 `ipa`，需要自行签名后安装
 
 macOS 包采用临时签名且未做公证，首次打开若被 Gatekeeper 拦截，请在「系统设置 → 隐私与安全性」中确认打开。iOS 包未签名，不能直接安装，也不能提交 App Store。
 
-当前版本 **1.2.4**，更新 Windows 优先的客户端界面，并补齐 Android 8.0 及以上的四种架构支持。安装目录名为 `qzone-memory`；本地数据仍按应用标识符存放（Windows：`%APPDATA%\top.ehre.qzonearchive`），升级前建议另存重要资料。
+当前版本 **1.2.5**，补齐媒体与账号数据（原图优先、内容去重、账号独立数据目录、旧库自动迁移），正式 APK 起只保留 ARM / ARM64（Intel 模拟器使用开发期 Debug 包）。安装目录名为 `qzone-memory`；本地数据仍按应用标识符存放（Windows：`%APPDATA%\top.ehre.qzonearchive`），升级前建议另存重要资料。
 
 ## 首次使用
 
@@ -118,7 +118,7 @@ npm run tauri:build:windows:all
 npx tauri build --bundles dmg
 
 # Android APK
-npm run tauri android build
+npx tauri android build --target aarch64 armv7 --apk
 
 # iOS 未签名 ipa（需在 macOS 上执行，依赖 Xcode 与 CocoaPods）
 npx tauri ios init --ci

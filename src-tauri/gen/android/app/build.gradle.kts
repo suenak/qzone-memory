@@ -19,7 +19,7 @@ android {
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "top.ehre.qzonearchive"
-        // 支持 Android 8.0 及以上；发行 APK 包含 ARM / ARM64 / x86 / x86_64。
+        // 支持 Android 8.0 及以上；发行 APK 仅包含 ARM / ARM64；x86 模拟器使用 Debug 包。
         minSdk = 26
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -38,6 +38,11 @@ android {
             }
         }
         getByName("release") {
+            ndk { abiFilters += setOf("arm64-v8a", "armeabi-v7a") }
+            packaging {
+                // Exclude stale JNI files left by debug/emulator builds as well.
+                jniLibs.excludes += setOf("**/x86/**", "**/x86_64/**")
+            }
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
@@ -51,6 +56,15 @@ android {
     }
     buildFeatures {
         buildConfig = true
+    }
+}
+
+// Intel targets remain available for emulator development, never for release.
+androidComponents {
+    beforeVariants(selector().withBuildType("release")) { variant ->
+        if (variant.productFlavors.any { (dimension, flavor) -> dimension == "abi" && flavor in setOf("x86", "x86_64") }) {
+            variant.enable = false
+        }
     }
 }
 

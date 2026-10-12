@@ -21,6 +21,7 @@ import {
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
+import Select from "primevue/select";
 import SectionCard from "../components/ui/SectionCard.vue";
 import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import { useToast } from "../composables/useToast";
@@ -29,14 +30,12 @@ import { useAuthStore } from "../stores/auth";
 import { useLicenseStore, type LicenseSeat } from "../stores/license";
 import { useArchiveStore } from "../stores/archive";
 import {
-  DEFAULT_ARCHIVE_INTERVAL,
   MIN_ARCHIVE_INTERVAL,
   MAX_ARCHIVE_INTERVAL,
   getArchiveInterval,
-  resetAppSettings,
   setArchiveInterval,
 } from "../utils/appSettings";
-import { clearArchivedFeeds, deleteAllAppData } from "../utils/qzone";
+import { listLocalAccounts, selectLocalAccount, clearArchivedFeeds, deleteAllAppData } from "../utils/qzone";
 import { useUpdateStore } from "../stores/update";
 
 const appStore = useAppStore();
@@ -139,6 +138,20 @@ async function clearArchiveContent() {
   }
 }
 
+const localAccounts = ref<{uin: string; selected: boolean}[]>([]);
+const localAccount = ref("");
+const switchingLocal = ref(false);
+onMounted(async () => {
+  try { localAccounts.value = await listLocalAccounts(); localAccount.value = localAccounts.value.find(a => a.selected)?.uin || ""; } catch { /* Retry after opening settings again. */ }
+});
+async function switchLocalAccount() {
+  if (!localAccount.value || switchingLocal.value) return;
+  switchingLocal.value = true;
+  try { await selectLocalAccount(localAccount.value); localAccounts.value.forEach(a => a.selected = a.uin === localAccount.value); toast.success("已切换本地账号"); }
+  catch (reason) { toast.error(describeError(reason,"账号没有切换成功，请重试。")); localAccount.value = localAccounts.value.find(a => a.selected)?.uin || ""; }
+  finally { switchingLocal.value = false; }
+}
+
 async function deleteEverything() {
   if (deleting.value || archiveStore.busy) return;
   deleting.value = true;
@@ -152,14 +165,13 @@ async function deleteEverything() {
     deleting.value = false;
     return;
   }
-  /* 主体已经删净（后端已清理数据库、缓存、会话与本地授权），后续三步都只是收尾：
+  /* 主体已经删净（后端已清理当前账号数据库、媒体文件与 QQ 会话），后续三步都只是收尾：
    * 它们各自兜错并降级为提示，否则会把「其实删成功」报成失败，用户再点一次就会
    * 在空库上重复执行删除路径。 */
   deleteVisible.value = false;
-  toast.success("本地数据已全部删除");
+  toast.success("当前账号数据已删除");
   deleting.value = false;
-  try { resetAppSettings(); intervalMs.value = DEFAULT_ARCHIVE_INTERVAL; intervalInputSeconds.value = DEFAULT_ARCHIVE_INTERVAL / 1000; }
-  catch (reason) { console.warn("重置本地设置失败", reason); }
+
   try { await authStore.logout(); }
   catch (reason) { toast.error(describeError(reason, "数据已删除，但退出 QQ 登录未完成，请手动退出。")); }
   try { await licenseStore.refresh(); }
@@ -364,15 +376,19 @@ async function refreshSeats() {
         <Button label="清空说说" severity="secondary" outlined size="small" :disabled="!loggedIn || archiveStore.busy" @click="error = ''; clearVisible = true" />
       </div>
 
+      <div v-if="localAccounts.length > 1" class="setting-row">
+        <div class="setting-row__label"><div><strong>查看本机其他账号</strong><small>{{ loggedIn ? '退出 QQ 登录后，可切换已保存的账号。' : '切换后可离线查看、搜索和导出这个账号的记录。' }}</small></div></div>
+        <Select v-model="localAccount" :options="localAccounts.map(a => ({label: `QQ ${a.uin}`, value: a.uin}))" option-label="label" option-value="value" :disabled="loggedIn || switchingLocal || archiveStore.busy" aria-label="本地账号" @change="switchLocalAccount" />
+      </div>
       <div class="setting-row is-danger">
         <div class="setting-row__label">
           <span class="setting-row__icon is-danger"><Trash2 :size="17" :stroke-width="1.8" /></span>
           <div>
-            <strong>删除所有数据</strong>
-            <small>清空全部账号的备份、续传记录、媒体缓存与本地登录状态，并退出软件授权。</small>
+            <strong>删除当前账号数据</strong>
+            <small>删除当前账号的备份、续传记录、媒体文件和 QQ 登录状态。保留其他账号与软件授权。</small>
           </div>
         </div>
-        <Button label="删除所有数据" severity="danger" outlined size="small" :disabled="archiveStore.busy" @click="error = ''; deleteVisible = true" />
+        <Button label="删除当前账号数据" severity="danger" outlined size="small" :disabled="archiveStore.busy" @click="error = ''; deleteVisible = true" />
       </div>
 
       <p v-if="error" class="settings-error" role="alert">{{ describeError(error) }}</p>
@@ -444,11 +460,11 @@ async function refreshSeats() {
         <h4>2. 网络请求</h4>
         <p>登录、备份和下载媒体会连接腾讯相关服务；激活与授权更新会连接授权服务，发送授权账号和设备信息。</p>
         <h4>3. 登录凭证</h4>
-        <p>扫码登录产生的 Cookie 仅保存在操作系统凭据库，用于访问当前账号有权查看的 QQ 空间内容。退出登录或删除所有数据后，本地会话会被清除。</p>
+        <p>扫码登录产生的 Cookie 仅保存在操作系统凭据库，用于访问当前账号有权查看的 QQ 空间内容。退出登录或删除当前账号数据后，本地会话会被清除。</p>
         <h4>4. 导出与分享</h4>
         <p>导出的 HTML 和保存的图片由你自行保管。文件可能包含昵称、QQ 号、头像和空间内容，请谨慎分享。</p>
         <h4>5. 数据删除</h4>
-        <p>你可以随时使用「删除所有数据」清理全部本地备份、任务续传位置、视频缓存与登录状态，此操作无法撤销。</p>
+        <p>你可以随时使用「删除当前账号数据」清理当前账号的本地备份、任务续传位置、视频缓存与登录状态，此操作无法撤销。</p>
       </div>
       <template #footer>
         <Button label="我已了解" @click="privacyVisible = false" />
@@ -470,18 +486,18 @@ async function refreshSeats() {
       </template>
     </Dialog>
 
-    <Dialog v-model:visible="deleteVisible" modal :draggable="false" :closable="!deleting" :close-on-escape="!deleting" header="删除所有数据？" class="settings-dialog">
+    <Dialog v-model:visible="deleteVisible" modal :draggable="false" :closable="!deleting" :close-on-escape="!deleting" header="删除当前账号数据？" class="settings-dialog">
       <div class="confirm">
         <span class="confirm__icon is-danger"><Trash2 :size="20" :stroke-width="1.8" /></span>
         <div>
-          <p>所有账号的本地备份和媒体缓存都将被永久删除。</p>
-          <small>包括动态、留言、评论、点赞、续传记录、视频缓存、登录状态与软件授权。此操作无法撤销。</small>
+          <p>当前账号的本地记录和已保存媒体将被删除，其他账号的数据会保留。</p>
+          <small>包括动态、留言、评论、点赞、续传记录、媒体文件和 QQ 登录状态。旧版迁移备份与另存的导出文件需自行删除。</small>
         </div>
       </div>
       <p v-if="error" role="alert" class="settings-error">{{ describeError(error, '删除失败，请重试。') }}</p>
       <template #footer>
         <Button label="取消" severity="secondary" text :disabled="deleting" @click="deleteVisible = false" />
-        <Button label="确认全部删除" severity="danger" :loading="deleting" @click="deleteEverything" ><template #icon><Trash2 :size="16" :stroke-width="1.8" /></template></Button>
+        <Button label="确认删除" severity="danger" :loading="deleting" @click="deleteEverything" ><template #icon><Trash2 :size="16" :stroke-width="1.8" /></template></Button>
       </template>
     </Dialog>
 

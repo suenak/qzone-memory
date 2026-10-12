@@ -206,6 +206,13 @@ pub(crate) struct QzoneAuth {
 }
 
 impl QLoginState {
+    pub(crate) fn current_uin(&self) -> Result<Option<String>, String> {
+        self.session
+            .try_lock()
+            .map(|s| s.as_ref().and_then(|v| v.uin.clone()))
+            .map_err(|_| "登录状态正在切换，请稍后重试".into())
+    }
+
     pub fn new() -> Self {
         let client = Client::builder()
             .redirect(Policy::none())

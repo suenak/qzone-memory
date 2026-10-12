@@ -201,7 +201,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -246,16 +246,20 @@ jobs:
       - uses: ./.github/actions/qza-config
 
       - name: Build Android
-        run: npx tauri android build --target aarch64 armv7 i686 x86_64 --apk
+        run: npx tauri android build --target aarch64 armv7 --apk
 
       - name: Verify Android ABI coverage
         shell: bash
         run: |
           set -euo pipefail
           APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
-          for ABI in arm64-v8a armeabi-v7a x86 x86_64; do
+          for ABI in arm64-v8a armeabi-v7a; do
             unzip -p "$APK" "lib/$ABI/libqzonearchive_lib.so" > /dev/null
           done
+          if unzip -Z1 "$APK" | grep -E '^lib/(x86|x86_64)/' > /dev/null; then
+            echo "::error::Release APK must contain ARM and ARM64 only."
+            exit 1
+          fi
 
       - uses: ./.github/actions/qza-verify
 
@@ -711,7 +715,7 @@ jobs:
             - Windows：下载 `.exe` 安装程序
             - macOS Apple 芯片：下载文件名含 `aarch64` 的 `.dmg`
             - macOS Intel：下载文件名含 `x64` 的 `.dmg`
-            - Android：Android 8.0 及以上，下载包含 ARM / ARM64 / x86 / x86_64 的通用 `.apk`。系统 WebView 需要 111 或以上，过旧时会提示更新网页组件。
+            - Android：Android 8.0 及以上，下载包含 ARM / ARM64 的通用 `.apk`。系统 WebView 需要 111 或以上，过旧时会提示更新网页组件。
             - iOS：提供未签名 `.ipa`，需使用 AltStore、SideStore、Sideloadly、TrollStore 等工具自行签名安装，不能直接安装或提交 App Store
 
             ### 重要说明

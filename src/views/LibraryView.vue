@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import ImageViewer from "../components/ImageViewer.vue";
+import Dialog from "primevue/dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { describeError, diagnosticError } from "../utils/uiError";
-import { save } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
 import { useAuthStore } from "../stores/auth";
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
@@ -10,9 +11,7 @@ import Paginator, { type PageState } from "primevue/paginator";
 import Select from "primevue/select";
 import {
   ArrowLeft,
-  Download,
   Bookmark,
-  ChevronLeft,
   ChevronRight,
   CircleAlert,
   CircleCheck,
@@ -24,15 +23,15 @@ import {
   Mail,
   RefreshCw,
   Search,
-  X,
 } from "lucide-vue-next";
 import EmptyState from "../components/ui/EmptyState.vue";
 import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import { useToast } from "../composables/useToast";
-import { usePreviewFocus } from "../composables/usePreviewFocus";
-import { loadRemoteImageBlob } from "../utils/archiveImage";
+import { loadRemoteImageBlob, mediaFileName } from "../utils/archiveImage";
 import {
+  loadLibraryMedia,
+  linkLibraryVideo,
   listQzoneLibrary,
   listQzoneLibraryYears,
   syncQzoneLibrary,
@@ -65,13 +64,11 @@ let loadSequence = 0;
 
 const toast = useToast();
 const authStore = useAuthStore();
-const savingPreview = ref(false);
 const expandedEntries = reactive(new Set<number>());
 /** 正在取封面的条目，用来区分「还没取到」和「取不到」。 */
 const coverLoading = reactive(new Set<number>());
 /** 灯箱当前位置，-1 表示未打开。 */
 const lightboxIndex = ref(-1);
-usePreviewFocus(computed(() => lightboxIndex.value >= 0), closeLightbox);
 
 const module = computed(() => String(route.meta.module || "albums") as LibraryModule);
 const parentKey = computed(() => typeof route.params.albumId === "string" ? route.params.albumId : undefined);
@@ -95,7 +92,7 @@ const moduleInfo = computed(() => ({
     title: albumTitle.value,
     kicker: "相册照片",
     icon: ImageIcon,
-    description: "保存照片记录和媒体地址；预览图片时需要联网。",
+    description: "打开照片时会优先保存原图，已保存的照片可离线查看。",
     action: "备份此相册",
     emptyTitle: "这个相册还没有照片",
     emptyHint: "点击「备份此相册」，读取当前可访问的照片。",
@@ -104,10 +101,10 @@ const moduleInfo = computed(() => ({
     title: "视频",
     kicker: "QQ 空间视频",
     icon: Film,
-    description: "保存 QQ 空间的视频列表，点击视频可打开播放地址。",
+    description: "保存视频列表，点击视频可在应用内播放。",
     action: "备份视频",
     emptyTitle: "还没有备份视频",
-    emptyHint: "点击「备份视频」读取视频列表。播放地址失效时，可重新备份。",
+    emptyHint: "点击「备份视频」读取视频列表。播放地址过期时会尝试刷新。",
   },
   guestbook: {
     title: "留言板",
@@ -204,6 +201,9 @@ const previewEntries = computed<PreviewEntry[]>(() => {
 const lightboxEntry = computed(() => (lightboxIndex.value >= 0 ? previewEntries.value[lightboxIndex.value] : undefined));
 
 function releaseImages() {
+  mediaSequence += 1;
+  Object.keys(originalSources).forEach(key => delete originalSources[Number(key)]);
+  Object.keys(originalErrors).forEach(key => delete originalErrors[Number(key)]);
   Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
   Object.keys(imageSources).forEach((key) => delete imageSources[Number(key)]);
 }
@@ -263,19 +263,79 @@ function openItem(item: LibraryItem) {
     void router.push({ name: "album-photos", params: { albumId: item.itemKey }, query: { title: item.title } });
   }
 }
-async function openMedia(item: LibraryItem) {
-  const url = item.mediaUrls.find((value) => /\.(?:mp4|m3u8)(?:[?#]|$)/i.test(value)) || item.mediaUrls[0] || item.coverUrl;
-  if (!url) return;
-  // 库内记录可能被污染，交给系统 Opener 之前必须校验 scheme。
-  // 只放行 http/https：旧备份里的 QQ 媒体链接可能是 HTTP，一律拦掉会让这些记录打不开；
-  // 真正要挡的是 file:、自定义协议这类会被系统直接拉起的危险 scheme。
+const mediaOpening = reactive(new Set<number>());
+const originalSources = reactive<Record<number,string>>({});
+const originalErrors = reactive<Record<number,string>>({});
+const videoVisible = ref(false), videoSource = ref(""), videoTitle = ref(""), videoError = ref("");
+const activeVideoItem = ref<LibraryItem>();
+const videoChoicesVisible = ref(false), videoChoiceQuery = ref("");
+const choicesLoading = ref(false);
+const choiceOffset = ref(0), choicesTotal = ref(0);
+const videoChoices = ref<LibraryItem[]>([]);
+const linkingVideo = ref(false);
+let choiceSequence = 0;
+async function loadVideoChoices() {
+  const sequence = ++choiceSequence;
+  choicesLoading.value = true;
+  try { const result = await listQzoneLibrary("videos",undefined,videoChoiceQuery.value.trim() || undefined,undefined,50,choiceOffset.value); if (sequence === choiceSequence) { videoChoices.value = result.items; choicesTotal.value = result.total; } }
+  catch (reason) { toast.error(describeError(reason,"视频列表读取失败，请重试。")); }
+  finally { if (sequence === choiceSequence) choicesLoading.value = false; }
+}
+async function chooseVideo() { videoChoicesVisible.value = true; videoChoiceQuery.value = ""; choiceOffset.value = 0; await loadVideoChoices(); }
+async function confirmVideoChoice(video: LibraryItem) {
+  const photo = activeVideoItem.value;
+  if (!photo || linkingVideo.value) return;
+  linkingVideo.value = true;
+  try { await linkLibraryVideo(photo.id,video.id); videoChoicesVisible.value = false; await openMedia(photo); }
+  catch (reason) { toast.error(describeError(reason,"视频没有关联成功，请重试。")); }
+  finally { linkingVideo.value = false; }
+}
+function showVideoCover() { const item = activeVideoItem.value; videoVisible.value = false; if (item) openLightbox(item); }
+let lastVideoRefresh = 0;
+let mediaSequence = 0;
+async function originalImage(item: LibraryItem) {
+  if (originalSources[item.id] || mediaOpening.has(item.id)) return;
+  mediaOpening.add(item.id); originalErrors[item.id] = "";
+  const sequence = mediaSequence;
   try {
-    const protocol = new URL(url).protocol;
-    if (protocol !== "https:" && protocol !== "http:") { toast.error("媒体地址协议不受支持，已阻止打开。"); return; }
-  } catch { toast.error("媒体地址无法识别，已阻止打开。"); return; }
-  const { openUrl } = await import("@tauri-apps/plugin-opener");
-  try { await openUrl(url); }
-  catch (reason) { toast.error(describeError(reason, "无法打开媒体地址，请重新备份后再试。")); }
+    const result = await loadLibraryMedia(item.id);
+    if (sequence !== mediaSequence) return;
+    originalSources[item.id] = convertFileSrc(result.path);
+  } catch (reason) { if (sequence === mediaSequence) originalErrors[item.id] = describeError(reason,"原图暂时取不到，请重试。"); }
+  finally { mediaOpening.delete(item.id); }
+}
+async function openMedia(item: LibraryItem) {
+  if (!item.isVideo) { openLightbox(item); return; }
+  if (mediaOpening.has(item.id)) return;
+  const sequence = ++mediaSequence;
+  activeVideoItem.value = item;
+  mediaOpening.add(item.id);
+  closeLightbox();
+  videoVisible.value = true; videoSource.value = ""; videoTitle.value = item.title; videoError.value = "";
+  try {
+    let result;
+    try { result = await loadLibraryMedia(item.id); }
+    catch (reason) {
+      // Refresh only expired/missing video URLs, never network failures or licence errors.
+      if (!/HTTP 403|未找到.*播放地址/.test(String(reason)) || Date.now() - lastVideoRefresh < 60_000) throw reason;
+      lastVideoRefresh = Date.now();
+      videoError.value = "正在刷新视频播放地址…";
+      const refreshed = await syncQzoneLibrary("videos");
+      if (!refreshed.complete) throw new Error("视频列表未读取完整，请稍后重新备份视频。");
+      if (sequence !== mediaSequence) return;
+      result = await loadLibraryMedia(item.id);
+    }
+    if (sequence !== mediaSequence) return;
+    closeLightbox();
+    videoSource.value = convertFileSrc(result.path); videoError.value = "";
+  } catch (reason) { if (sequence === mediaSequence) videoError.value = describeError(reason,"视频暂时无法播放，请重试；封面仍可查看。"); }
+  finally { mediaOpening.delete(item.id); }
+}
+function retryOriginal() {
+  const item = lightboxEntry.value?.item;
+  if (!item) return;
+  delete originalSources[item.id];
+  if (item.isVideo) void reloadCover(item); else void originalImage(item);
 }
 function clearFilters() { query.value = ""; selectedYear.value = 0; first.value = 0; }
 function changePage(event: PageState) { first.value = event.first; pageSize.value = event.rows; void load(); }
@@ -311,7 +371,7 @@ function tileFootnote(item: LibraryItem) {
 /** 卡片主点击：相册进相册，视频开媒体，其余进灯箱看大图。 */
 function activateItem(item: LibraryItem) {
   if (module.value === "albums") return openItem(item);
-  if (module.value === "videos") return void openMedia(item);
+  if (item.isVideo) return void openMedia(item);
   openLightbox(item);
 }
 
@@ -319,6 +379,7 @@ function openLightbox(item: LibraryItem) {
   const index = previewEntries.value.findIndex((entry) => entry.id === item.id);
   if (index < 0) return;
   lightboxIndex.value = index;
+  if (!item.isVideo && ["photos","videos"].includes(item.module)) void originalImage(item);
 }
 function closeLightbox() { lightboxIndex.value = -1; }
 function handleCoverError(item: LibraryItem) {
@@ -326,35 +387,15 @@ function handleCoverError(item: LibraryItem) {
   if (source?.startsWith("blob:")) URL.revokeObjectURL(source);
   delete imageSources[item.id];
 }
-async function saveCurrentPreview() {
-  const current = lightboxEntry.value;
-  if (!current || !imageSources[current.id] || savingPreview.value) return;
-  savingPreview.value = true;
-  try {
-    const response = await window.fetch(imageSources[current.id]);
-    if (!response.ok) throw new Error("图片读取失败");
-    const blob = await response.blob();
-    const extension = ({ "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/avif": "avif" } as Record<string, string>)[blob.type] || "jpg";
-    const name = (current.title || "空间照片").replace(/[<>:"/\\|?*]/g, "_").slice(0, 80);
-    const path = await save({ defaultPath: `${name}.${extension}`, filters: [{ name: "图片", extensions: [extension] }] });
-    if (!path) return;
-    await writeFile(path, new Uint8Array(await blob.arrayBuffer()));
-    toast.success("已保存当前预览图");
-  } catch { toast.error("图片没有保存成功，请重新加载后再试。"); }
-  finally { savingPreview.value = false; }
-}
 function stepLightbox(delta: number) {
   const count = previewEntries.value.length;
   if (count < 2) return;
   lightboxIndex.value = (lightboxIndex.value + delta + count) % count;
-}
-function handleLightboxKey(event: KeyboardEvent) {
-  if (lightboxIndex.value < 0) return;
-  if (event.key === "Escape") { event.preventDefault(); closeLightbox(); }
-  else if (event.key === "ArrowLeft") { event.preventDefault(); stepLightbox(-1); }
-  else if (event.key === "ArrowRight") { event.preventDefault(); stepLightbox(1); }
+  const item = lightboxEntry.value?.item;
+  if (item && !item.isVideo && item.module === "photos") void originalImage(item);
 }
 
+watch(() => authStore.user?.uin, () => { closeLightbox(); videoVisible.value = false; releaseImages(); void load(); });
 onMounted(load);
 watch(() => [route.name, route.params.albumId], () => { first.value = 0; selectedYear.value = 0; query.value = ""; void load(); });
 watch(selectedYear, () => { first.value = 0; void load(); });
@@ -364,11 +405,11 @@ watch(query, () => {
 });
 // 列表被整体替换后，旧索引可能指向别的照片，直接关掉灯箱更安全。
 watch(items, () => { lightboxIndex.value = -1; });
-onMounted(() => window.addEventListener("keydown", handleLightboxKey));
+
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer);
   releaseImages();
-  window.removeEventListener("keydown", handleLightboxKey);
+
 });
 </script>
 
@@ -557,7 +598,7 @@ onBeforeUnmount(() => {
             class="tile__hit"
             type="button"
             :disabled="module !== 'albums' && module !== 'videos' && !item.coverUrl"
-            :aria-label="module === 'albums' ? `打开相册：${item.title}` : module === 'videos' ? `打开视频：${item.title}` : `预览：${item.title}`"
+            :aria-label="module === 'albums' ? `打开相册：${item.title}` : item.isVideo ? `播放视频：${item.title}` : `预览：${item.title}`"
             @click="activateItem(item)"
           />
         </div>
@@ -584,7 +625,7 @@ onBeforeUnmount(() => {
             </button>
             <button v-else-if="item.mediaUrls.length" class="link" type="button" @click="openMedia(item)">
               <ExternalLink :size="14" :stroke-width="1.8" />
-              <span>{{ module === 'videos' ? '打开视频' : '打开媒体地址' }}</span>
+              <span>{{ item.isVideo ? '播放视频' : '查看原图' }}</span>
             </button>
             <button v-else-if="item.coverUrl" class="link" type="button" @click="openLightbox(item)">
               <span>查看大图</span>
@@ -625,89 +666,33 @@ onBeforeUnmount(() => {
   </div>
 
   <!-- --------------------------------------------------------------- 灯箱 -->
-  <Teleport to="body">
-    <Transition name="lightbox">
-      <div
-        v-if="lightboxEntry"
-        class="lightbox"
-        data-qza-preview
-        tabindex="-1"
-        role="dialog"
-        aria-modal="true"
-        aria-label="图片预览"
-        @click.self="closeLightbox"
-      >
-        <header class="lightbox__bar">
-          <div class="lightbox__caption">
-            <strong>{{ lightboxEntry.title }}</strong>
-            <span>{{ lightboxEntry.meta }}</span>
-          </div>
-          <span class="lightbox__counter">{{ lightboxIndex + 1 }} / {{ previewEntries.length }}</span>
-          <button class="lightbox__icon" type="button" aria-label="关闭预览（Esc）" @click="closeLightbox">
-            <X :size="18" :stroke-width="1.8" />
-          </button>
-        </header>
-
-        <div class="lightbox__stage">
-          <button
-            class="lightbox__nav"
-            type="button"
-            aria-label="上一张"
-            :disabled="previewEntries.length < 2"
-            @click="stepLightbox(-1)"
-          >
-            <ChevronLeft :size="20" :stroke-width="1.8" />
-          </button>
-
-          <figure class="lightbox__figure">
-            <img
-              v-if="imageSources[lightboxEntry.id]"
-              :src="imageSources[lightboxEntry.id]"
-              :alt="lightboxEntry.title"
-              loading="lazy"
-              decoding="async"
-              referrerpolicy="no-referrer"
-            />
-            <div v-else class="lightbox__fallback">
-              <ImageIcon :size="24" :stroke-width="1.8" />
-              <p>{{ coverLoading.has(lightboxEntry.id) ? "正在加载这一张…" : "这一张暂时取不到" }}</p>
-              <button
-                v-if="!coverLoading.has(lightboxEntry.id)"
-                class="btn btn--ghost"
-                type="button"
-                @click="reloadCover(lightboxEntry.item)"
-              >
-                <RefreshCw :size="15" :stroke-width="1.8" />
-                <span>重新加载</span>
-              </button>
-            </div>
-          </figure>
-
-          <button
-            class="lightbox__nav"
-            type="button"
-            aria-label="下一张"
-            :disabled="previewEntries.length < 2"
-            @click="stepLightbox(1)"
-          >
-            <ChevronRight :size="20" :stroke-width="1.8" />
-          </button>
-        </div>
-
-        <footer class="lightbox__foot">
-          <button class="btn btn--ghost" type="button" :disabled="savingPreview || !imageSources[lightboxEntry.id]" @click="saveCurrentPreview"><Download :size="16" :stroke-width="1.8" />{{ savingPreview ? '正在保存…' : '保存当前预览图' }}</button>
-          <p class="lightbox__summary selectable">{{ lightboxEntry.summary || "这条内容没有更多说明" }}</p>
-          <button v-if="lightboxEntry.item.mediaUrls.length" class="btn btn--ghost" type="button" @click="openMedia(lightboxEntry.item)">
-            <ExternalLink :size="15" :stroke-width="1.8" />
-            <span>打开媒体</span>
-          </button>
-        </footer>
-      </div>
-    </Transition>
-  </Teleport>
+  <ImageViewer v-if="lightboxEntry" :src="originalSources[lightboxEntry.id] || (!mediaOpening.has(lightboxEntry.id) ? imageSources[lightboxEntry.id] : undefined)" :name="mediaFileName(lightboxEntry.item.createdAt, lightboxEntry.title)" :title="lightboxEntry.title" :index="lightboxIndex" :total="previewEntries.length" :loading="mediaOpening.has(lightboxEntry.id)" :error="originalErrors[lightboxEntry.id]" @close="closeLightbox" @step="stepLightbox" @retry="retryOriginal" @saved="toast.success('图片已保存')" @error="toast.error($event)">
+    <p v-if="originalErrors[lightboxEntry.id]" role="status">{{ originalErrors[lightboxEntry.id] }} · 当前显示预览图</p>
+    <button v-if="lightboxEntry.item.isVideo" type="button" class="btn btn--ghost" @click="openMedia(lightboxEntry.item)">播放视频</button>
+  </ImageViewer>
+  <Dialog v-model:visible="videoVisible" modal :draggable="false" :header="videoTitle || '播放视频'" class="library-video-dialog">
+    <video v-if="videoSource" :src="videoSource" controls autoplay playsinline preload="metadata" @error="videoError = '当前设备无法播放这个视频格式，已保存的文件会保留。'" />
+    <p v-else-if="!videoError" role="status">正在读取视频…</p>
+    <button v-if="videoSource && activeVideoItem?.module === 'photos'" type="button" class="btn btn--ghost" @click="videoVisible = false; chooseVideo()">更换对应视频</button>
+    <p v-if="videoError" role="status">{{ videoError }}</p>
+    <div v-if="videoError && !mediaOpening.has(activeVideoItem?.id || 0)" class="video-recovery"><button type="button" class="btn btn--ghost" @click="showVideoCover">查看封面</button><button v-if="activeVideoItem?.module === 'photos'" type="button" class="btn btn--ghost" @click="videoVisible = false; chooseVideo()">选择对应视频</button><button v-if="activeVideoItem" type="button" class="btn btn--ghost" @click="openMedia(activeVideoItem)">重试播放</button></div>
+  </Dialog>
+  <Dialog v-model:visible="videoChoicesVisible" modal :draggable="false" header="选择对应视频" class="library-video-dialog">
+    <p>这条相册记录没有保留明确的视频标识。请从本账号已保存的视频中选择对应内容。</p>
+    <InputText v-model="videoChoiceQuery" placeholder="输入视频标题搜索" aria-label="搜索对应视频" @input="choiceOffset = 0; loadVideoChoices()" />
+    <div class="video-choices"><button v-for="video in videoChoices" :key="video.id" type="button" class="btn btn--ghost" :disabled="linkingVideo" @click="confirmVideoChoice(video)">{{ video.title }} · {{ formatTime(video.createdAt) }}</button></div>
+    <Paginator v-if="choicesTotal > 50" :first="choiceOffset" :rows="50" :total-records="choicesTotal" template="PrevPageLink CurrentPageReport NextPageLink" @page="choiceOffset = $event.first; loadVideoChoices()" />
+    <p v-if="choicesLoading" role="status">正在读取视频列表…</p>
+    <p v-else-if="!videoChoices.length">没有找到视频，可先到「视频」页面备份列表，或换个关键词。</p>
+  </Dialog>
 </template>
 
 <style scoped>
+.video-recovery {display:flex; flex-wrap:wrap; gap:var(--space-2);}
+.video-choices {display:grid; gap:var(--space-2); margin-top:var(--space-3);}
+.library-video-dialog video {display:block; width:100%; max-height:70dvh;}
+:global(.library-video-dialog) {width:min(900px, calc(100vw - var(--space-6)));}
+
 .library {
   display: flex;
   flex-direction: column;
@@ -1266,166 +1251,6 @@ onBeforeUnmount(() => {
 
 /* ------------------------------------------------------------------ 灯箱 */
 
-.lightbox {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-modal);
-  display: flex;
-  flex-direction: column;
-  background: var(--color-canvas);
-}
-
-.lightbox__bar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex-shrink: 0;
-  padding: var(--space-4) var(--space-5);
-  border-bottom: var(--line-width) solid var(--color-border);
-  background: var(--color-surface);
-}
-
-.lightbox__caption {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  flex: 1;
-}
-
-.lightbox__caption strong {
-  font-size: var(--text-base);
-  font-weight: var(--weight-medium);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.lightbox__caption span {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-}
-
-.lightbox__counter {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-
-.lightbox__icon {
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  border: var(--line-width) solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  color: var(--color-text-secondary);
-  transition: border-color var(--duration-fast) var(--ease-out),
-    color var(--duration-fast) var(--ease-out);
-}
-
-.lightbox__icon:hover {
-  border-color: var(--color-border-strong);
-  color: var(--color-text);
-}
-
-.lightbox__stage {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex: 1;
-  min-height: 0;
-  padding: var(--space-4) var(--space-5);
-}
-
-.lightbox__nav {
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-  width: var(--space-10);
-  height: var(--space-10);
-  border: var(--line-width) solid var(--color-border);
-  border-radius: var(--radius-full);
-  background: var(--color-surface);
-  color: var(--color-text-secondary);
-  transition: border-color var(--duration-fast) var(--ease-out),
-    color var(--duration-fast) var(--ease-out);
-}
-
-.lightbox__nav:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-  color: var(--color-text);
-}
-
-.lightbox__nav:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.lightbox__figure {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: 1;
-  min-width: 0;
-  height: 100%;
-  margin: 0;
-}
-
-.lightbox__figure img {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
-}
-
-.lightbox__fallback {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-10);
-  border: var(--line-width) dashed var(--color-border-strong);
-  border-radius: var(--radius-lg);
-  color: var(--color-text-tertiary);
-  font-size: var(--text-sm);
-  text-align: center;
-}
-
-.lightbox__foot {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex-shrink: 0;
-  padding: var(--space-4) var(--space-5);
-  border-top: var(--line-width) solid var(--color-border);
-  background: var(--color-surface);
-}
-
-.lightbox__summary {
-  flex: 1;
-  min-width: 0;
-  max-height: 4.6em;
-  overflow-y: auto;
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--color-text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.lightbox-enter-active,
-.lightbox-leave-active {
-  transition: opacity var(--duration-base) var(--ease-out);
-}
-
-.lightbox-enter-from,
-.lightbox-leave-to {
-  opacity: 0;
-}
-
 /* ------------------------------------------------------------------ 响应式 */
 
 @media (max-width: 1080px) {
@@ -1467,16 +1292,6 @@ onBeforeUnmount(() => {
 
   .library__count {
     margin-left: 0;
-  }
-
-  .lightbox__stage {
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-  }
-
-  .lightbox__nav {
-    width: var(--space-8);
-    height: var(--space-8);
   }
 }
 

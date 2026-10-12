@@ -22,7 +22,12 @@ pub fn media_url(value: &str) -> Result<Url, String> {
     if url.scheme() == "http" {
         url.set_scheme("https")
             .map_err(|_| "媒体地址无效".to_owned())?;
-        if !accepts_qq_credentials(&url) {
+        let public_cdn = url.host_str().is_some_and(|host| {
+            ["gtimg.com", "myqcloud.com", "qlogo.cn"]
+                .iter()
+                .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+        });
+        if !accepts_qq_credentials(&url) && !public_cdn {
             return Err("媒体地址必须使用 HTTPS".to_owned());
         }
     }
@@ -32,6 +37,22 @@ pub fn media_url(value: &str) -> Result<Url, String> {
         return Err("媒体地址必须使用 HTTPS".to_owned());
     }
     Ok(url)
+}
+
+/// Used only by clients with no cookie jar and requests with no QQ credentials.
+pub fn anonymous_redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        let url = attempt.url();
+        if attempt.previous().len() >= 5
+            || url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            attempt.error("媒体重定向目标不安全")
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// 判断一次重定向是否放行。
@@ -98,6 +119,14 @@ mod tests {
             media_url("http://img.qq.com/a?sign=test").unwrap().as_str(),
             "https://img.qq.com/a?sign=test"
         );
+        for value in [
+            "http://ugc.video.gtimg.com/a.mp4",
+            "http://a.myqcloud.com/a.mp4",
+        ] {
+            let url = media_url(value).unwrap();
+            assert_eq!(url.scheme(), "https");
+            assert!(!accepts_qq_credentials(&url));
+        }
         for value in [
             "http://evilqq.com/a",
             "http://example.com/a",

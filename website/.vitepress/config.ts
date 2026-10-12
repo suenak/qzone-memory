@@ -7,10 +7,9 @@ export default defineConfig({
   base: "/qzone-memory/",
   outDir: "./dist",
   head: [
-    // 之前完全没声明 icon，标签页一直是浏览器给的空白默认图标。
     // head 里的 href 不会被自动加上 base，这里要写全。
-    ["link", { rel: "icon", type: "image/png", href: "/qzone-memory/favicon.png" }],
-    ["link", { rel: "apple-touch-icon", href: "/qzone-memory/favicon.png" }],
+    ["link", { rel: "icon", type: "image/png", href: "/qzone-memory/favicon.png?v=shiyi-v2-20261012" }],
+    ["link", { rel: "apple-touch-icon", href: "/qzone-memory/favicon.png?v=shiyi-v2-20261012" }],
   ],
   themeConfig: {
     // 内容页（安装/开发/首归档…）走 VitePress 内置主题，它只在给了 logo 时才画图标，

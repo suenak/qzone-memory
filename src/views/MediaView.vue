@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { useToast } from "../composables/useToast";
+import ImageViewer from "../components/ImageViewer.vue";
 import { describeError } from "../utils/uiError";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -6,8 +8,6 @@ import Dialog from "primevue/dialog";
 import Select from "primevue/select";
 import {
   Camera,
-  ChevronLeft,
-  ChevronRight,
   CircleAlert,
   ExternalLink,
   Film,
@@ -18,17 +18,16 @@ import {
   Play,
   RefreshCw,
   User,
-  X,
 } from "lucide-vue-next";
 import QzoneText from "../components/QzoneText.vue";
 import EmptyState from "../components/ui/EmptyState.vue";
 import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
-import { usePreviewFocus } from "../composables/usePreviewFocus";
-import { loadRemoteImageBlob } from "../utils/archiveImage";
+import { loadRemoteImageBlob, mediaFileName } from "../utils/archiveImage";
 import { getArchivedFeed, listArchivedMedia, loadArchivedImage, loadArchivedVideo, type ArchiveItem, type ArchiveMediaItem } from "../utils/qzone";
 
 const PAGE_SIZE = 60;
+const toast = useToast();
 const media = ref<ArchiveMediaItem[]>([]);
 const years = ref<number[]>([]);
 const selectedYear = ref(0);
@@ -75,7 +74,6 @@ interface LightboxEntry {
 
 const lightboxList = ref<LightboxEntry[]>([]);
 const lightboxIndex = ref(-1);
-usePreviewFocus(computed(() => lightboxIndex.value >= 0), closeLightbox);
 
 /** 按年份切段，增量加载时同一年的两页会自动接在一起。 */
 const groupedMedia = computed(() => {
@@ -303,12 +301,6 @@ function retryLightboxImage() {
   void loadImage(current.url, current.dynamicId, current.pictureIndex);
 }
 
-function handleLightboxKey(event: KeyboardEvent) {
-  if (lightboxIndex.value < 0) return;
-  if (event.key === "Escape") { event.preventDefault(); closeLightbox(); }
-  else if (event.key === "ArrowLeft") { event.preventDefault(); stepLightbox(-1); }
-  else if (event.key === "ArrowRight") { event.preventDefault(); stepLightbox(1); }
-}
 
 watch(selectedYear, () => void load(true));
 watch(detailVisible, (visible) => { if (!visible) { detailSequence += 1; releaseVideo(); } });
@@ -320,11 +312,11 @@ onMounted(() => {
   const sentinel = document.querySelector(".media-load-sentinel");
   if (sentinel) loadObserver.observe(sentinel);
 });
-onMounted(() => window.addEventListener("keydown", handleLightboxKey));
+
 onBeforeUnmount(() => {
   imageObserver?.disconnect(); loadObserver?.disconnect(); releaseVideo();
   Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
-  window.removeEventListener("keydown", handleLightboxKey);
+
 });
 </script>
 
@@ -592,86 +584,7 @@ onBeforeUnmount(() => {
   </Dialog>
 
   <!-- --------------------------------------------------------------- 灯箱 -->
-  <Teleport to="body">
-    <Transition name="lightbox">
-      <div
-        v-if="lightboxCurrent"
-        class="lightbox"
-        data-qza-preview
-        tabindex="-1"
-        role="dialog"
-        aria-modal="true"
-        aria-label="图片预览"
-        @click.self="closeLightbox"
-      >
-        <header class="lightbox__bar">
-          <div class="lightbox__caption">
-            <strong>{{ lightboxCurrent.meta }}</strong>
-            <span>{{ lightboxCurrent.caption }}</span>
-          </div>
-          <span class="lightbox__counter">{{ lightboxIndex + 1 }} / {{ lightboxList.length }}</span>
-          <button class="lightbox__icon" type="button" aria-label="关闭预览（Esc）" @click="closeLightbox">
-            <X :size="18" :stroke-width="1.8" />
-          </button>
-        </header>
-
-        <div class="lightbox__stage">
-          <button
-            class="lightbox__nav"
-            type="button"
-            aria-label="上一张"
-            :disabled="lightboxList.length < 2"
-            @click="stepLightbox(-1)"
-          >
-            <ChevronLeft :size="20" :stroke-width="1.8" />
-          </button>
-
-          <figure class="lightbox__figure">
-            <img
-              v-if="imageSources[lightboxCurrent.url]"
-              :src="imageSources[lightboxCurrent.url]"
-              :alt="lightboxCurrent.caption"
-              loading="lazy"
-              decoding="async"
-              referrerpolicy="no-referrer"
-            />
-            <div v-else class="lightbox__fallback">
-              <ImageIcon :size="24" :stroke-width="1.8" />
-              <p>{{ imageLoading[lightboxCurrent.url] ? "正在加载这一张…" : "这一张暂时取不到" }}</p>
-              <p v-if="imageErrors[lightboxCurrent.url]" class="lightbox__reason">{{ imageErrors[lightboxCurrent.url] }}</p>
-              <button
-                v-if="!imageLoading[lightboxCurrent.url]"
-                class="btn btn--ghost"
-                type="button"
-                @click="retryLightboxImage"
-              >
-                <RefreshCw :size="15" :stroke-width="1.8" />
-                <span>重新加载</span>
-              </button>
-            </div>
-          </figure>
-
-          <button
-            class="lightbox__nav"
-            type="button"
-            aria-label="下一张"
-            :disabled="lightboxList.length < 2"
-            @click="stepLightbox(1)"
-          >
-            <ChevronRight :size="20" :stroke-width="1.8" />
-          </button>
-        </div>
-
-        <footer class="lightbox__foot">
-          <p class="lightbox__note">← → 切换照片，Esc 关闭</p>
-          <button v-if="lightboxCurrent.item" class="btn btn--ghost" type="button" @click="openLightboxOriginal">
-            <ExternalLink :size="15" :stroke-width="1.8" />
-            <span>查看说说</span>
-          </button>
-        </footer>
-      </div>
-    </Transition>
-  </Teleport>
+    <ImageViewer v-if="lightboxCurrent" :src="imageSources[lightboxCurrent.url]" :name="mediaFileName(lightboxCurrent.item?.publishedAt || detail?.publishedAt || 0, `照片-${lightboxCurrent.dynamicId || lightboxIndex}`)" :title="lightboxCurrent.meta" :index="lightboxIndex" :total="lightboxList.length" :loading="imageLoading[lightboxCurrent.url]" :error="imageErrors[lightboxCurrent.url]" @close="closeLightbox" @step="stepLightbox" @retry="retryLightboxImage" @saved="toast.success('图片已保存')" @error="toast.error($event)"><button v-if="lightboxCurrent.item" type="button" class="btn btn--ghost" @click="openLightboxOriginal">查看说说</button></ImageViewer>
 </template>
 
 <style scoped>
@@ -1208,170 +1121,6 @@ onBeforeUnmount(() => {
 
 /* ---------------------------------------------------------------- 灯箱 */
 
-.lightbox {
-  position: fixed;
-  inset: 0;
-  /* PrimeVue 的 Dialog 由 ZIndexUtils 管理（从 ~1000 起递增），灯箱要盖在详情之上。 */
-  z-index: 1200;
-  display: flex;
-  flex-direction: column;
-  background: var(--color-canvas);
-}
-
-.lightbox__bar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex-shrink: 0;
-  padding: var(--space-4) var(--space-5);
-  border-bottom: var(--line-width) solid var(--color-border);
-  background: var(--color-surface);
-}
-
-.lightbox__caption {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  flex: 1;
-}
-
-.lightbox__caption strong {
-  font-size: var(--text-base);
-  font-weight: var(--weight-medium);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.lightbox__caption span {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.lightbox__counter {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-
-.lightbox__icon {
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  border: var(--line-width) solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  color: var(--color-text-secondary);
-  transition: border-color var(--duration-fast) var(--ease-out),
-    color var(--duration-fast) var(--ease-out);
-}
-
-.lightbox__icon:hover {
-  border-color: var(--color-border-strong);
-  color: var(--color-text);
-}
-
-.lightbox__stage {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex: 1;
-  min-height: 0;
-  padding: var(--space-4) var(--space-5);
-}
-
-.lightbox__nav {
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-  width: var(--space-10);
-  height: var(--space-10);
-  border: var(--line-width) solid var(--color-border);
-  border-radius: var(--radius-full);
-  background: var(--color-surface);
-  color: var(--color-text-secondary);
-  transition: border-color var(--duration-fast) var(--ease-out),
-    color var(--duration-fast) var(--ease-out);
-}
-
-.lightbox__nav:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-  color: var(--color-text);
-}
-
-.lightbox__nav:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.lightbox__figure {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: 1;
-  min-width: 0;
-  height: 100%;
-  margin: 0;
-}
-
-.lightbox__figure img {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
-}
-
-.lightbox__fallback {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-10);
-  border: var(--line-width) dashed var(--color-border-strong);
-  border-radius: var(--radius-lg);
-  color: var(--color-text-tertiary);
-  font-size: var(--text-sm);
-  text-align: center;
-}
-
-.lightbox__reason {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-  word-break: break-word;
-}
-
-.lightbox__foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  flex-shrink: 0;
-  padding: var(--space-4) var(--space-5);
-  border-top: var(--line-width) solid var(--color-border);
-  background: var(--color-surface);
-}
-
-.lightbox__note {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-}
-
-.lightbox-enter-active,
-.lightbox-leave-active {
-  transition: opacity var(--duration-base) var(--ease-out);
-}
-
-.lightbox-enter-from,
-.lightbox-leave-to {
-  opacity: 0;
-}
-
 /* ---------------------------------------------------------------- 响应式 */
 
 @media (max-width: 1080px) {
@@ -1403,21 +1152,6 @@ onBeforeUnmount(() => {
 
   .shot-grid {
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  }
-
-  .lightbox__stage {
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-  }
-
-  .lightbox__nav {
-    width: var(--space-8);
-    height: var(--space-8);
-  }
-
-  .lightbox__foot {
-    flex-direction: column;
-    align-items: stretch;
   }
 }
 
