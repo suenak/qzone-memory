@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { describeLicenseError } from "../utils/uiError";
 import { computed, nextTick, ref, watch } from "vue";
-import { useRouter } from "vue-router";
+import { useRouter, useRoute } from "vue-router";
 import { BookOpen, CircleAlert, CircleCheck, ShieldCheck, LockKeyhole, Ticket, Trash2, Sun, Moon, Monitor } from "lucide-vue-next";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
@@ -14,6 +14,7 @@ import { platform } from "../utils/platform";
 const store = useLicenseStore();
 const appStore = useAppStore();
 const router = useRouter();
+const route = useRoute();
 const mobilePlatform = ["android", "ios"].includes(platform());
 
 type Mode = "activate" | "redeem";
@@ -76,7 +77,8 @@ async function submit() {
       notice.value = "激活成功，正在进入应用…";
       password.value = "";
       blockedSeats.value = [];
-      void router.replace('/');
+      const target = typeof route.query.returnTo === "string" && route.query.returnTo.startsWith("/") && !route.query.returnTo.startsWith("//") && !route.query.returnTo.startsWith("/activation") ? route.query.returnTo : "/";
+      await router.replace(target);
       return;
     }
     // 业务性失败（口令错误、席位已满）由后端以 success=false 返回，此处可拿到占用设备列表。
@@ -151,6 +153,7 @@ async function confirmRelease() {
       <div class="activation-themes" role="group" aria-label="界面主题"><button type="button" :aria-pressed="appStore.themeMode === 'light'" @click="appStore.setTheme('light')"><Sun :size="16" :stroke-width="1.8" />浅色</button><button type="button" :aria-pressed="appStore.themeMode === 'dark'" @click="appStore.setTheme('dark')"><Moon :size="16" :stroke-width="1.8" />深色</button><button type="button" :aria-pressed="appStore.themeMode === 'system'" @click="appStore.setTheme('system')"><Monitor :size="16" :stroke-width="1.8" />系统</button></div>
     </aside>
     <section class="activation-card">
+      <p v-if="route.query.returnTo" class="activation-intro">请先完成软件授权，再登录 QQ 空间。已有的本地记录仍可查看。</p>
       <header class="activation-head">
         <span class="activation-mark"><ShieldCheck :size="22" :stroke-width="1.8" /></span>
         <h1>{{ mode === "activate" ? "激活本设备" : "兑换卡密" }}</h1>
@@ -414,4 +417,5 @@ async function confirmRelease() {
   .is-mobile .activation-card { padding:var(--space-4); }
   .is-mobile .activation-mark { display:none; }
 }
+.activation-intro { padding:var(--space-3); margin-bottom:var(--space-4); color:var(--color-accent); background:var(--color-accent-soft); border-radius:var(--radius-md); font-size:var(--text-sm); line-height:var(--leading-relaxed); }
 </style>

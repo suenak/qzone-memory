@@ -1004,4 +1004,9 @@ onBeforeUnmount(() => clearInterval(timer));
 @media(min-width:1000px) { .tasks-page { max-width:var(--layout-section-max); } }
 
 @media(max-width:600px) { .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--space-2); } .status-panel__copy h3 { font-size:var(--text-lg); } }
+@media (max-width:600px) {
+  .notice.is-accent { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; }
+  .notice.is-accent > .p-button { grid-column:1 / -1; width:100%; }
+  .notice__copy { overflow-wrap:anywhere; }
+}
 </style>

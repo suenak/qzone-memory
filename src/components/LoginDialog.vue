@@ -20,6 +20,7 @@ import { describeError } from "../utils/uiError";
 
 const authStore = useAuthStore();
 const { dialogVisible, loading, qrImage, status, message, webLoginMode } = storeToRefs(authStore);
+const androidLogin = computed(() => platform() === "android");
 const showWebLogin = computed(() => {
   const currentPlatform = platform();
   return currentPlatform !== "android" && currentPlatform !== "ios";
@@ -59,7 +60,7 @@ const webState = computed(() =>
         </span>
         <span class="qzl-brand__copy">
           <strong>登录 QQ 空间</strong>
-          <small>使用手机 QQ 扫码并确认登录</small>
+          <small>{{ androidLogin ? "在 QQ 官方页面完成登录" : "使用手机 QQ 扫码并确认登录" }}</small>
         </span>
       </div>
     </template>
@@ -70,7 +71,7 @@ const webState = computed(() =>
         <SkeletonBlock v-if="loading" width="100%" height="100%" />
         <span v-else class="qzl-stage__placeholder">
           <Monitor :size="46" :stroke-width="1.6" aria-hidden="true" />
-          <small>登录窗口已打开</small>
+          <small>{{ androidLogin ? "QQ 登录页已打开" : "登录窗口已打开" }}</small>
         </span>
       </div>
 
@@ -80,11 +81,12 @@ const webState = computed(() =>
       </div>
 
       <p class="qzl-note">
-        请在 QQ 登录窗口中完成登录，成功后会自动返回。
+        请在 QQ 官方页面完成登录。有 QQ 时可按页面提示打开 QQ；未安装时可在页面登录。
       </p>
 
       <div class="qzl-actions">
         <Button
+          v-if="!androidLogin"
           label="返回扫码登录"
           severity="secondary"
           text
@@ -92,7 +94,7 @@ const webState = computed(() =>
         />
         <Button
           v-if="status === 'error' || status === 'webLoginCancelled'"
-          label="重试网页登录"
+          :label="androidLogin ? '重新打开登录页' : '重试网页登录'"
           :loading="loading"
           @click="authStore.startWebLogin()"
         >
@@ -102,7 +104,7 @@ const webState = computed(() =>
 
       <p class="qzl-footnote">
         <Lock :size="14" :stroke-width="1.8" aria-hidden="true" />
-        <span>登录信息由系统凭据库保存，退出登录后清除。</span>
+        <span>{{ androidLogin ? "登录凭证仅用于读取 QQ 空间，退出后清除。" : "登录信息由系统凭据库保存，退出登录后清除。" }}</span>
       </p>
     </div>
 
@@ -227,8 +229,8 @@ const webState = computed(() =>
   flex-direction: column;
   align-items: center;
   gap: var(--space-4);
-  max-height: min(520px, calc(100dvh - var(--space-8)));
-  overflow-y: auto;
+  min-height: 0;
+  flex-shrink: 0;
 }
 
 /* ------------------------------------------------------------------ 二维码 */

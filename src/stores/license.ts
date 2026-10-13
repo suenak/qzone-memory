@@ -64,6 +64,7 @@ export const useLicenseStore = defineStore("license", () => {
       view.value = await invoke<LicenseView>("get_license_status");
       lastError.value = view.value.message ?? "";
     } catch (error) {
+      view.value = null;
       lastError.value = String(error);
     } finally {
       initialized.value = true;

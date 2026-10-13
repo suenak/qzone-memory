@@ -419,10 +419,6 @@ async function refreshSeats() {
             <dt>数据存储</dt>
             <dd>本机应用数据目录</dd>
           </div>
-          <div>
-            <dt>软件许可</dt>
-            <dd>GPLv3</dd>
-          </div>
         </dl>
 
         <div class="about__update">

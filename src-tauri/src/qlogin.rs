@@ -12,7 +12,9 @@ use reqwest::{
     Client, Response,
 };
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::Manager;
+#[cfg(not(target_os = "android"))]
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -28,7 +30,9 @@ const MOBILE_USER_AGENTS: &[&str] = &[
 ];
 static USER_AGENT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(not(target_os = "android"))]
 const WEB_LOGIN_URL: &str = "https://i.qq.com";
+#[cfg(not(target_os = "android"))]
 const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
 
 const XLOGIN_URL: &str = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin";
@@ -960,6 +964,7 @@ pub async fn poll_qr_login(
 
 #[tauri::command]
 pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<LoginStatus, String> {
+    crate::license::require_archive_access()?;
     state.restore_session().await?;
     let guard = state.session.lock().await;
     if let Some(session) = guard.as_ref() {
@@ -986,12 +991,14 @@ pub async fn logout_qzone(
 ) -> Result<(), String> {
     crate::archive::ensure_archive_idle(&archive)?;
     state.clear_session().await;
+    cancel_web_login(app.clone()).await?;
     // 页面 token 与独立密码签名同样是进程级凭证缓存，登出时必须一并作废，
     // 否则它们会活到进程结束。
     crate::qzone::clear_qq_credential_caches(&app);
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub async fn open_web_login(app: tauri::AppHandle) -> Result<LoginStatus, String> {
     crate::license::require_archive_access()?;
@@ -1028,6 +1035,7 @@ pub async fn open_web_login(app: tauri::AppHandle) -> Result<LoginStatus, String
     })
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub async fn check_web_login(
     app: tauri::AppHandle,
@@ -1162,4 +1170,146 @@ pub async fn sync_cookies_to_webview(
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_web_login(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<QLoginState>();
+    state.session_epoch.fetch_add(1, Ordering::SeqCst);
+    #[cfg(target_os = "android")]
+    {
+        crate::android_login::cancel(&app)?;
+    }
+    #[cfg(not(target_os = "android"))]
+    if let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
+        window.close().ok();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn open_web_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, QLoginState>,
+) -> Result<LoginStatus, String> {
+    crate::license::require_archive_access()?;
+    *state.restore_attempted.lock().await = true;
+    let result = crate::android_login::call(&app, "start")?;
+    Ok(LoginStatus {
+        status: "webLoginOpened",
+        message: result.message,
+        auth: None,
+    })
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn check_web_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, QLoginState>,
+) -> Result<LoginStatus, String> {
+    crate::license::require_archive_access()?;
+    let epoch = state.session_epoch();
+    let result = crate::android_login::call(&app, "poll")?;
+    if result.status == "webLoginCancelled" || result.status == "error" {
+        return Ok(LoginStatus {
+            status: if result.status == "error" {
+                "error"
+            } else {
+                "webLoginCancelled"
+            },
+            message: result.message,
+            auth: None,
+        });
+    }
+    let Some(mut session) = native_login_session(&result.cookie_header, result.user_agent)? else {
+        return Ok(LoginStatus {
+            status: "webLoginWaiting",
+            message: result.message,
+            auth: None,
+        });
+    };
+    let uin = session.uin.clone().ok_or("登录信息不完整")?;
+    warmup_qzone_session(
+        &state.client,
+        &mut session.cookies,
+        &session.user_agent,
+        &uin,
+    )
+    .await;
+    let auth = login_credentials(&session).ok_or("登录信息不完整")?;
+    let mut current = state.session.lock().await;
+    if epoch != state.session_epoch() {
+        return Err(LOGIN_CANCELLED.into());
+    }
+    *current = Some(session);
+    drop(current);
+    crate::android_login::cancel(&app)?;
+    crate::qzone::clear_qq_credential_caches(&app);
+    Ok(LoginStatus {
+        status: "success",
+        message: "登录成功".into(),
+        auth: Some(auth),
+    })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn native_login_session(header: &str, user_agent: String) -> Result<Option<LoginSession>, String> {
+    let mut cookies = HashMap::new();
+    for pair in header.split(';') {
+        if let Some((name, value)) = pair.trim().split_once('=') {
+            if !value.is_empty() {
+                cookies.insert(name.to_owned(), value.to_owned());
+            }
+        }
+    }
+    let Some(key) = cookies.get("p_skey").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let uin = cookies
+        .get("p_uin")
+        .or_else(|| cookies.get("uin"))
+        .map(|v| normalized_uin(v))
+        .ok_or("登录信息不完整，请重试")?;
+    if uin.is_empty() || !uin.chars().all(|c| c.is_ascii_digit()) {
+        return Err("登录账号格式不正确".into());
+    }
+    Ok(Some(LoginSession {
+        g_tk: Some(bkn(key)),
+        cookies: allowed_session_cookies(&cookies),
+        uin: Some(uin),
+        user_agent,
+        ..Default::default()
+    }))
+}
+
+#[cfg(test)]
+mod native_login_tests {
+    use super::*;
+    #[test]
+    fn oauth_or_partial_login_never_counts_as_qzone_login() {
+        assert!(
+            native_login_session("openid=example; access_token=oauth", "test".into())
+                .unwrap()
+                .is_none()
+        );
+        assert!(native_login_session("p_uin=o12345; p_skey=", "test".into())
+            .unwrap()
+            .is_none());
+        assert!(native_login_session("p_skey=key", "test".into()).is_err());
+        assert!(native_login_session("p_uin=openid-value; p_skey=key", "test".into()).is_err());
+    }
+    #[test]
+    fn native_session_keeps_only_valid_account_and_required_cookies() {
+        let session = native_login_session(
+            "p_uin=o0012345; p_skey=example; tracking=discard",
+            "test".into(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(session.uin.as_deref(), Some("12345"));
+        assert_eq!(session.g_tk, Some(bkn("example")));
+        assert!(!session.cookies.contains_key("tracking"));
+    }
 }

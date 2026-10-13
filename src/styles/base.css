@@ -364,7 +364,7 @@ html .p-password-input { width: 100%; min-width: 0; }
 html .p-dialog-footer { flex-wrap: wrap; }
 html .p-dialog-mask { background: var(--color-overlay); }
 html .p-drawer-right { width: min(var(--layout-detail-width), 100vw); }
-html .p-drawer-bottom { max-height: 80dvh; padding-bottom: env(safe-area-inset-bottom); }
+html .p-drawer-bottom > .p-drawer { max-height: 80dvh; padding-bottom: env(safe-area-inset-bottom); }
 html .p-dialog-content { min-height: 0; overscroll-behavior: contain; }
 
 @media (max-width: 860px) {
@@ -379,3 +379,11 @@ html .p-select { min-height:var(--control-height); align-items:center; }
 html .p-inputtext,html .p-password-input { min-height:var(--control-height); font-size:var(--text-sm); }
 html .p-button { font-size:var(--text-sm); gap:var(--space-2); }
 @media(forced-colors:active) { :focus-visible { outline-color:Highlight; } html .p-button { forced-color-adjust:auto; } }
+
+/* Teleported dialogs use the available WebView height; keep one scrolling content area. */
+html .p-dialog { max-height:calc(var(--mobile-viewport-height,100dvh) - var(--space-4) * 2); min-height:0; }
+html .p-dialog-header, html .p-dialog-footer { flex-shrink:0; }
+html .p-dialog-content { overflow-y:auto; }
+html .p-drawer-bottom > .mobile-more-drawer { height: min(80dvh, var(--mobile-viewport-height,100dvh)); max-height:calc(var(--mobile-viewport-height,100dvh) - var(--space-4) * 2); }
+html .mobile-more-drawer .p-drawer-header { flex-shrink:0; }
+html .mobile-more-drawer .p-drawer-content { min-height:0; overflow-y:auto; padding-bottom:var(--space-4); }

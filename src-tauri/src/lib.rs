@@ -1,4 +1,6 @@
 mod account_storage;
+#[cfg(target_os = "android")]
+mod android_login;
 mod archive;
 mod license;
 mod media_http;
@@ -24,7 +26,10 @@ fn exit_app(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android_login::init());
+    builder
         .manage(archive::ArchiveState::new())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
@@ -67,6 +72,7 @@ pub fn run() {
             qlogin::logout_qzone,
             qlogin::open_web_login,
             qlogin::check_web_login,
+            qlogin::cancel_web_login,
             qlogin::sync_cookies_to_webview,
             // fetch_first_feeds / fetch_more_feeds 已删除：归档引擎直接走
             // qzone::fetch_feeds，这两个命令前端从未调用。

@@ -39,10 +39,6 @@ android {
         }
         getByName("release") {
             ndk { abiFilters += setOf("arm64-v8a", "armeabi-v7a") }
-            packaging {
-                // Exclude stale JNI files left by debug/emulator builds as well.
-                jniLibs.excludes += setOf("**/x86/**", "**/x86_64/**")
-            }
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
@@ -61,6 +57,10 @@ android {
 
 // Intel targets remain available for emulator development, never for release.
 androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        // Apply exclusions per release variant; android.packaging would affect Debug too.
+        variant.packaging.jniLibs.excludes.addAll(setOf("**/x86/**", "**/x86_64/**"))
+    }
     beforeVariants(selector().withBuildType("release")) { variant ->
         if (variant.productFlavors.any { (dimension, flavor) -> dimension == "abi" && flavor in setOf("x86", "x86_64") }) {
             variant.enable = false

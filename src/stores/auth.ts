@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { getQzoneLoginUser, type LoginCredentials, openWebLogin, checkWebLogin, syncCookiesToWebview } from "../utils/qlogin";
+import router from "../router";
+import { platform } from "../utils/platform";
+import { useLicenseStore } from "./license";
 import { useRecycleSessionStore } from "./recycle";
 
 /** 仅本 store 内部使用：外部通过 user.value 读取即可，全仓没有 import type 引用，不需要导出。 */
@@ -40,6 +43,16 @@ export const useAuthStore = defineStore("auth", () => {
     if (restoringSession || loggedIn.value) return;
     restoringSession = true;
     try {
+      // Restoring an online QQ session is subject to the same license as a new login.
+      // Local archive browsing uses independent local-data commands.
+      const license = useLicenseStore();
+      await license.refresh();
+      if (!license.canArchive) {
+        status.value = "loggedOut";
+        user.value = undefined;
+        message.value = "完成软件授权后可登录 QQ 空间";
+        return;
+      }
       const result = await invoke<LoginStatus>("get_login_status");
       status.value = result.status;
       message.value = result.message;
@@ -56,11 +69,22 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
+  async function ensureLoginAccess() {
+    const license = useLicenseStore();
+    await license.refresh();
+    if (license.canArchive) return true;
+    closeLogin();
+    await router.push({ path: "/activation", query: { returnTo: router.currentRoute.value.path === "/activation" ? "/" : router.currentRoute.value.fullPath } });
+    return false;
+  }
+
   async function openLogin() {
-    // 网页登录模式不能跨对话框残留：每次打开都从扫码开始，否则会看到「登录窗口已打开」，而实际在跑的是扫码轮询。
+    if (!(await ensureLoginAccess())) return;
     webLoginMode.value = false;
     dialogVisible.value = true;
-    if (!loggedIn.value) await refreshQrCode();
+    if (loggedIn.value) return;
+    if (platform() === "android") await startWebLogin();
+    else await refreshQrCode();
   }
 
   function closeLogin() {
@@ -68,9 +92,11 @@ export const useAuthStore = defineStore("auth", () => {
     // 关闭时一并退出网页登录模式，避免下次打开时界面与真实轮询状态错位。
     webLoginMode.value = false;
     pollingRun += 1;
+    void invoke("cancel_web_login").catch(() => {});
   }
 
   async function refreshQrCode() {
+    if (!(await ensureLoginAccess())) return;
     // 扫码与网页登录互斥：一进入扫码流程就退出网页登录模式，保证模板走二维码分支。
     webLoginMode.value = false;
     const run = ++pollingRun;
@@ -94,9 +120,12 @@ export const useAuthStore = defineStore("auth", () => {
         if (result.status === "success") {
           if (!result.auth) throw new Error("Rust 后端未返回完整登录凭证");
           message.value = "正在获取用户资料…";
-          user.value = await getQzoneLoginUser(result.auth);
+          user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
+          try { user.value = await getQzoneLoginUser(result.auth); } catch { /* Profile failure must not undo a valid session. */ }
+          if (run !== pollingRun) return;
           syncCookiesToWebview().catch(() => {});
           await delay(700);
+          if (run !== pollingRun) return;
           dialogVisible.value = false;
           pollingRun += 1;
           return;
@@ -117,6 +146,8 @@ export const useAuthStore = defineStore("auth", () => {
   }
 
   async function startWebLogin() {
+    if (!(await ensureLoginAccess())) return;
+    dialogVisible.value = true;
     const run = ++pollingRun;
     loading.value = true;
     webLoginMode.value = true;
@@ -138,9 +169,12 @@ export const useAuthStore = defineStore("auth", () => {
         message.value = result.message;
         if (result.status === "success") {
           if (!result.auth) throw new Error("后端未返回登录凭证");
-          user.value = await getQzoneLoginUser(result.auth);
+          user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
+          try { user.value = await getQzoneLoginUser(result.auth); } catch { /* Profile failure must not undo a valid session. */ }
+          if (run !== pollingRun) return;
           syncCookiesToWebview().catch(() => {});
           await delay(700);
+          if (run !== pollingRun) return;
           dialogVisible.value = false;
           webLoginMode.value = false;
           pollingRun += 1;
@@ -148,8 +182,12 @@ export const useAuthStore = defineStore("auth", () => {
         }
         if (result.status === "webLoginCancelled") {
           // 用户在 QQ 登录窗口里取消：退回扫码时必须重新取二维码，否则会停在既无二维码也无按钮的空档。
-          webLoginMode.value = false;
-          if (dialogVisible.value) void refreshQrCode();
+          if (platform() === "android") {
+            message.value = "登录已取消，可以重新打开 QQ 登录页。";
+          } else {
+            webLoginMode.value = false;
+            if (dialogVisible.value) void refreshQrCode();
+          }
           return;
         }
         if (result.status === "error") return;
@@ -174,6 +212,7 @@ export const useAuthStore = defineStore("auth", () => {
     status.value = "loggedOut";
     message.value = "使用手机 QQ 扫码登录";
     loading.value = false;
+    void invoke("cancel_web_login").catch(() => {});
     // 回到扫码后必须重新取二维码：否则 qrState 归为 waiting，界面上既没有二维码也没有刷新按钮，用户只能关掉对话框重开。
     if (dialogVisible.value) void refreshQrCode();
   }
