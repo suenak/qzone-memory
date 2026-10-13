@@ -427,13 +427,18 @@ async function refreshSeats() {
             <small>{{ updateStore.message || `当前版本 v${appVersion || "未知"}` }}</small>
           </div>
           <Button
-            :label="updateStore.checking ? '检查中…' : '检查更新'"
+            :label="updateStore.checking ? '检查中…' : updateStore.downloading || updateStore.downloaded ? '查看下载' : '检查更新'"
             severity="secondary"
             outlined
             size="small"
             :loading="updateStore.checking"
-            @click="updateStore.check()"
+            @click="updateStore.downloading || updateStore.downloaded ? updateStore.dialogVisible = true : updateStore.check()"
           />
+        </div>
+
+        <div class="about__update">
+          <div class="about__update-text"><strong>自动下载安装包</strong><small>启动和运行期间会自动检查；开启后，有新版就后台下载，安装由你确认。</small></div>
+          <Checkbox v-model="updateStore.autoDownload" binary aria-label="自动下载安装包" />
         </div>
 
         <p class="about__notice">

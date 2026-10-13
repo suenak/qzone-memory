@@ -40,3 +40,14 @@ pub fn cancel(app: &tauri::AppHandle) -> Result<(), String> {
         .map(|_| ())
         .map_err(|_| "无法关闭登录页".to_owned())
 }
+
+pub fn open_update(app: &tauri::AppHandle, path: &std::path::Path) -> Result<(), String> {
+    app.state::<AndroidLogin>()
+        .0
+        .run_mobile_plugin::<serde_json::Value>(
+            "openUpdate",
+            serde_json::json!({"path":path.to_string_lossy()}),
+        )
+        .map(|_| ())
+        .map_err(|_| "无法打开安装包，请允许拾忆安装应用后重试".to_owned())
+}

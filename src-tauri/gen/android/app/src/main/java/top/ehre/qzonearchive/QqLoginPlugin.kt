@@ -21,10 +21,44 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Plugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
+import app.tauri.annotation.InvokeArg
+import androidx.core.content.FileProvider
+import android.provider.Settings
+import java.io.File
+
+@InvokeArg
+class OpenUpdateArgs { lateinit var path: String }
 
 /** Native QQ login page; no JS bridge or credentials in frontend storage. */
 @TauriPlugin
 class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
+    @Command
+    fun openUpdate(invoke: Invoke) {
+        try {
+            val file = File(invoke.parseArgs(OpenUpdateArgs::class.java).path).canonicalFile
+            val root = File(activity.cacheDir, "update-packages").canonicalFile
+            if (!file.isFile || !file.path.startsWith(root.path + File.separator) || !file.name.endsWith(".apk")) {
+                invoke.reject("安装包路径无效")
+                return
+            }
+            val archive = activity.packageManager.getPackageArchiveInfo(file.path, 0)
+            if (archive?.packageName != activity.packageName) {
+                invoke.reject("安装包不属于拾忆，请重新下载")
+                return
+            }
+            if (!activity.packageManager.canRequestPackageInstalls()) {
+                activity.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${activity.packageName}")))
+                invoke.reject("请允许安装应用，返回后再次点击打开安装包")
+                return
+            }
+            val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
+            activity.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+            invoke.resolve(JSObject())
+        } catch (_: Exception) {
+            invoke.reject("无法打开安装包")
+        }
+    }
     private var dialog: Dialog? = null
     private var browser: WebView? = null
     private var state = "webLoginCancelled"
