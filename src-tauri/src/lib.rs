@@ -8,6 +8,7 @@ mod media_store;
 mod offline_export;
 mod qlogin;
 mod qzone;
+mod update_download;
 mod updater;
 
 /// 构建期部署常量。
@@ -31,6 +32,7 @@ pub fn run() {
     let builder = builder.plugin(android_login::init());
     builder
         .manage(archive::ArchiveState::new())
+        .manage(update_download::UpdateDownloadState::default())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
         .manage(qzone::QzonePageTokenState::default())
@@ -115,6 +117,11 @@ pub fn run() {
             updater::update_endpoint,
             updater::fetch_update_manifest,
             updater::download_page,
+            update_download::download_update,
+            update_download::get_update_download_progress,
+            update_download::cancel_update_download,
+            update_download::open_update_package,
+            update_download::reveal_update_package,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,27 +1,36 @@
-//! 客户端更新：只做「检查新版本 + 引导到官网手动下载」。
-//!
-//! 曾经实现过应用内自动安装（桌面走官方 updater 插件、Android 自建 APK 安装器），
-//! 但那要维护一对 minisign 密钥、Android 的 FileProvider 与「安装未知应用」权限，
-//! 而且在两端都很难让用户看清「这次更新到底改了什么」。现在改成：
-//! 请求更新清单 → 展示版本号与更新内容 → 用户自己决定是否前往官网下载覆盖安装。
-//!
-//! 这样一来既没有静默安装的权限负担，也不需要在客户端内置任何签名公钥。
+//! 固定更新服务的清单读取。安装包下载独立使用无 QQ 凭据的网络客户端。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateManifest {
-    version: String,
+    pub(crate) version: String,
     #[serde(default)]
     notes: Option<String>,
     #[serde(default)]
     download_page: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub(crate) platforms: HashMap<String, PlatformPackage>,
+    #[serde(skip_deserializing)]
+    download: Option<crate::update_download::DownloadDescriptor>,
+    #[serde(skip_deserializing)]
+    download_error: Option<String>,
 }
 
-async fn request_manifest(
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlatformPackage {
+    pub url: String,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+pub(crate) async fn request_manifest(
     endpoint: &str,
     timeout: Duration,
 ) -> Result<Option<UpdateManifest>, String> {
@@ -67,7 +76,19 @@ async fn request_manifest(
 /// 仅请求编译时配置的清单地址，不接收前端传入的网址或 QQ 凭据。
 #[tauri::command]
 pub async fn fetch_update_manifest() -> Result<Option<UpdateManifest>, String> {
-    request_manifest(UPDATE_ENDPOINT, Duration::from_secs(10)).await
+    let Some(mut manifest) = request_manifest(UPDATE_ENDPOINT, Duration::from_secs(10)).await?
+    else {
+        return Ok(None);
+    };
+    match crate::update_download::select_package(
+        &manifest,
+        UPDATE_ENDPOINT,
+        crate::update_download::current_target(),
+    ) {
+        Ok(package) => manifest.download = Some(package.descriptor()),
+        Err(error) => manifest.download_error = Some(error),
+    }
+    Ok(Some(manifest))
 }
 
 /// 更新清单地址。

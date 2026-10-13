@@ -9,6 +9,7 @@ import Checkbox from "primevue/checkbox";
 import Dialog from "primevue/dialog";
 import AppShell from "./layouts/AppShell.vue";
 import ToastHost from "./components/ui/ToastHost.vue";
+import UpdateDialog from "./components/UpdateDialog.vue";
 import { useAuthStore } from "./stores/auth";
 import { useLicenseStore } from "./stores/license";
 import { useUpdateStore } from "./stores/update";
@@ -40,7 +41,7 @@ async function bootstrapLicense() {
  * 不该让他为一次无关的请求多等哪怕一秒。失败也不提示，只有真的有新版才出声。
  */
 function checkForUpdatesOnStartup() {
-  void updateStore.check({ silent: true });
+  updateStore.startAutomaticChecks();
 }
 
 const licenseNotice = computed(() => (licenseStore.activated ? (licenseStore.view?.message ?? "").replace(/归档/g, "备份") : ""));
@@ -60,6 +61,7 @@ onMounted(() => {
   document.addEventListener("visibilitychange", retryPersistedSession);
 });
 onBeforeUnmount(() => {
+  updateStore.stopAutomaticChecks();
   window.removeEventListener("focus", retryPersistedSession);
   document.removeEventListener("visibilitychange", retryPersistedSession);
 });
@@ -101,20 +103,7 @@ async function declineDisclaimer() {
   <ToastHost />
 
   <!-- 更新提示必须是全局的：启动检查发生时用户可能停在任何页面，设置页甚至尚未挂载。 -->
-  <Dialog v-model:visible="updateStore.dialogVisible" modal :draggable="false" header="发现新版本" class="disclaimer-dialog">
-    <div class="update-body">
-      <p>新版本 <strong>v{{ updateStore.available?.version }}</strong> 已发布。</p>
-      <template v-if="updateStore.available?.notes">
-        <h4>更新内容</h4>
-        <p class="update-notes">{{ updateStore.available.notes }}</p>
-      </template>
-      <p class="update-hint">新版需要你自行下载安装包覆盖安装。应用不会在后台自动替换，也不会改动你已经归档到本地的数据。</p>
-    </div>
-    <template #footer>
-      <Button label="稍后再说" severity="secondary" text size="small" @click="updateStore.dialogVisible = false" />
-      <Button label="前往官网下载" size="small" @click="updateStore.goToDownloadPage" />
-    </template>
-  </Dialog>
+  <UpdateDialog />
   <Dialog :visible="!disclaimerAccepted" modal :closable="false" :draggable="false" :close-on-escape="false" class="disclaimer-dialog" header="免责声明与使用须知">
     <div class="disclaimer-heading"><span><ShieldCheck :size="19" :stroke-width="1.8" /></span><div><strong>使用前请确认</strong><small>本地备份工具 · 非 QQ 官方产品</small></div></div>
     <ul class="disclaimer-summary"><li>仅备份本人或已获授权的账号内容。</li><li>已删除内容只能尝试恢复，结果可能不完整。</li><li>请另存重要文件，备份过程中不要切换 QQ 账号。</li></ul>
@@ -168,17 +157,6 @@ async function declineDisclaimer() {
   margin: var(--space-3) 0 var(--space-1);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-}
-
-/* 更新说明由发布者在后台填写，保留其中的换行。 */
-.update-notes {
-  white-space: pre-wrap;
-}
-
-.update-hint {
-  margin-top: var(--space-3);
-  font-size: var(--text-xs);
-  color: var(--color-text-secondary);
 }
 
 /* ------------------------------------------------- 免责声明闸门

@@ -68,22 +68,19 @@ the server-signed token. Accordingly:
 
 ### Client updates
 
-The client **never installs updates by itself**. It fetches a manifest; if a newer version is
-published it shows a dialog with the release notes and a button that opens the download page, and
-the user downloads and installs manually.
-
-That is a deliberate simplification. An earlier revision did implement in-app installation — the
-official `tauri-plugin-updater` on desktop plus a hand-written APK installer (FileProvider, Kotlin
-plugin, `REQUEST_INSTALL_PACKAGES`) on Android. It was removed: it required maintaining a minisign
-keypair whose loss would permanently strand every installed client, needed Android's
-"install unknown apps" permission, and gave the user no chance to read what had changed before the
-install started.
+The client checks for updates at startup and every six hours while visible. New releases show
+their notes before the user starts an in-app package download. Optional background package
+downloads are disabled by default. Downloading never installs or silently replaces the app.
+The user opens the downloaded package and completes the system installer. Android uses a narrow
+FileProvider and the OS unknown-app-source permission; iOS retains the external download path.
 
 - **Manifest**: `GET <server>/api/v1/update/latest`, returning `version` / `notes` / `pub_date` /
   `download_page` / `platforms`. **204 means "no update"** — either nothing is published or the
   reported client version is already current.
-- The client reads only `version`, `notes` and `download_page`. `platforms` keeps Tauri's field
-  names for possible future use and is not consumed today.
+- Native Rust selects the current `platforms` package. New manifests include `size`, `sha256`
+  and `file_name`. Downloads validate length, SHA-256 when supplied, and package type. Older
+  HTTPS manifests without a digest remain compatible. This is transport/file integrity checking,
+  not minisign verification or unattended installation.
 - The manifest request runs in Rust, with a 10-second timeout and a 512 KiB response limit.
   It accepts no endpoint argument or QQ credentials from the frontend; WebView CSP stays narrow.
 - Deployment constants — the update endpoint, the fallback download page, the licence server
@@ -98,8 +95,9 @@ install started.
   network error. Publishing a real build means supplying `qza.config.local.json` on the build
   machine; never commit one.
 
-Server side, `QZA_DOWNLOAD_PAGE` is what the manifest advertises; publishing no longer requires
-minisign signatures. Release steps: [docs/RELEASE-AUTO-UPDATE.md](docs/RELEASE-AUTO-UPDATE.md).
+Server side, `QZA_DOWNLOAD_PAGE` remains a fallback. Published file digests are streamed and
+cached without a database schema migration. Publishing does not require minisign signatures.
+Release steps: [docs/RELEASE-AUTO-UPDATE.md](docs/RELEASE-AUTO-UPDATE.md).
 
 ### Frontend design system
 
