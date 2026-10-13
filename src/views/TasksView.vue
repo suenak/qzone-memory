@@ -57,7 +57,7 @@ const rateLimited = computed(() => progress.value.status === "limited");
 const remainingSeconds = computed(() => Math.max(0, Math.ceil((Number(progress.value.retryAt || 0) * 1000 - currentTime.value) / 1000)));
 const rateWaiting = computed(() => rateLimited.value && remainingSeconds.value > 0);
 const remainingText = computed(() => `${String(Math.floor(remainingSeconds.value / 60)).padStart(2, "0")}:${String(remainingSeconds.value % 60).padStart(2, "0")}`);
-const statusText = computed(() => ({ idle: "未开始", running: "进行中", completed: "已完成", cancelled: "已取消", limited: "稍后继续", error: "失败" }[progress.value.status]));
+const statusText = computed(() => ({ idle: "未开始", running: "进行中", completed: "已完成", partial: "未读取完整", cancelled: "已取消", limited: "稍后继续", error: "失败" }[progress.value.status]));
 
 /* ---------------------------------------------------------------------- UI 层
  * 以下只为呈现服务：状态卡文案、配色、展开状态、备份间隔草稿。
@@ -69,6 +69,7 @@ const statusTone = computed<"accent" | "success" | "warning" | "danger" | "neutr
     idle: "neutral",
     running: "accent",
     completed: "success",
+    partial: "warning",
     cancelled: "warning",
     limited: "warning",
     error: "danger",
@@ -80,7 +81,8 @@ const statusTone = computed<"accent" | "success" | "warning" | "danger" | "neutr
 const statusTitle = computed(() => ({
   idle: "等待开始",
   running: "正在查找和保存说说",
-  completed: "本次恢复已完成",
+  completed: "本轮读取已完成",
+  partial: "部分来源未读取完成",
   cancelled: "恢复已停止",
   limited: "请求过于频繁，已暂停",
   error: "恢复未完成",
@@ -91,6 +93,7 @@ const statusDescription = computed(() => ({
   idle: "开始后会逐页读取空间记录，保存到本机。",
   running: "正在读取并保存。请保持应用运行，不要切换 QQ 账号。",
   completed: "本轮读取已结束，可到「说说」查看结果。",
+  partial: "已保存的内容会保留。请查看下方说明后继续读取。",
   cancelled: "已保存的内容会保留，下次可继续恢复。",
   limited: "QQ 空间暂时限制了请求。等待倒计时结束后，点击「继续恢复」。",
   error: "已保存的内容会保留。请查看错误提示后重试。",
@@ -102,6 +105,7 @@ const startLabel = computed(() => {
   if (rateWaiting.value) return `请等待 ${remainingText.value}`;
   if (rateLimited.value) return "继续恢复";
   if (progress.value.status === "cancelled" || progress.value.status === "error") return "继续恢复";
+  if (progress.value.status === "partial") return "继续恢复";
   if (progress.value.status === "completed") return "检查新内容";
   return "开始恢复";
 });
@@ -252,6 +256,7 @@ onBeforeUnmount(() => clearInterval(timer));
                 idle: CircleSlash,
                 running: HardDriveDownload,
                 completed: CircleCheck,
+                partial: CircleAlert,
                 cancelled: CircleSlash,
                 limited: Clock,
                 error: CircleAlert,
@@ -271,7 +276,7 @@ onBeforeUnmount(() => clearInterval(timer));
           <span class="indeterminate__bar" />
         </div>
 
-        <p v-show="detailsOpen" class="engine-message">
+        <p v-show="detailsOpen || progress.status === 'partial' || progress.status === 'error'" class="engine-message">
           <Info :size="14" :stroke-width="1.8" aria-hidden="true" />
           <span>{{ diagnosticError(progress.message) }}</span>
         </p>

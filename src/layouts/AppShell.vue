@@ -159,7 +159,8 @@ const archiveSummary = computed(() => {
   const progress = archiveStore.progress;
   if (!progress) return "";
   if (progress.status === "running") return `已保存 ${progress.saved} 条`;
-  if (progress.status === "completed") return "上次恢复已完成";
+  if (progress.status === "partial") return "上次有部分来源未读取完成";
+  if (progress.status === "completed") return "上轮读取已完成";
   if (progress.status === "limited") return "请求过于频繁，稍后可继续";
   if (progress.status === "error") return "上次恢复未完成";
   return "任务已停止";

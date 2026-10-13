@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ArchiveStatus = "idle" | "running" | "completed" | "cancelled" | "limited" | "error";
+export type ArchiveStatus = "idle" | "running" | "completed" | "partial" | "cancelled" | "limited" | "error";
 export interface ArchiveProgress { status: ArchiveStatus; pages: number; fetched: number; saved: number; skipped: number; message: string; retryAt?: number; librarySyncing: boolean; }
 /**
  * 后端还没给出进度时的兜底值。

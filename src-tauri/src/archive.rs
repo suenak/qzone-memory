@@ -10,7 +10,7 @@ use std::{
 };
 
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{qlogin::QLoginState, qzone};
@@ -376,6 +376,13 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            fetched INTEGER NOT NULL DEFAULT 0,
            saved INTEGER NOT NULL DEFAULT 0,
            updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS archive_source_checkpoints (
+           owner_uin TEXT NOT NULL,
+           source TEXT NOT NULL,
+           state_json TEXT NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(owner_uin,source)
          );
          CREATE TABLE IF NOT EXISTS archive_rate_limits (
            owner_uin TEXT PRIMARY KEY,
@@ -2104,13 +2111,72 @@ fn skip_probe_offsets(first_advance: i64) -> Vec<i64> {
     offsets
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct VisibleSyncSummary {
     pages: u32,
     moments: u64,
     saved: u64,
     total: u64,
     owner_name: Option<String>,
+}
+
+// Numeric source offsets remain resumable beyond the short-lived interaction cursor.
+// A completed source is retained while another source is paused or incomplete.
+const SOURCE_CHECKPOINT_MAX_AGE: i64 = 24 * 3600;
+#[derive(Default, Serialize, Deserialize)]
+struct VisibleCheckpoint {
+    next_pos: u32,
+    complete: bool,
+    summary: VisibleSyncSummary,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct HistoryCheckpoint {
+    next_offset: u32,
+    empty_tail: u32,
+    last_hit: Option<u32>,
+    complete: bool,
+    summary: HistorySyncSummary,
+}
+fn load_source_checkpoint<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    owner: &str,
+    source: &str,
+    current: i64,
+) -> Result<Option<T>, String> {
+    let mut query = connection.prepare("SELECT state_json,updated_at FROM archive_source_checkpoints WHERE owner_uin=?1 AND source=?2").map_err(|e| e.to_string())?;
+    let mut rows = query
+        .query(params![owner, source])
+        .map_err(|e| e.to_string())?;
+    let Some(row) = rows.next().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let updated: i64 = row.get(1).map_err(|e| e.to_string())?;
+    if current.saturating_sub(updated) >= SOURCE_CHECKPOINT_MAX_AGE || updated > current + 60 {
+        return Ok(None);
+    }
+    let json: String = row.get(0).map_err(|e| e.to_string())?;
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|_| "来源断点无法读取，请检查本地数据库".to_owned())
+}
+fn save_source_checkpoint<T: Serialize>(
+    connection: &Connection,
+    owner: &str,
+    source: &str,
+    checkpoint: &T,
+    current: i64,
+) -> Result<(), String> {
+    let json = serde_json::to_string(checkpoint).map_err(|e| e.to_string())?;
+    connection.execute("INSERT INTO archive_source_checkpoints(owner_uin,source,state_json,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(owner_uin,source) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",params![owner,source,json,current]).map(|_| ()).map_err(|e| format!("保存来源断点失败：{e}"))
+}
+fn clear_source_checkpoints(connection: &Connection, owner: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM archive_source_checkpoints WHERE owner_uin=?1",
+            params![owner],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 async fn sync_visible_moments(
@@ -2120,8 +2186,18 @@ async fn sync_visible_moments(
     owner_uin: &str,
     interval_ms: u64,
 ) -> Result<VisibleSyncSummary, String> {
-    let mut summary = VisibleSyncSummary::default();
-    let mut pos = 0_u32;
+    let mut checkpoint = load_source_checkpoint::<VisibleCheckpoint>(
+        &open_database(app)?,
+        owner_uin,
+        "visible",
+        now(),
+    )?
+    .unwrap_or_default();
+    if checkpoint.complete {
+        return Ok(checkpoint.summary);
+    }
+    let mut summary = checkpoint.summary;
+    let mut pos = checkpoint.next_pos;
     let mut seen_positions = HashSet::new();
     set_progress(archive, |progress| {
         progress.message = "正在同步本人可见说说、评论和回复…".into();
@@ -2144,6 +2220,18 @@ async fn sync_visible_moments(
                     page.total
                 ));
             }
+            checkpoint = VisibleCheckpoint {
+                next_pos: pos,
+                complete: true,
+                summary: summary.clone(),
+            };
+            save_source_checkpoint(
+                &open_database(app)?,
+                owner_uin,
+                "visible",
+                &checkpoint,
+                now(),
+            )?;
             return Ok(summary);
         }
         summary.total = page.total;
@@ -2173,11 +2261,23 @@ async fn sync_visible_moments(
                 summary.moments
             );
         });
+        if page.has_more && page.next_pos <= pos {
+            return Err("本人说说接口未推进分页位置，已停止以避免死循环".into());
+        }
+        checkpoint = VisibleCheckpoint {
+            next_pos: page.next_pos,
+            complete: !page.has_more,
+            summary: summary.clone(),
+        };
+        save_source_checkpoint(
+            &open_database(app)?,
+            owner_uin,
+            "visible",
+            &checkpoint,
+            now(),
+        )?;
         if !page.has_more {
             return Ok(summary);
-        }
-        if page.next_pos <= pos {
-            return Err("本人说说接口未推进分页位置，已停止以避免死循环".into());
         }
         pos = page.next_pos;
         tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
@@ -2187,7 +2287,7 @@ async fn sync_visible_moments(
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct HistorySyncSummary {
     pages: u32,
     records: u64,
@@ -2246,25 +2346,30 @@ async fn sync_history_messages(
     owner_name: Option<&str>,
     interval_ms: u64,
 ) -> Result<HistorySyncSummary, String> {
-    // QQ's legacy notification list can contain holes: an empty offset does not
-    // prove that every later offset is empty. Read it sequentially and only stop
-    // after a long verified empty tail. This costs more requests than binary
-    // search, but prevents a single sparse page from hiding older recoverable
-    // records. Normally this uses 30-position windows; endpoints that reject a
-    // large window are retried with the upstream project's 10-position size.
-    // In both cases 6,000 positions past the last hit must be verified empty.
-    const PAGE_SIZE: u32 = 30;
-    const FALLBACK_PAGE_SIZE: u32 = 10;
+    // Read the upstream-compatible ten-position window; don't assume that a
+    // larger requested count is honored when choosing the next offset.
+    // Holes still require a verified empty tail, and checkpoints carry it across pauses.
+    const PAGE_SIZE: u32 = 10;
     const MAX_HISTORY_OFFSET: u32 = 10_000_000;
     const EMPTY_TAIL_POSITIONS: u32 = 6_000;
-    let mut summary = HistorySyncSummary::default();
+    let checkpoint = load_source_checkpoint::<HistoryCheckpoint>(
+        &open_database(app)?,
+        owner_uin,
+        "history",
+        now(),
+    )?
+    .unwrap_or_default();
+    if checkpoint.complete {
+        return Ok(checkpoint.summary);
+    }
+    let mut summary = checkpoint.summary;
     set_progress(archive, |progress| {
         progress.message = "正在顺序读取历史消息，并验证最后 6,000 个位置是否为空…".into();
     });
 
-    let mut offset = 0_u32;
-    let mut consecutive_empty_positions = 0_u32;
-    let mut last_nonempty_offset: Option<u32> = None;
+    let mut offset = checkpoint.next_offset;
+    let mut consecutive_empty_positions = checkpoint.empty_tail;
+    let mut last_nonempty_offset = checkpoint.last_hit;
     while offset <= MAX_HISTORY_OFFSET && consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
         if archive.cancel.load(Ordering::Relaxed) {
             return Ok(summary);
@@ -2272,30 +2377,8 @@ async fn sync_history_messages(
         if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
             return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
         }
-        let (page, requested_count) = match qzone::fetch_history_messages(
-            login, offset, PAGE_SIZE, owner_name,
-        )
-        .await
-        {
-            Ok(page) => (page, PAGE_SIZE),
-            Err(primary_error) => {
-                set_progress(archive, |progress| {
-                    progress.message = format!(
-                        "历史 offset {offset} 的 30 条窗口读取失败，正在按 10 条小窗口兼容重试…"
-                    );
-                });
-                match qzone::fetch_history_messages(login, offset, FALLBACK_PAGE_SIZE, owner_name)
-                    .await
-                {
-                    Ok(page) => (page, FALLBACK_PAGE_SIZE),
-                    Err(fallback_error) => {
-                        return Err(format!(
-                                "历史 offset {offset} 的大、小窗口均读取失败：{primary_error}；{fallback_error}"
-                            ));
-                    }
-                }
-            }
-        };
+        let page = qzone::fetch_history_messages(login, offset, PAGE_SIZE, owner_name).await?;
+        let requested_count = PAGE_SIZE;
         summary.pages = summary.pages.saturating_add(1);
         summary.deepest_probe_offset = summary.deepest_probe_offset.max(offset);
         set_progress(archive, |progress| {
@@ -2305,7 +2388,7 @@ async fn sync_history_messages(
             last_nonempty_offset = Some(offset);
             consecutive_empty_positions = 0;
             let saved = save_retried_page(app, owner_uin, &page.feeds)?;
-            summary.records = summary.records.saturating_add(page.record_count as u64);
+            summary.records = summary.records.saturating_add(page.feeds.len() as u64);
             summary.saved = summary.saved.saturating_add(saved);
             set_progress(archive, |progress| {
                 progress.fetched = progress.fetched.saturating_add(page.record_count as u64);
@@ -2326,6 +2409,22 @@ async fn sync_history_messages(
             });
         }
         offset = offset.saturating_add(requested_count);
+        summary.estimated_end_offset = last_nonempty_offset.unwrap_or(0);
+        let complete = consecutive_empty_positions >= EMPTY_TAIL_POSITIONS;
+        let checkpoint = HistoryCheckpoint {
+            next_offset: offset,
+            empty_tail: consecutive_empty_positions,
+            last_hit: last_nonempty_offset,
+            complete,
+            summary: summary.clone(),
+        };
+        save_source_checkpoint(
+            &open_database(app)?,
+            owner_uin,
+            "history",
+            &checkpoint,
+            now(),
+        )?;
         if consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
             tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
                 interval_ms,
@@ -2334,6 +2433,9 @@ async fn sync_history_messages(
         }
     }
     summary.estimated_end_offset = last_nonempty_offset.unwrap_or(0);
+    if offset > MAX_HISTORY_OFFSET && consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
+        return Err("历史读取已达到安全上限，仍有未验证的位置；不能确认读取完整".into());
+    }
     set_progress(archive, |progress| {
         progress.message = format!(
             "历史探测完成：最后命中约 offset {}，其后已连续验证 {} 个位置无记录…",
@@ -2461,9 +2563,9 @@ pub async fn start_feed_archive(
                         .map(str::to_owned);
                 }
                 Err(error) => {
-                    history_sync_error = Some(concise_archive_error(&format!(
-                        "无法补全本人昵称：{error}"
-                    )));
+                    set_progress(&archive, |progress| {
+                        progress.message = format!("本人昵称暂未获取成功（{}），继续按 QQ 号识别可确认的历史记录…", concise_archive_error(&error));
+                    });
                 }
             }
         }
@@ -2689,6 +2791,20 @@ pub async fn start_feed_archive(
         Err(error) => Some(concise_archive_error(&error)),
     };
     let quality_summary = archive_quality_summary(&app, &owner_uin).unwrap_or_default();
+    let interaction_result = if interaction_result.is_ok()
+        && !archive.cancel.load(Ordering::Relaxed)
+        && visible_sync_error.is_none()
+        && history_sync_error.is_none()
+        && archive
+            .progress
+            .lock()
+            .map(|progress| progress.skipped == 0)
+            .unwrap_or(false)
+    {
+        interaction_result.and_then(|_| clear_source_checkpoints(&open_database(&app)?, &owner_uin))
+    } else {
+        interaction_result
+    };
     let result = match interaction_result {
         Err(error)
             if interaction_failure_can_finish(
@@ -2708,7 +2824,12 @@ pub async fn start_feed_archive(
             p.retry_at = None;
         }),
         Ok(()) => set_progress(&archive, |p| {
-            p.status = "completed";
+            p.status =
+                if visible_sync_error.is_some() || history_sync_error.is_some() || p.skipped > 0 {
+                    "partial"
+                } else {
+                    "completed"
+                };
             p.message = if let (Some(visible_error), Some(history_error)) =
                 (visible_sync_error.as_deref(), history_sync_error.as_deref())
             {
@@ -2717,14 +2838,14 @@ pub async fn start_feed_archive(
                 )
             } else if let Some(error) = visible_sync_error.as_deref() {
                 format!(
-                    "已读取 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}）并完成互动补充；但可见说说接口暂时不可用（{error}），稍后重试可补齐仍存在的正文和评论回复",
+                    "已读取 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}）并完成互动补充；但可见说说接口暂时不可用（{error}），可稍后重试这一来源",
                     history_summary.records,
                     history_summary.estimated_end_offset,
                     history_summary.deepest_probe_offset
                 )
             } else if let Some(error) = history_sync_error.as_deref() {
                 format!(
-                    "已同步 {} / {} 条本人可见说说并完成互动补充；但历史消息接口暂时不可用（{error}），稍后重试可补齐更多已删除残留",
+                    "已同步 {} / {} 条本人可见说说并完成互动补充；但历史消息接口暂时不可用（{error}），可稍后重试这一来源",
                     visible_summary.moments, visible_summary.total
                 )
             } else if p.skipped > 0 {
@@ -2756,7 +2877,7 @@ pub async fn start_feed_archive(
                 let detail = concise_archive_error(
                     error.trim_start_matches("ARCHIVE_INTERACTIONS_UNAVAILABLE:"),
                 );
-                p.status = "completed";
+                p.status = "partial";
                 p.message = format!(
                     "已保存 {} / {} 条本人可见说说及评论回复，并读取 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}）；互动通知接口暂时不可用（{}），点赞等互动尚未补齐，请稍后继续归档",
                     visible_summary.moments,
@@ -2766,6 +2887,14 @@ pub async fn start_feed_archive(
                     history_summary.deepest_probe_offset,
                     detail
                 );
+                if let Some(error) = history_sync_error.as_deref() {
+                    p.message
+                        .push_str(&format!("。历史消息也未读取成功：{error}"));
+                }
+                if let Some(error) = visible_sync_error.as_deref() {
+                    p.message
+                        .push_str(&format!("。可见说说也未读取成功：{error}"));
+                }
                 p.retry_at = None;
             });
         }
@@ -4199,6 +4328,7 @@ pub async fn clear_archived_feeds(
             params![owner_uin],
         )
         .map_err(|error| format!("清空归档频率记录失败：{error}"))?;
+    clear_source_checkpoints(&connection, &owner_uin)?;
     // 异常跳过记录必须一起清掉：数据都没了，再留着这些位置只会让界面显示
     // 已经不存在数据的“异常位置”，并在下次归档时把旧的跳过数量重新算进进度。
     connection
@@ -5761,5 +5891,94 @@ mod tests {
             vec![1, 2, 4, 8, 16, 32, 64, 128, 256]
         );
         assert_eq!(skip_probe_offsets(20), vec![20, 32, 64, 128, 256]);
+    }
+}
+
+#[cfg(test)]
+mod source_resume_tests {
+    use super::*;
+    fn database() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE archive_source_checkpoints(owner_uin TEXT,source TEXT,state_json TEXT,updated_at INTEGER,PRIMARY KEY(owner_uin,source));").unwrap();
+        c
+    }
+    #[test]
+    fn history_resume_keeps_depth_and_empty_tail_across_rate_limit_windows() {
+        let c = database();
+        let state = HistoryCheckpoint {
+            next_offset: 9000,
+            empty_tail: 5100,
+            last_hit: Some(3870),
+            complete: false,
+            summary: HistorySyncSummary {
+                records: 42,
+                saved: 42,
+                ..Default::default()
+            },
+        };
+        save_source_checkpoint(&c, "12345", "history", &state, 1000).unwrap();
+        let resumed: HistoryCheckpoint = load_source_checkpoint(&c, "12345", "history", 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.next_offset, 9000);
+        assert_eq!(resumed.empty_tail, 5100);
+        assert_eq!(resumed.last_hit, Some(3870));
+        assert_eq!(resumed.summary.records, 42);
+        assert!(!resumed.complete);
+    }
+    #[test]
+    fn completed_visible_source_is_not_restarted_while_history_is_incomplete() {
+        let c = database();
+        let state = VisibleCheckpoint {
+            next_pos: 12000,
+            complete: true,
+            summary: VisibleSyncSummary {
+                moments: 12000,
+                ..Default::default()
+            },
+        };
+        save_source_checkpoint(&c, "12345", "visible", &state, 1000).unwrap();
+        let resumed: VisibleCheckpoint = load_source_checkpoint(&c, "12345", "visible", 2000)
+            .unwrap()
+            .unwrap();
+        assert!(resumed.complete);
+        assert_eq!(resumed.summary.moments, 12000);
+        assert!(
+            load_source_checkpoint::<VisibleCheckpoint>(&c, "67890", "visible", 2000)
+                .unwrap()
+                .is_none()
+        );
+        clear_source_checkpoints(&c, "67890").unwrap();
+        assert!(
+            load_source_checkpoint::<VisibleCheckpoint>(&c, "12345", "visible", 2000)
+                .unwrap()
+                .is_some()
+        );
+        clear_source_checkpoints(&c, "12345").unwrap();
+        assert!(
+            load_source_checkpoint::<VisibleCheckpoint>(&c, "12345", "visible", 2000)
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn stale_source_offsets_are_rechecked_but_local_records_are_not_removed() {
+        let c = database();
+        save_source_checkpoint(&c, "12345", "history", &HistoryCheckpoint::default(), 1000)
+            .unwrap();
+        assert!(load_source_checkpoint::<HistoryCheckpoint>(
+            &c,
+            "12345",
+            "history",
+            1000 + SOURCE_CHECKPOINT_MAX_AGE
+        )
+        .unwrap()
+        .is_none());
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM archive_source_checkpoints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

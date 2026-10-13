@@ -2382,6 +2382,35 @@ fn history_original_content(content: &str, owner_name: Option<&str>) -> Option<S
     (!content.is_empty()).then_some(content)
 }
 
+fn history_original_content_from_markup(
+    markup: &str,
+    owner_uin: &str,
+    owner_name: Option<&str>,
+) -> Option<String> {
+    let text = history_plain_text(markup);
+    static ANCHORS: OnceLock<regex::Regex> = OnceLock::new();
+    let anchors = ANCHORS.get_or_init(|| {
+        regex::Regex::new(r"(?is)<a\b(?P<attrs>[^>]*)>(?P<body>.*?)</a>")
+            .expect("fixed history author anchor regex")
+    });
+    let linked_owner = anchors.captures_iter(markup).find_map(|anchor| {
+        let attrs = anchor.name("attrs")?.as_str();
+        let name = history_plain_text(anchor.name("body")?.as_str());
+        if name.is_empty() || !text.starts_with(&name) {
+            return None;
+        }
+        let uin = ["data-uin", "link", "href"].iter().find_map(|key| {
+            history_attribute(attrs, key).and_then(|value| trailing_qq_number(&value))
+        })?;
+        Some((uin, name))
+    });
+    match linked_owner {
+        Some((uin, name)) if uin == owner_uin => history_original_content(&text, Some(&name)),
+        Some(_) => None, // A matching nickname does not make a friend's post the owner's.
+        None => history_original_content(&text, owner_name),
+    }
+}
+
 fn history_guestbook_content(content: &str) -> String {
     content
         .trim()
@@ -2463,7 +2492,7 @@ fn history_html_as_feeds(
                 })
                 .unwrap_or_else(|| actor_uin.clone());
             let (_, content_markup) = history_element(card_body, "p", "txt-box-title")?;
-            let content = history_original_content(&history_plain_text(&content_markup), owner_name)?;
+            let content = history_original_content_from_markup(&content_markup, owner_uin, owner_name)?;
             let guestbook_content = is_guestbook.then(|| history_guestbook_content(&content));
             let time_node = history_element(card_body, "div", "info-detail");
             let time_text = time_node
@@ -2557,6 +2586,19 @@ fn history_html_as_feeds(
     (scanned_count, feeds)
 }
 
+fn decode_history_response(bytes: &[u8]) -> Result<String, String> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.to_owned());
+    }
+    // The legacy interface can ignore useutf8=1; replacing invalid UTF-8 bytes
+    // would corrupt Chinese owner names before the ownership filter sees them.
+    let (text, _, errors) = encoding_rs::GB18030.decode(bytes);
+    if errors {
+        return Err("历史消息响应编码无法识别，请稍后重试".into());
+    }
+    Ok(text.into_owned())
+}
+
 pub(crate) async fn fetch_history_messages(
     state: &QLoginState,
     offset: u32,
@@ -2564,9 +2606,7 @@ pub(crate) async fn fetch_history_messages(
     owner_name: Option<&str>,
 ) -> Result<HistoryMessagePage, String> {
     let auth = state.qzone_auth().await?;
-    // The endpoint accepts a larger count while probing, but in live responses
-    // it can return an empty body for count=100. Thirty is the largest window
-    // we have verified to return the actual notification cards reliably.
+    // Keep requests small; the archive scanner advances in ten-position windows.
     let count = count.clamp(1, 30);
     let query = vec![
         ("uin", auth.uin.clone()),
@@ -2612,10 +2652,11 @@ pub(crate) async fn fetch_history_messages(
         match response {
             Ok(response) => {
                 let status = response.status();
-                let body = response
-                    .text()
+                let bytes = response
+                    .bytes()
                     .await
                     .map_err(|error| format!("读取历史消息响应失败：{error}"))?;
+                let body = decode_history_response(&bytes)?;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                     last_error = format!("HTTP {status}");
                 } else if !status.is_success() {
@@ -2631,6 +2672,7 @@ pub(crate) async fn fetch_history_messages(
                         history_html_as_feeds(&html, &auth.uin, owner_name, offset);
                     if record_count > 0
                         && owner_name.map(str::trim).is_none_or(|name| name.is_empty())
+                        && feeds.is_empty()
                     {
                         return Err(
                             "历史消息包含记录，但无法确认本人昵称；为避免错配正文，本页未写入"
@@ -2734,14 +2776,31 @@ fn parse_feed_page(value: Value) -> Result<FeedPage, String> {
         .get("vFeeds")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .ok_or("动态响应中缺少有效的 vFeeds 列表，不能确认读取结束")?;
     let attach_info = data
         .get("attachinfo")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
-    let server_has_more = data.get("hasmore").and_then(Value::as_i64).unwrap_or(0) != 0;
-    let has_more = server_has_more && !feeds.is_empty() && attach_info.is_some();
+    let has_more = match data.get("hasmore") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(value)) => {
+            value.as_i64().ok_or("动态响应中的 hasmore 标记无法识别")? != 0
+        }
+        Some(Value::String(value)) => {
+            value
+                .parse::<i64>()
+                .map_err(|_| "动态响应中的 hasmore 标记无法识别")?
+                != 0
+        }
+        Some(_) => return Err("动态响应中的 hasmore 标记无法识别".into()),
+    };
+    // Empty notification windows can still point to older records. Only the
+    // server's end marker ends pagination; a missing cursor is an error.
+    if has_more && attach_info.is_none() {
+        return Err("动态响应表示还有下一页，但缺少分页游标，不能确认读取结束".into());
+    }
     Ok(FeedPage {
         feeds,
         attach_info,
@@ -2772,6 +2831,9 @@ pub(crate) fn feed_error_can_skip(error: &str) -> bool {
 pub(crate) fn feed_error_is_transient(error: &str) -> bool {
     error.starts_with("解析空间动态失败：")
         || error.starts_with("动态响应中缺少 data")
+        || error.starts_with("动态响应中缺少有效的 vFeeds")
+        || error.starts_with("动态响应中的 hasmore")
+        || error.starts_with("动态响应表示还有下一页")
         || error.contains("HTTP 5")
         || error.contains("HTTP 429")
         || error.contains("请求超时")
@@ -3084,6 +3146,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_notification_window_keeps_the_server_next_page() {
+        for has_more in [json!(1), json!(true), json!("1")] {
+            let page = parse_feed_page(json!({"code":0,"data":{
+                "vFeeds":[],"hasmore":has_more,"attachinfo":"older-window"
+            }}))
+            .unwrap();
+            assert!(page.feeds.is_empty());
+            assert!(page.has_more);
+            assert_eq!(page.attach_info.as_deref(), Some("older-window"));
+        }
+    }
+
+    #[test]
+    fn incomplete_notification_contract_cannot_report_an_end() {
+        for data in [
+            json!({"hasmore":1,"attachinfo":"older-window"}),
+            json!({"vFeeds":null,"hasmore":0}),
+            json!({"vFeeds":[],"hasmore":1}),
+            json!({"vFeeds":[],"hasmore":true,"attachinfo":"  "}),
+            json!({"vFeeds":[],"hasmore":"unknown"}),
+        ] {
+            let error = parse_feed_page(json!({"code":0,"data":data})).unwrap_err();
+            assert!(feed_error_is_transient(&error));
+            assert!(!feed_error_can_skip(&error));
+        }
+    }
+
+    #[test]
     fn cursor_remains_server_encoded_until_query_serialization() {
         let cursor = "att=back%5Fserver%5Finfo%3Doffset%253D6&tl=123";
         let encoded =
@@ -3381,5 +3471,48 @@ mod tests {
             "QQ 空间动态接口返回错误 10001：当前游标已失效"
         ));
         assert!(!feed_error_can_skip("尚未登录 QQ 空间"));
+    }
+}
+
+#[cfg(test)]
+mod historical_author_tests {
+    use super::*;
+    #[test]
+    fn retains_linked_owner_records_after_a_nickname_change() {
+        let html = r#"<li class="f-single f-s-s" data-key="fct_22222_217_3_1700000000_1"><a class="f-name" href="https://user.qzone.qq.com/22222">访客</a><p class="txt-box-title"><a class="q_namecard" data-uin="12345">旧昵称</a>的说说：删除前留下的正文</p></li>"#;
+        for nickname in [Some("新昵称"), None] {
+            let (count, feeds) = history_html_as_feeds(html, "12345", nickname, 0);
+            assert_eq!(count, 1);
+            assert_eq!(feeds.len(), 1);
+            assert_eq!(
+                feeds[0]
+                    .pointer("/original/cell_summary/summary")
+                    .and_then(Value::as_str),
+                Some("删除前留下的正文")
+            );
+        }
+    }
+    #[test]
+    fn history_response_preserves_chinese_in_utf8_and_gbk() {
+        let response = r#"_Callback({html:'<li class="f-single f-s-s" data-key="fct_22222_217_3_1700000000_1"><p class="txt-box-title">主人昵称的说说：仍有历史残留</p></li>',opuin:'12345'});"#;
+        let (gbk, _, errors) = encoding_rs::GBK.encode(response);
+        assert!(!errors);
+        for bytes in [response.as_bytes(), gbk.as_ref()] {
+            let text = decode_history_response(bytes).unwrap();
+            let html = decode_history_html(&text).unwrap();
+            let (_, feeds) = history_html_as_feeds(&html, "12345", Some("主人昵称"), 0);
+            assert_eq!(feeds.len(), 1);
+            assert_eq!(
+                feeds[0]
+                    .pointer("/original/cell_summary/summary")
+                    .and_then(Value::as_str),
+                Some("仍有历史残留")
+            );
+        }
+    }
+    #[test]
+    fn a_friend_with_the_same_nickname_is_not_assigned_to_the_owner() {
+        let html = r#"<a class="q_namecard" data-uin="67890">同名用户</a>的说说：好友内容"#;
+        assert!(history_original_content_from_markup(html, "12345", Some("同名用户")).is_none());
     }
 }

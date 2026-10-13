@@ -47,8 +47,8 @@ let refreshTimer: number | undefined;
 /** 登出或重新加载都会让在途请求作废，否则轮询期间旧账号的概览与排行会写回界面。 */
 let loadSequence = 0;
 const storageText = computed(() => overview.value.databaseBytes < 1024 * 1024 ? `${(overview.value.databaseBytes / 1024).toFixed(1)} KB` : `${(overview.value.databaseBytes / 1024 / 1024).toFixed(1)} MB`);
-const taskSeverity = computed(() => ({ completed: "success", running: "info", error: "danger", cancelled: "warn", limited: "warn", idle: "secondary" }[progress.value.status]));
-const taskText = computed(() => ({ completed: "已完成", running: "备份中", error: "失败", cancelled: "已取消", limited: "稍后继续", idle: "未开始" }[progress.value.status]));
+const taskSeverity = computed(() => ({ completed: "success", partial: "warn", running: "info", error: "danger", cancelled: "warn", limited: "warn", idle: "secondary" }[progress.value.status]));
+const taskText = computed(() => ({ completed: "已完成", partial: "未读取完整", running: "恢复中", error: "失败", cancelled: "已取消", limited: "稍后继续", idle: "未开始" }[progress.value.status]));
 const formatTime = (seconds: number) => seconds ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(seconds * 1000)) : "时间未知";
 // 地址必须稳定：loadAvatar 用它 fetch 成 blob，带时间戳只会让每次重新加载都重下一遍头像。
 const avatarUrl = (uin: string) => `https://qlogo2.store.qq.com/qzone/${uin}/${uin}/50`;
