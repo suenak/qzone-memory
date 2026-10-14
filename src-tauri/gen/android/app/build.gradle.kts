@@ -14,6 +14,16 @@ val tauriProperties = Properties().apply {
 }
 
 android {
+    // Strip with the same NDK that builds Rust. The AGP default may not be installed
+    // locally, in which case Gradle otherwise silently packages unstripped libraries.
+    val nativeNdkPath = System.getenv("ANDROID_NDK_HOME") ?: System.getenv("NDK_HOME")
+    if (!nativeNdkPath.isNullOrBlank()) {
+        ndkPath = nativeNdkPath
+        val nativeNdkProperties = Properties().apply {
+            file("$nativeNdkPath/source.properties").inputStream().use { load(it) }
+        }
+        ndkVersion = nativeNdkProperties.getProperty("Pkg.Revision")
+    }
     compileSdk = 36
     namespace = "top.ehre.qzonearchive"
     defaultConfig {
@@ -31,15 +41,11 @@ android {
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
-            packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
-                jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
-            }
         }
         getByName("release") {
             ndk { abiFilters += setOf("arm64-v8a", "armeabi-v7a") }
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
@@ -57,9 +63,16 @@ android {
 
 // Intel targets remain available for emulator development, never for release.
 androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        // BuildType has no packaging block: a nested block there affects every variant.
+        variant.packaging.jniLibs.keepDebugSymbols.addAll(setOf("*/arm64-v8a/*.so", "*/armeabi-v7a/*.so", "*/x86/*.so", "*/x86_64/*.so"))
+    }
     onVariants(selector().withBuildType("release")) { variant ->
         // Apply exclusions per release variant; android.packaging would affect Debug too.
         variant.packaging.jniLibs.excludes.addAll(setOf("**/x86/**", "**/x86_64/**"))
+        // APKs are distributed directly. Compress native libraries to reduce download size;
+        // Android extracts them at installation, so installed disk use may be higher.
+        variant.packaging.jniLibs.useLegacyPackaging.set(true)
     }
     beforeVariants(selector().withBuildType("release")) { variant ->
         if (variant.productFlavors.any { (dimension, flavor) -> dimension == "abi" && flavor in setOf("x86", "x86_64") }) {

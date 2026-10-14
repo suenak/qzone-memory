@@ -53,3 +53,10 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service"] }
+
+# Shared by desktop and mobile release builds; keep unwinding behavior unchanged.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
