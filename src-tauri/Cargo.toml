@@ -1,6 +1,6 @@
 [package]
 name = "qzonearchive"
-version = "1.2.6"
+version = "1.2.7"
 description = "将 QQ 空间动态、照片、视频与互动记录安全归档到本地"
 authors = ["suenak <85518392+suenak@users.noreply.github.com>"]
 edition = "2021"
@@ -53,3 +53,10 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service"] }
+
+# Shared by desktop and mobile release builds; keep unwinding behavior unchanged.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
