@@ -42,8 +42,7 @@ const CREDENTIAL_ACCOUNT: &str = "qq-login-session";
 /// 会话被登出/切换账号打断时的统一提示文案。
 const LOGIN_CANCELLED: &str = "登录已被取消";
 /// 恢复会话真正需要的最小 Cookie 集合，指纹与统计类 Cookie（`_qimei_*`、`fqm_*`、
-/// `pgv_*`、`RK` 等）留在内存里即可。持久化与前端凭证下发共用这一份白名单，
-/// 避免两处漂移导致某一侧漏出多余凭证。
+/// `pgv_*`、`RK` 等）留在内存里即可。前端只接收账号标识，不接收会话凭证。
 const SESSION_COOKIE_WHITELIST: &[&str] =
     &["uin", "skey", "p_uin", "pt4_token", "p_skey", "pt2gguin"];
 
@@ -343,11 +342,8 @@ pub struct QrLoginStart {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LoginCredentials {
+pub struct LoginIdentity {
     uin: String,
-    g_tk: i64,
-    cookies: HashMap<String, String>,
-    user_agent: String,
 }
 
 #[derive(Serialize)]
@@ -355,7 +351,7 @@ pub struct LoginCredentials {
 pub struct LoginStatus {
     status: &'static str,
     message: String,
-    auth: Option<LoginCredentials>,
+    auth: Option<LoginIdentity>,
 }
 
 fn unix_millis() -> u128 {
@@ -469,6 +465,34 @@ mod tests {
         assert!(persisted.cookies.contains_key("skey"));
         for name in ["_qimei_fingerprint", "fqm_pvqid", "pgv_pvid", "RK"] {
             assert!(!persisted.cookies.contains_key(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn login_status_exposes_only_the_account_identity() {
+        let session = LoginSession {
+            uin: Some("12345678".into()),
+            g_tk: Some(123),
+            cookies: HashMap::from([("p_skey".into(), "secret-session-key".into())]),
+            user_agent: "private-agent".into(),
+            ..Default::default()
+        };
+        let status = super::LoginStatus {
+            status: "success",
+            message: "ok".into(),
+            auth: super::login_identity(&session),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["auth"], serde_json::json!({"uin":"12345678"}));
+        let encoded = value.to_string();
+        for secret in [
+            "secret-session-key",
+            "private-agent",
+            "gTk",
+            "cookies",
+            "userAgent",
+        ] {
+            assert!(!encoded.contains(secret));
         }
     }
 
@@ -640,7 +664,7 @@ async fn fetch_login_sig(
         .query(&params)
         .send()
         .await
-        .map_err(|e| format!("xlogin 请求失败: {e}"))?;
+        .map_err(|e| format!("xlogin 请求失败: {}", e.without_url()))?;
     if !response.status().is_success() {
         return Err(format!("xlogin 返回 HTTP {}", response.status()));
     }
@@ -676,15 +700,14 @@ fn is_trusted_login_url(value: &str) -> bool {
     })
 }
 
-fn login_credentials(session: &LoginSession) -> Option<LoginCredentials> {
-    let uin = session.uin.clone()?;
-    let g_tk = session.g_tk?;
-    Some(LoginCredentials {
-        uin,
-        g_tk,
-        // 与持久化共用同一份最小 Cookie 白名单，避免两处各写一份后逐渐漂移。
-        cookies: allowed_session_cookies(&session.cookies),
-        user_agent: session.user_agent.clone(),
+fn login_identity(session: &LoginSession) -> Option<LoginIdentity> {
+    session.g_tk?;
+    session
+        .cookies
+        .get("p_skey")
+        .filter(|value| !value.trim().is_empty())?;
+    Some(LoginIdentity {
+        uin: session.uin.clone()?,
     })
 }
 
@@ -750,7 +773,7 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
         ])
         .send()
         .await
-        .map_err(|error| format!("获取登录二维码失败：{error}"))?;
+        .map_err(|error| format!("获取登录二维码失败：{}", error.without_url()))?;
     if !response.status().is_success() {
         return Err(format!("获取登录二维码失败：HTTP {}", response.status()));
     }
@@ -824,7 +847,7 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
     let image = response
         .bytes()
         .await
-        .map_err(|error| format!("读取二维码失败：{error}"))?;
+        .map_err(|error| format!("读取二维码失败：{}", error.without_url()))?;
     *state.session.lock().await = Some(LoginSession {
         ptqrtoken: ptqr_token(&qrsig),
         cookies,
@@ -873,12 +896,12 @@ pub async fn poll_qr_login(
         ])
         .send()
         .await
-        .map_err(|error| format!("检查扫码状态失败：{error}"))?;
+        .map_err(|error| format!("检查扫码状态失败：{}", error.without_url()))?;
     merge_response_cookies(&response, &mut session.cookies);
     let text = response
         .text()
         .await
-        .map_err(|error| format!("读取扫码状态失败：{error}"))?;
+        .map_err(|error| format!("读取扫码状态失败：{}", error.without_url()))?;
 
     if text.contains("'66'") || text.contains("二维码未失效") {
         return Ok(LoginStatus {
@@ -926,7 +949,7 @@ pub async fn poll_qr_login(
         .header(COOKIE, cookie_header(&session.cookies))
         .send()
         .await
-        .map_err(|error| format!("确认 QQ 登录失败：{error}"))?;
+        .map_err(|error| format!("确认 QQ 登录失败：{}", error.without_url()))?;
     merge_response_cookies(&response, &mut session.cookies);
     let uin = normalized_uin(&callback_uin);
     let p_skey = session
@@ -941,10 +964,10 @@ pub async fn poll_qr_login(
     // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
     let warmup_ua = session.user_agent.clone();
     warmup_qzone_session(&state.client, &mut session.cookies, &warmup_ua, &uin).await;
-    let auth = login_credentials(session).ok_or("登录凭证不完整")?;
+    let auth = login_identity(session).ok_or("登录凭证不完整")?;
     let persistence_result = state.persist_session(session, epoch).await;
     if matches!(&persistence_result, Err(reason) if reason.as_str() == LOGIN_CANCELLED) {
-        // 会话已在扫码期间被登出/切换：既不写回凭据库，也不把凭证交给前端。
+        // 会话已在扫码期间被登出/切换：既不写回凭据库，也不把旧账号状态交给前端。
         return Ok(LoginStatus {
             status: "loggedOut",
             message: LOGIN_CANCELLED.into(),
@@ -968,7 +991,7 @@ pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<Lo
     state.restore_session().await?;
     let guard = state.session.lock().await;
     if let Some(session) = guard.as_ref() {
-        if let Some(auth) = login_credentials(session) {
+        if let Some(auth) = login_identity(session) {
             return Ok(LoginStatus {
                 status: "success",
                 message: "已恢复上次登录".into(),
@@ -1110,7 +1133,7 @@ pub async fn check_web_login(
         ..Default::default()
     };
 
-    let auth = login_credentials(&session).ok_or("登录凭证不完整")?;
+    let auth = login_identity(&session).ok_or("登录凭证不完整")?;
     let persistence_result = state.persist_session(&session, epoch).await;
     if matches!(&persistence_result, Err(reason) if reason.as_str() == LOGIN_CANCELLED) {
         // 校验期间用户已登出：不写回凭据库，也不把这次登录写进内存会话。
@@ -1238,7 +1261,7 @@ pub async fn check_web_login(
         &uin,
     )
     .await;
-    let auth = login_credentials(&session).ok_or("登录信息不完整")?;
+    let auth = login_identity(&session).ok_or("登录信息不完整")?;
     let mut current = state.session.lock().await;
     if epoch != state.session_epoch() {
         return Err(LOGIN_CANCELLED.into());
@@ -1313,3 +1336,6 @@ mod native_login_tests {
         assert!(!session.cookies.contains_key("tracking"));
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+mod live_tests;

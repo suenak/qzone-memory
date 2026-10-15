@@ -1046,19 +1046,7 @@ pub async fn load_recycle_photo_preview(
     if !response.status().is_success() {
         return Err(format!("读取照片缩略图失败：HTTP {}", response.status()));
     }
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("image/jpeg")
-        .split(';')
-        .next()
-        .unwrap_or("image/jpeg")
-        .to_owned();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("读取照片缩略图失败：{error}"))?;
+    let (content_type, bytes) = crate::media_http::image_body(response, 16 * 1024 * 1024).await?;
     Ok(format!(
         "data:{content_type};base64,{}",
         BASE64.encode(bytes)
@@ -2110,26 +2098,7 @@ fn history_record_hash(parts: &[&str]) -> u64 {
 }
 
 fn decode_history_html(response: &str) -> Result<String, String> {
-    let capture = regex::Regex::new(r"(?s)html\s*:\s*'(.*)',\s*opuin")
-        .expect("fixed history response regex")
-        .captures(response)
-        .and_then(|captures| captures.get(1))
-        .ok_or("历史消息响应中缺少 html 数据")?;
-    let hex = regex::Regex::new(r"\\x([0-9a-fA-F]{2})").expect("fixed hex escape regex");
-    let decoded = hex.replace_all(capture.as_str(), |captures: &regex::Captures<'_>| {
-        u8::from_str_radix(&captures[1], 16)
-            .map(char::from)
-            .unwrap_or('\u{fffd}')
-            .to_string()
-    });
-    Ok(decoded
-        .replace("\\/", "/")
-        .replace("\\'", "'")
-        .replace("\\\"", "\"")
-        .replace("\\t", " ")
-        .replace("\\r", " ")
-        .replace("\\n", "\n")
-        .replace("\\\\", "\\"))
+    crate::history_response::html(response)
 }
 
 /// 解析一页历史卡片会对同一组属性名/标签重复构造正则（30 张卡片可达数百次），
@@ -2652,20 +2621,12 @@ pub(crate) async fn fetch_history_messages(
         match response {
             Ok(response) => {
                 let status = response.status();
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|error| format!("读取历史消息响应失败：{error}"))?;
+                let bytes = crate::media_http::bounded_body(response, 4 * 1024 * 1024).await?;
                 let body = decode_history_response(&bytes)?;
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                     last_error = format!("HTTP {status}");
                 } else if !status.is_success() {
                     return Err(format!("获取历史消息失败：HTTP {status}"));
-                } else if !body.contains("html") {
-                    return Err(format!(
-                        "历史消息接口返回异常：{}",
-                        body.chars().take(120).collect::<String>()
-                    ));
                 } else {
                     let html = decode_history_html(&body)?;
                     let (record_count, feeds) =

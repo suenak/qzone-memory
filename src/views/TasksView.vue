@@ -93,10 +93,10 @@ const statusDescription = computed(() => ({
   idle: "开始后会逐页读取空间记录，保存到本机。",
   running: "正在读取并保存。请保持应用运行，不要切换 QQ 账号。",
   completed: "本轮读取已结束，可到「说说」查看结果。",
-  partial: "已保存的内容会保留。请查看下方说明后继续读取。",
+  partial: "已找到的内容已保存，可稍后继续读取。",
   cancelled: "已保存的内容会保留，下次可继续恢复。",
   limited: "QQ 空间暂时限制了请求。等待倒计时结束后，点击「继续恢复」。",
-  error: "已保存的内容会保留。请查看错误提示后重试。",
+  error: "已保存的内容会保留，可以查看原因后重试。",
 }[progress.value.status]));
 
 /** 操作按钮文案：把「现在能不能点、点了会发生什么」写在按钮上。 */
@@ -229,6 +229,7 @@ onBeforeUnmount(() => clearInterval(timer));
     <ArchiveHeading title="恢复任务" description="查找说说和互动记录。离开此页不会停止任务。" :icon="Archive" />
     <!-- ------------------------------------------------------- 任务状态卡 -->
     <SectionCard
+      class="task-card"
       title="恢复说说"
       description="查找仍可读取的互动记录，尝试还原说说并保存到本机。"
     >
@@ -237,9 +238,9 @@ onBeforeUnmount(() => clearInterval(timer));
           <span class="status-chip__dot" aria-hidden="true" />
           {{ statusText }}
         </span>
-        <button class="ghost-button" type="button" :disabled="refreshing" @click="refresh">
+        <button class="ghost-button" type="button" aria-label="刷新进度" :disabled="refreshing" @click="refresh">
           <RefreshCw :size="16" :stroke-width="1.8" />
-          <span class="ghost-button__text">刷新进度</span>
+          <span class="ghost-button__text">刷新</span>
         </button>
       </template>
 
@@ -272,14 +273,14 @@ onBeforeUnmount(() => clearInterval(timer));
         </div>
 
         <!-- 进度没有总任务量，因此只做不确定进度提示，不画百分比进度条。 -->
-        <div v-if="running || rateLimited" class="indeterminate" role="progressbar" aria-label="备份进行中" aria-valuetext="无法预估剩余量">
+        <div v-if="running || rateLimited" class="indeterminate" role="progressbar" aria-label="恢复任务进度" aria-valuetext="无法预估剩余量">
           <span class="indeterminate__bar" />
         </div>
 
-        <p v-show="detailsOpen || progress.status === 'partial' || progress.status === 'error'" class="engine-message">
-          <Info :size="14" :stroke-width="1.8" aria-hidden="true" />
-          <span>{{ diagnosticError(progress.message) }}</span>
-        </p>
+        <details v-if="progress.message && progress.status !== 'idle'" class="task-message">
+          <summary><Info :size="15" :stroke-width="1.8" /><span>{{ progress.status === 'partial' || progress.status === 'error' ? '查看原因和读取详情' : '查看本轮读取详情' }}</span><ChevronDown :size="15" :stroke-width="1.8" /></summary>
+          <p class="engine-message">{{ diagnosticError(progress.message) }}</p>
+        </details>
 
         <div v-if="rateWaiting" class="notice is-warning">
           <span class="notice__icon" aria-hidden="true">
@@ -323,7 +324,7 @@ onBeforeUnmount(() => clearInterval(timer));
 
       <template #footer>
         <div class="action-bar">
-          <div class="action-bar__buttons">
+          <div class="action-bar__buttons" :class="{ 'is-running': running }">
             <Button :label="startLabel" :loading="starting" :disabled="running || rateWaiting || !loggedIn || !licenseStore.canArchive" @click="start" ><template #icon><Download :size="16" :stroke-width="1.8" /></template></Button>
             <Button v-if="running" label="停止恢复" severity="secondary" outlined :loading="stopping" @click="cancel" ><template #icon><X :size="16" :stroke-width="1.8" /></template></Button>
             <button
@@ -334,7 +335,7 @@ onBeforeUnmount(() => clearInterval(timer));
               @click="detailsOpen = !detailsOpen"
             >
               <ListChecks :size="16" :stroke-width="1.8" />
-              <span class="ghost-button__text">运行详情</span>
+              <span class="ghost-button__text">跳页记录</span>
               <span v-if="skipBadge" class="ghost-button__badge">{{ skipBadge }}</span>
               <ChevronDown class="ghost-button__chevron" :class="{ 'is-open': detailsOpen }" :size="15" :stroke-width="1.8" />
             </button>
@@ -427,7 +428,7 @@ onBeforeUnmount(() => clearInterval(timer));
     </div>
 
     <!-- ------------------------------------------------------------ 使用提示 -->
-    <SectionCard title="备份须知">
+    <SectionCard title="恢复前请了解">
       <ul class="tips">
         <li>
           <span class="tips__icon" aria-hidden="true"><KeyRound :size="16" :stroke-width="1.8" /></span>
@@ -1013,5 +1014,41 @@ onBeforeUnmount(() => clearInterval(timer));
   .notice.is-accent { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; }
   .notice.is-accent > .p-button { grid-column:1 / -1; width:100%; }
   .notice__copy { overflow-wrap:anywhere; }
+}
+
+.task-message { margin-top:var(--space-3); border:var(--line-width) solid var(--color-border); border-radius:var(--radius-md); }
+.task-message summary { display:flex; align-items:center; gap:var(--space-2); padding:var(--space-3); min-height:var(--touch-target); cursor:pointer; color:var(--color-text-secondary); font-size:var(--text-sm); list-style:none; }
+.task-message summary::-webkit-details-marker { display:none; }
+.task-message summary > span { flex:1; }
+.task-message[open] summary > svg:last-child { transform:rotate(180deg); }
+.task-message .engine-message { display:block; padding:0 var(--space-3) var(--space-3); margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+@media(max-width:860px) {
+ .task-card :deep(.qza-card__head) { flex-wrap:nowrap; align-items:center; padding:var(--space-3) var(--space-4); gap:var(--space-2); }
+ .task-card :deep(.qza-card__description) { display:none; }
+ .task-card :deep(.qza-card__actions) { flex-shrink:0; }
+ .task-card :deep(.qza-card__body),.task-card :deep(.qza-card__foot) { padding:var(--space-4); }
+ .status-panel { padding:var(--space-3); gap:var(--space-3); }
+ .status-panel__icon { width:var(--space-8); height:var(--space-8); }
+ .status-panel__copy strong { font-size:var(--text-lg); line-height:var(--leading-tight); }
+ .status-panel__copy p { font-size:var(--text-sm); line-height:var(--leading-normal); }
+ .status-panel.is-warning { border-left-color:var(--color-warning); }
+ .status-panel.is-danger { border-left-color:var(--color-danger); }
+ .status-panel.is-success { border-left-color:var(--color-success); }
+ .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); margin-top:var(--space-3); gap:var(--space-2); }
+ .stat-grid :deep(.qza-stat) { padding:var(--space-3); gap:var(--space-2); }
+ .stat-grid :deep(.qza-stat__icon) { width:var(--space-6); height:var(--space-6); }
+ .stat-grid :deep(.qza-stat__hint) { display:none; }
+ .stat-grid :deep(.qza-stat__value) { font-size:var(--text-xl); }
+ .action-bar { gap:var(--space-4); padding-top:0; border-top:0; }
+ .action-bar__buttons { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; gap:var(--space-2); }
+ .action-bar__buttons > .p-button:first-child { grid-column:1 / -1; }
+ .action-bar__buttons > :last-child:not(.p-button) { grid-column:1 / -1; }
+ .action-bar__buttons.is-running > :last-child { grid-column:auto; }
+ .ghost-button__text { display:inline; }
+ .interval-field { gap:var(--space-2); border-top:var(--line-width) solid var(--color-border); padding-top:var(--space-3); }
+ .interval-field label { flex-basis:auto; flex:1; }
+ .interval-field :deep(.p-inputnumber) { width:calc(var(--touch-target) * 3); }
+ .interval-field small { flex-basis:100%; }
+ .notice { padding:var(--space-3); }
 }
 </style>

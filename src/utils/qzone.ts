@@ -82,6 +82,7 @@ export const listQzoneLibrary = (module: LibraryModule, parentKey?: string, quer
 export const listQzoneLibraryYears = (module: LibraryModule, parentKey?: string) =>
   invoke<number[]>("list_qzone_library_years", { module, parentKey });
 
+export const loadLibraryCover = (id: number) => invoke<string>("load_library_cover", { id });
 export const loadLibraryMedia = (id: number) => invoke<{path: string; isVideo: boolean}>("load_library_media", {id});
 
 export const listLocalAccounts = () => invoke<{uin: string; selected: boolean}[]>("list_local_accounts");

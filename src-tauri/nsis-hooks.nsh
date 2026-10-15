@@ -10,6 +10,37 @@
 ; 缓存目录在 %LOCALAPPDATA%\top.ehre.qzonearchive。标识符见 tauri.conf.json。
 ; 标识符改了就同步改这里，否则卸载时会删错目录（或漏删）。
 
+; Only rename links pointing at this installation; never touch another app's shortcut.
+!macro QZA_RENAME_LEGACY_SHORTCUT oldPath newPath
+  !insertmacro IsShortcutTarget "${oldPath}" "$INSTDIR\${MAINBINARYNAME}.exe"
+  Pop $0
+  ${If} $0 = 1
+    ${IfNot} ${FileExists} "${newPath}"
+      Rename "${oldPath}" "${newPath}"
+    ${Else}
+      !insertmacro IsShortcutTarget "${newPath}" "$INSTDIR\${MAINBINARYNAME}.exe"
+      Pop $0
+      ${If} $0 = 1
+        Delete "${oldPath}"
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  !insertmacro QZA_RENAME_LEGACY_SHORTCUT "$SMPROGRAMS\$AppStartMenuFolder\qzone-memory.lnk" "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+  !insertmacro QZA_RENAME_LEGACY_SHORTCUT "$SMPROGRAMS\qzone-memory.lnk" "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+  !insertmacro QZA_RENAME_LEGACY_SHORTCUT "$DESKTOP\qzone-memory.lnk" "$DESKTOP\${PRODUCTNAME}.lnk"
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
 !macro NSIS_HOOK_PREUNINSTALL
   ; 静默卸载（/S）没有交互条件，走保留分支。
   IfSilent uninstall_keep_data

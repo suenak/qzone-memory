@@ -4,7 +4,7 @@ import Dialog from "primevue/dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { describeError, diagnosticError } from "../utils/uiError";
 import { useAuthStore } from "../stores/auth";
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import InputText from "primevue/inputtext";
 import Paginator, { type PageState } from "primevue/paginator";
@@ -28,9 +28,10 @@ import EmptyState from "../components/ui/EmptyState.vue";
 import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import { useToast } from "../composables/useToast";
-import { loadRemoteImageBlob, mediaFileName } from "../utils/archiveImage";
+import { ImageRequestScope, mediaFileName } from "../utils/archiveImage";
 import {
   loadLibraryMedia,
+  loadLibraryCover,
   linkLibraryVideo,
   listQzoneLibrary,
   listQzoneLibraryYears,
@@ -53,6 +54,8 @@ const loading = ref(false);
 const syncing = ref(false);
 const error = ref("");
 const notice = ref("");
+let coverObserver: IntersectionObserver | undefined;
+const imageRequests = new ImageRequestScope();
 const imageSources = reactive<Record<number, string>>({});
 const failedGuestbookAvatars = reactive(new Set<number>());
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -201,15 +204,41 @@ const previewEntries = computed<PreviewEntry[]>(() => {
 const lightboxEntry = computed(() => (lightboxIndex.value >= 0 ? previewEntries.value[lightboxIndex.value] : undefined));
 
 function releaseImages() {
+  coverObserver?.disconnect();
+  coverLoading.clear();
+  imageRequests.clear();
   mediaSequence += 1;
   Object.keys(originalSources).forEach(key => delete originalSources[Number(key)]);
   Object.keys(originalErrors).forEach(key => delete originalErrors[Number(key)]);
   Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
   Object.keys(imageSources).forEach((key) => delete imageSources[Number(key)]);
 }
+function observeCovers() {
+  coverObserver?.disconnect();
+  coverObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const id = Number((entry.target as HTMLElement).dataset.libraryCover);
+      const item = items.value.find((item) => item.id === id);
+      if (item) void ensureCover(item);
+      coverObserver?.unobserve(entry.target);
+    }
+  }, { rootMargin: "240px 0px" });
+  document.querySelectorAll<HTMLElement>(".library [data-library-cover]").forEach((element) => coverObserver?.observe(element));
+}
 async function loadCover(item: LibraryItem) {
   if (!item.coverUrl || imageSources[item.id]) return;
-  try { imageSources[item.id] = await loadRemoteImageBlob(item.coverUrl); } catch { /* card keeps its media placeholder */ }
+  const generation = imageRequests.generation;
+  try {
+    let source: string;
+    try { source = convertFileSrc(await loadLibraryCover(item.id)); }
+    catch {
+      if (generation !== imageRequests.generation) return;
+      source = await imageRequests.load(item.coverUrl);
+    }
+    if (generation === imageRequests.generation) imageSources[item.id] = source;
+    else URL.revokeObjectURL(source);
+  } catch { /* card keeps its media placeholder */ }
 }
 async function load() {
   const sequence = ++loadSequence;
@@ -226,7 +255,8 @@ async function load() {
     items.value = result.items;
     years.value = availableYears;
     failedGuestbookAvatars.clear();
-    void Promise.allSettled(result.items.map(loadCover));
+    await nextTick();
+    if (sequence === loadSequence) observeCovers();
   } catch (reason) {
     if (sequence === loadSequence) error.value = String(reason);
   } finally {
@@ -345,8 +375,9 @@ function changePage(event: PageState) { first.value = event.first; pageSize.valu
 /** 包装已有 loadCover：只补一个「加载中」标记，不改变原来的取图方式。 */
 async function ensureCover(item: LibraryItem) {
   if (!item.coverUrl || imageSources[item.id] || coverLoading.has(item.id)) return;
+  const generation = imageRequests.generation;
   coverLoading.add(item.id);
-  try { await loadCover(item); } finally { coverLoading.delete(item.id); }
+  try { await loadCover(item); } finally { if (generation === imageRequests.generation) coverLoading.delete(item.id); }
 }
 
 async function reloadCover(item: LibraryItem) {
@@ -407,6 +438,7 @@ watch(query, () => {
 watch(items, () => { lightboxIndex.value = -1; });
 
 onBeforeUnmount(() => {
+  ++loadSequence;
   if (searchTimer) clearTimeout(searchTimer);
   releaseImages();
 
@@ -565,7 +597,7 @@ onBeforeUnmount(() => {
 
     <section v-else-if="items.length" class="library__grid" :class="`is-${module}`">
       <SectionCard v-for="item in items" :key="item.id" flush class="tile">
-        <div class="tile__visual">
+        <div class="tile__visual" :data-library-cover="item.coverUrl ? item.id : undefined">
           <img
             v-if="imageSources[item.id]"
             :src="imageSources[item.id]"
@@ -582,12 +614,12 @@ onBeforeUnmount(() => {
             <span v-if="coverLoading.has(item.id)" class="tile__blank-text">正在加载封面…</span>
             <button v-else-if="item.coverUrl" class="link tile__retry" type="button" @click.stop="reloadCover(item)">
               <RefreshCw :size="14" :stroke-width="1.8" />
-              <span>封面未加载，重试</span>
+              <span>{{ module === 'albums' ? '重试封面' : '封面未加载，重试' }}</span>
             </button>
             <span v-else class="tile__blank-text">没有封面图</span>
           </div>
 
-          <span v-if="item.mediaUrls.length" class="tile__badge" :title="`${item.mediaUrls.length} 个媒体地址`">
+          <span v-if="item.mediaUrls.length && module !== 'albums'" class="tile__badge" :title="`${item.mediaUrls.length} 个媒体地址`">
             {{ item.mediaUrls.length }}
           </span>
           <span v-if="module === 'videos'" class="tile__play" aria-hidden="true">
@@ -614,7 +646,7 @@ onBeforeUnmount(() => {
             <span>{{ formatTime(item.createdAt) }}</span>
           </p>
 
-          <p v-if="item.summary" class="tile__summary selectable" :class="{ 'is-expanded': expandedEntries.has(item.id) }">{{ item.summary }}</p>
+          <p v-if="item.summary && item.summary.trim() !== item.title.trim()" class="tile__summary selectable" :class="{ 'is-expanded': expandedEntries.has(item.id) }">{{ item.summary }}</p>
           <button v-if="item.summary.length > 120" class="link" type="button" :aria-expanded="expandedEntries.has(item.id)" @click="expandedEntries.has(item.id) ? expandedEntries.delete(item.id) : expandedEntries.add(item.id)">{{ expandedEntries.has(item.id) ? '收起' : '展开全文' }}</button>
 
           <div class="tile__foot">
@@ -663,28 +695,27 @@ onBeforeUnmount(() => {
       :page-link-size="3"
       @page="changePage"
     />
+    <!-- --------------------------------------------------------------- 灯箱 -->
+    <ImageViewer v-if="lightboxEntry" :src="originalSources[lightboxEntry.id] || (!mediaOpening.has(lightboxEntry.id) ? imageSources[lightboxEntry.id] : undefined)" :name="mediaFileName(lightboxEntry.item.createdAt, lightboxEntry.title)" :title="lightboxEntry.title" :index="lightboxIndex" :total="previewEntries.length" :loading="mediaOpening.has(lightboxEntry.id)" :error="originalErrors[lightboxEntry.id]" @close="closeLightbox" @step="stepLightbox" @retry="retryOriginal" @saved="toast.success('图片已保存')" @error="toast.error($event)">
+      <p v-if="originalErrors[lightboxEntry.id]" role="status">{{ originalErrors[lightboxEntry.id] }} · 当前显示预览图</p>
+      <button v-if="lightboxEntry.item.isVideo" type="button" class="btn btn--ghost" @click="openMedia(lightboxEntry.item)">播放视频</button>
+    </ImageViewer>
+    <Dialog v-model:visible="videoVisible" modal :draggable="false" :header="videoTitle || '播放视频'" class="library-video-dialog">
+      <video v-if="videoSource" :src="videoSource" controls autoplay playsinline preload="metadata" @error="videoError = '当前设备无法播放这个视频格式，已保存的文件会保留。'" />
+      <p v-else-if="!videoError" role="status">正在读取视频…</p>
+      <button v-if="videoSource && activeVideoItem?.module === 'photos'" type="button" class="btn btn--ghost" @click="videoVisible = false; chooseVideo()">更换对应视频</button>
+      <p v-if="videoError" role="status">{{ videoError }}</p>
+      <div v-if="videoError && !mediaOpening.has(activeVideoItem?.id || 0)" class="video-recovery"><button type="button" class="btn btn--ghost" @click="showVideoCover">查看封面</button><button v-if="activeVideoItem?.module === 'photos'" type="button" class="btn btn--ghost" @click="videoVisible = false; chooseVideo()">选择对应视频</button><button v-if="activeVideoItem" type="button" class="btn btn--ghost" @click="openMedia(activeVideoItem)">重试播放</button></div>
+    </Dialog>
+    <Dialog v-model:visible="videoChoicesVisible" modal :draggable="false" header="选择对应视频" class="library-video-dialog">
+      <p>这条相册记录没有保留明确的视频标识。请从本账号已保存的视频中选择对应内容。</p>
+      <InputText v-model="videoChoiceQuery" placeholder="输入视频标题搜索" aria-label="搜索对应视频" @input="choiceOffset = 0; loadVideoChoices()" />
+      <div class="video-choices"><button v-for="video in videoChoices" :key="video.id" type="button" class="btn btn--ghost" :disabled="linkingVideo" @click="confirmVideoChoice(video)">{{ video.title }} · {{ formatTime(video.createdAt) }}</button></div>
+      <Paginator v-if="choicesTotal > 50" :first="choiceOffset" :rows="50" :total-records="choicesTotal" template="PrevPageLink CurrentPageReport NextPageLink" @page="choiceOffset = $event.first; loadVideoChoices()" />
+      <p v-if="choicesLoading" role="status">正在读取视频列表…</p>
+      <p v-else-if="!videoChoices.length">没有找到视频，可先到「视频」页面备份列表，或换个关键词。</p>
+    </Dialog>
   </div>
-
-  <!-- --------------------------------------------------------------- 灯箱 -->
-  <ImageViewer v-if="lightboxEntry" :src="originalSources[lightboxEntry.id] || (!mediaOpening.has(lightboxEntry.id) ? imageSources[lightboxEntry.id] : undefined)" :name="mediaFileName(lightboxEntry.item.createdAt, lightboxEntry.title)" :title="lightboxEntry.title" :index="lightboxIndex" :total="previewEntries.length" :loading="mediaOpening.has(lightboxEntry.id)" :error="originalErrors[lightboxEntry.id]" @close="closeLightbox" @step="stepLightbox" @retry="retryOriginal" @saved="toast.success('图片已保存')" @error="toast.error($event)">
-    <p v-if="originalErrors[lightboxEntry.id]" role="status">{{ originalErrors[lightboxEntry.id] }} · 当前显示预览图</p>
-    <button v-if="lightboxEntry.item.isVideo" type="button" class="btn btn--ghost" @click="openMedia(lightboxEntry.item)">播放视频</button>
-  </ImageViewer>
-  <Dialog v-model:visible="videoVisible" modal :draggable="false" :header="videoTitle || '播放视频'" class="library-video-dialog">
-    <video v-if="videoSource" :src="videoSource" controls autoplay playsinline preload="metadata" @error="videoError = '当前设备无法播放这个视频格式，已保存的文件会保留。'" />
-    <p v-else-if="!videoError" role="status">正在读取视频…</p>
-    <button v-if="videoSource && activeVideoItem?.module === 'photos'" type="button" class="btn btn--ghost" @click="videoVisible = false; chooseVideo()">更换对应视频</button>
-    <p v-if="videoError" role="status">{{ videoError }}</p>
-    <div v-if="videoError && !mediaOpening.has(activeVideoItem?.id || 0)" class="video-recovery"><button type="button" class="btn btn--ghost" @click="showVideoCover">查看封面</button><button v-if="activeVideoItem?.module === 'photos'" type="button" class="btn btn--ghost" @click="videoVisible = false; chooseVideo()">选择对应视频</button><button v-if="activeVideoItem" type="button" class="btn btn--ghost" @click="openMedia(activeVideoItem)">重试播放</button></div>
-  </Dialog>
-  <Dialog v-model:visible="videoChoicesVisible" modal :draggable="false" header="选择对应视频" class="library-video-dialog">
-    <p>这条相册记录没有保留明确的视频标识。请从本账号已保存的视频中选择对应内容。</p>
-    <InputText v-model="videoChoiceQuery" placeholder="输入视频标题搜索" aria-label="搜索对应视频" @input="choiceOffset = 0; loadVideoChoices()" />
-    <div class="video-choices"><button v-for="video in videoChoices" :key="video.id" type="button" class="btn btn--ghost" :disabled="linkingVideo" @click="confirmVideoChoice(video)">{{ video.title }} · {{ formatTime(video.createdAt) }}</button></div>
-    <Paginator v-if="choicesTotal > 50" :first="choiceOffset" :rows="50" :total-records="choicesTotal" template="PrevPageLink CurrentPageReport NextPageLink" @page="choiceOffset = $event.first; loadVideoChoices()" />
-    <p v-if="choicesLoading" role="status">正在读取视频列表…</p>
-    <p v-else-if="!videoChoices.length">没有找到视频，可先到「视频」页面备份列表，或换个关键词。</p>
-  </Dialog>
 </template>
 
 <style scoped>
@@ -1317,7 +1348,7 @@ onBeforeUnmount(() => {
   aspect-ratio: var(--tile-ratio, 4 / 3);
   overflow: hidden; background:var(--color-photo-mat); }
 .tile__retry {
-  font-size: var(--text-xs); position:relative; z-index:1; }
+  font-size: var(--text-xs); position:relative; z-index:2; }
 .tile { transition:border-color var(--duration-fast) var(--ease-out),box-shadow var(--duration-fast) var(--ease-out); }
 .tile:hover { border-color:var(--color-accent-border); box-shadow:var(--shadow-sm); }
 .guest {
@@ -1349,4 +1380,29 @@ onBeforeUnmount(() => {
 .tile:hover { box-shadow:var(--shadow-xs); }
 .guest { background:var(--color-surface); }
 @media(max-width:600px) { .library__head { gap:var(--space-4); } .library__action { align-items:stretch; } .library__action .btn { width:100%; } }
+
+@media(max-width:860px) {
+ .library__head { gap:var(--space-3); }
+ .library__action { gap:var(--space-1); }
+ .library__sync-hint { font-size:var(--text-xs); }
+ .library__toolbar { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:var(--space-2); }
+ .library__search { grid-column:1 / -1; min-height:var(--touch-target); height:auto; }
+ .library__select { min-width:0; max-width:none; width:100%; }
+ .library__search :deep(.p-inputtext),.library__select { min-height:var(--touch-target); }
+ .library__count { grid-column:1 / -1; }
+ .library__grid.is-albums { grid-template-columns:minmax(0,1fr); }
+ .is-albums .tile :deep(.qza-card__body) { display:grid; grid-template-columns:var(--layout-mobile-album-cover) minmax(0,1fr); padding:var(--space-3); gap:var(--space-3); }
+ .is-albums .tile__visual { width:var(--layout-mobile-album-cover); aspect-ratio:1; border-radius:var(--radius-md); align-self:start; }
+ .is-albums .tile__skeleton { aspect-ratio:1; height:var(--layout-mobile-album-cover); }
+ .is-albums .tile__body { padding:0; min-width:0; gap:var(--space-1); }
+ .is-albums .tile__title { font-size:var(--text-base); line-height:var(--leading-normal); overflow-wrap:anywhere; white-space:normal; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+ .is-albums .tile__summary { font-size:var(--text-xs); -webkit-line-clamp:2; }
+ .is-albums .tile__summary.is-expanded { display:block; }
+ .is-albums .tile__foot { margin-top:auto; padding-top:0; border-top:0; }
+ .is-albums .tile__foot > span { display:none; }
+ .is-albums .tile__foot > button { min-height:var(--touch-target); }
+ .is-albums .tile__blank { padding:var(--space-2); gap:var(--space-1); }
+ .is-albums .tile__retry { min-height:var(--touch-target); font-size:var(--text-2xs); }
+ .is-albums .tile__retry span { overflow-wrap:anywhere; }
+}
 </style>

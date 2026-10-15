@@ -38,7 +38,9 @@ Never present archive results as complete or as a substitute for a server-side b
 - **Web login** (desktop only) — opens an independent window with the QQ login page and reads
   credentials through the WebView cookie API.
 
-Login credentials live in Rust memory while the app runs. On supported desktop platforms only
+Login credentials live in Rust memory while the app runs. Login IPC returns only the QQ
+account identity; nickname and bounded avatar lookup use native `get_login_user` without
+returning cookies or derived tokens to JavaScript. On supported desktop platforms only
 the minimal restorable session is persisted, and only into the operating system credential
 store (macOS Keychain / Windows Credential Manager / Linux Secret Service). **Credentials must
 never be written to SQLite, frontend storage, console output or logs.**

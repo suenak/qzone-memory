@@ -24,6 +24,10 @@
 - [PrimeVue](https://primevue.org/) — MIT License；浮层、表单与交互控件。
 - [Vue.js](https://vuejs.org/) — MIT License；前端框架。
 
+## 安装工具模板
+
+- [Tauri NSIS installer template](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi) — MIT；`src-tauri/nsis-installer.nsi` 基于 CLI 2.11.4 模板修改，用于将应用显示名与旧版安装识别名分开，避免改名影响覆盖升级。许可证原文保留在 [tauri-nsis-MIT.txt](src-tauri/licenses/tauri-nsis-MIT.txt)。
+
 ## 许可证说明
 
 本仓库整体继续按根目录 [LICENSE](LICENSE) 中的 GPL-3.0 条款发布。Apache-2.0 参考项目的许可证原文可在其上游仓库中查看：[QZoneExport LICENSE](https://github.com/ShunCai/QZoneExport/blob/master/LICENSE)。
