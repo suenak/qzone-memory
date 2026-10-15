@@ -122,6 +122,9 @@ jobs:
         with:
           workspaces: src-tauri -> target
           cache-bin: "false"
+          # 与 ci-build.yml 的 macos 任务共用同一份缓存。两个工作流的 job id 不同
+          # （macos vs macos-x64），所以必须用 shared-key 取代默认的 job 键。
+          shared-key: x86_64-apple-darwin
 
       - name: Install frontend dependencies
         run: npm ci
@@ -174,6 +177,9 @@ jobs:
         with:
           workspaces: src-tauri -> target
           cache-bin: "false"
+          # 与 ci-build.yml 的 macos 任务共用同一份缓存。两个工作流的 job id 不同
+          # （macos vs macos-arm64），所以必须用 shared-key 取代默认的 job 键。
+          shared-key: aarch64-apple-darwin
 
       - name: Install frontend dependencies
         run: npm ci

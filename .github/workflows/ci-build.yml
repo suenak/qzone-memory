@@ -80,8 +80,10 @@ jobs:
         with:
           workspaces: src-tauri -> target
           cache-bin: "false"
-          # 两个 matrix 腿跑在同一个 job 里，默认的 job 键会把它们指向同一份缓存。
-          key: ${{ matrix.target }}
+          # 两个 matrix 腿跑在同一个 job 里，默认的 job 键会把它们指向同一份缓存；
+          # 用 shared-key 还能与 release.yml 的 macos 任务共用同一份（它会取代 job 名，
+          # 两个工作流的 job id 不同也能命中同一键）。
+          shared-key: ${{ matrix.target }}
       - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri build --target ${{ matrix.target }} --bundles dmg
