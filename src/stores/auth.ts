@@ -98,6 +98,14 @@ export const useAuthStore = defineStore("auth", () => {
     else await refreshQrCode();
   }
 
+  async function reauthenticate() {
+    // Keep native credentials and the local account directory until the user
+    // completes a new login; a dismissed dialog must not delete saved records.
+    status.value = "expired";
+    message.value = "QQ 登录已失效，请重新登录";
+    await openLogin();
+  }
+
   function closeLogin() {
     dialogVisible.value = false;
     // 关闭时一并退出网页登录模式，避免下次打开时界面与真实轮询状态错位。
@@ -244,5 +252,5 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
-  return { dialogVisible, loading, qrImage, status, message, user, webLoginMode, loggedIn, restoreSession, openLogin, closeLogin, refreshQrCode, startWebLogin, cancelWebLogin, logout };
+  return { dialogVisible, loading, qrImage, status, message, user, webLoginMode, loggedIn, restoreSession, openLogin, reauthenticate, closeLogin, refreshQrCode, startWebLogin, cancelWebLogin, logout };
 });

@@ -29,7 +29,7 @@ import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import StatTile from "../components/ui/StatTile.vue";
 import {
-  cancelFeedArchive, getArchiveProgress, listArchiveSkips, retryArchiveSkip, startFeedArchive,
+  cancelFeedArchive, listArchiveSkips, retryArchiveSkip, startFeedArchive,
   IDLE_ARCHIVE_PROGRESS, type ArchiveProgress, type ArchiveSkipItem, type ArchiveStatus,
 } from "../utils/qzone";
 import { useArchiveStore } from "../stores/archive";
@@ -53,6 +53,7 @@ const skipsError = ref("");
 const currentTime = ref(Date.now());
 let timer: ReturnType<typeof setInterval> | undefined;
 const running = computed(() => progress.value.status === "running");
+const needsLogin = computed(() => !running.value && /QQ_LOGIN_REQUIRED:|(?:^|\D)-3000(?!\d)/.test(progress.value.message));
 const rateLimited = computed(() => progress.value.status === "limited");
 const remainingSeconds = computed(() => Math.max(0, Math.ceil((Number(progress.value.retryAt || 0) * 1000 - currentTime.value) / 1000)));
 const rateWaiting = computed(() => rateLimited.value && remainingSeconds.value > 0);
@@ -78,7 +79,7 @@ const statusTone = computed<"accent" | "success" | "warning" | "danger" | "neutr
 });
 
 /** 状态标题：一眼看懂「现在在做什么」。 */
-const statusTitle = computed(() => ({
+const statusTitle = computed(() => needsLogin.value ? "QQ 登录已失效" : ({
   idle: "等待开始",
   running: "正在查找和保存说说",
   completed: "本轮读取已完成",
@@ -89,7 +90,7 @@ const statusTitle = computed(() => ({
 }[progress.value.status]));
 
 /** 状态说明：解释「为什么」以及「下一步」。 */
-const statusDescription = computed(() => ({
+const statusDescription = computed(() => needsLogin.value ? "重新登录后可从断点继续。已保存的记录会保留。" : ({
   idle: "开始后会逐页读取空间记录，保存到本机。",
   running: "正在读取并保存。请保持应用运行，不要切换 QQ 账号。",
   completed: "本轮读取已结束，可到「说说」查看结果。",
@@ -101,6 +102,7 @@ const statusDescription = computed(() => ({
 
 /** 操作按钮文案：把「现在能不能点、点了会发生什么」写在按钮上。 */
 const startLabel = computed(() => {
+  if (needsLogin.value) return "重新登录 QQ 空间";
   if (running.value) return "恢复中…";
   if (rateWaiting.value) return `请等待 ${remainingText.value}`;
   if (rateLimited.value) return "继续恢复";
@@ -133,30 +135,14 @@ function commitIntervalInput() {
   intervalInputValue.value = normalized / 1000;
 }
 
-/* 刚由 start / cancel 写入的进度在此刻之前视为权威：侧边栏轮询是「更早发出」的请求，
- * 它的响应回来时不能把按钮状态改回旧值（「停止恢复」变回「备份中」）。
- * archive.ts 是父任务负责的文件，这里不引入跨文件的新接口，只在组件内做短 TTL 保护。 */
-const PROGRESS_FRESH_MS = 2500;
-let progressFreshAt = 0;
-function markProgressFresh() { progressFreshAt = Date.now(); }
-function progressIsFresh() { return Date.now() - progressFreshAt < PROGRESS_FRESH_MS; }
-
-/** 取一次最新进度；已有在飞请求时返回同一个 Promise，调用方 await 到的一定是新值。
- *  不走 archiveStore.refresh()：它遇到在飞请求会直接 return，调用方随后读到的还是旧值。 */
+/** All progress reads share the store's request-order protection. */
 let refreshPromise: Promise<void> | null = null;
 async function refresh() {
   if (refreshPromise) return refreshPromise;
   refreshing.value = true;
   refreshPromise = (async () => {
     try {
-      try {
-        const snapshot = await getArchiveProgress();
-        // 旧轮询响应在 start/cancel 写入之后才返回：丢弃，避免按钮状态回跳。
-        if (!progressIsFresh()) { archiveStore.progress = snapshot; archiveStore.error = ""; }
-      } catch (reason) {
-        // 落在与 store 相同的错误面上，进度读取失败时模板照旧给出提示。
-        archiveStore.error = String(reason);
-      }
+      await archiveStore.refresh();
       if (!loggedIn.value) { skips.value = []; return; }
       try { skips.value = await listArchiveSkips(); skipsError.value = ""; }
       catch (reason) { skipsError.value = describeError(reason, "跳页记录读取失败，请刷新重试。"); }
@@ -165,16 +151,19 @@ async function refresh() {
   return refreshPromise;
 }
 async function start() {
+  if (needsLogin.value) { await authStore.reauthenticate(); return; }
   if (!loggedIn.value || starting.value || running.value || rateWaiting.value || !licenseStore.canArchive) return;
   starting.value = true;
   actionError.value = "";
+  archiveStore.beginRun();
   try {
-    archiveStore.progress = await startFeedArchive(getArchiveInterval());
-    // 紧接其后的 refresh（含侧边栏轮询）不得用旧快照覆盖刚拿到的状态。
-    markProgressFresh();
+    archiveStore.finishRun(await startFeedArchive(getArchiveInterval()));
   }
-  catch (reason) { actionError.value = describeError(reason, "未能开始恢复，请重试。"); }
-  finally { starting.value = false; await refresh(); }
+  catch (reason) {
+    archiveStore.finishRun();
+    actionError.value = describeError(reason, "未能开始恢复，请重试。");
+  }
+  finally { starting.value = false; await archiveStore.refresh(); await refresh(); }
 }
 async function cancel() {
   if (stopping.value) return;
@@ -182,7 +171,6 @@ async function cancel() {
   actionError.value = "";
   try {
     await cancelFeedArchive();
-    markProgressFresh();
   }
   catch (reason) { actionError.value = describeError(reason, "未能停止恢复，请重试。"); }
   finally { stopping.value = false; await refresh(); }
@@ -325,7 +313,7 @@ onBeforeUnmount(() => clearInterval(timer));
       <template #footer>
         <div class="action-bar">
           <div class="action-bar__buttons" :class="{ 'is-running': running }">
-            <Button :label="startLabel" :loading="starting" :disabled="running || rateWaiting || !loggedIn || !licenseStore.canArchive" @click="start" ><template #icon><Download :size="16" :stroke-width="1.8" /></template></Button>
+            <Button :label="startLabel" :loading="starting" :disabled="running || rateWaiting || (!loggedIn && !needsLogin) || !licenseStore.canArchive" @click="start" ><template #icon><Download :size="16" :stroke-width="1.8" /></template></Button>
             <Button v-if="running" label="停止恢复" severity="secondary" outlined :loading="stopping" @click="cancel" ><template #icon><X :size="16" :stroke-width="1.8" /></template></Button>
             <button
               class="ghost-button"

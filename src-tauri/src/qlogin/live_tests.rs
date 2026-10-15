@@ -2,6 +2,33 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "requires a signed-in Windows account; reads one history page without changing checkpoints"]
+async fn signed_in_history_resume_probe() {
+    let state = QLoginState::new();
+    assert!(
+        state.restore_session().await.unwrap(),
+        "no saved QQ session"
+    );
+    match crate::qzone::fetch_history_messages(&state, 30, 10, None).await {
+        Ok(page) => eprintln!("resume probe: readable, {} records", page.record_count),
+        Err(error) => {
+            let category = if crate::qzone::qq_login_required(&error) {
+                "QQ login expired (-3000)"
+            } else if error.contains("无法确认本人昵称") {
+                "ownership name needed"
+            } else if error.contains("HTTP") {
+                "HTTP failure"
+            } else if error.contains("历史消息") {
+                "history response rejected"
+            } else {
+                "network or decoding failure"
+            };
+            eprintln!("resume probe: {category}");
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires an authorised, signed-in Windows account and performs QQ GET requests"]
 async fn signed_in_media_and_history_are_readable() {
     let state = QLoginState::new();

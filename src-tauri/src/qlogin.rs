@@ -976,6 +976,7 @@ pub async fn poll_qr_login(
     }
     // 新账号接管会话，旧账号遗留的页面 token 与回收站签名必须一起作废。
     crate::qzone::clear_qq_credential_caches(&app);
+    crate::archive::qq_login_restored(&app);
     Ok(LoginStatus {
         status: "success",
         message: persistence_result
@@ -1151,6 +1152,7 @@ pub async fn check_web_login(
     *state.session.lock().await = Some(session);
     // 新账号接管会话，旧账号遗留的页面 token 与回收站签名必须一起作废。
     crate::qzone::clear_qq_credential_caches(&app);
+    crate::archive::qq_login_restored(&app);
 
     Ok(LoginStatus {
         status: "success",
@@ -1270,6 +1272,7 @@ pub async fn check_web_login(
     drop(current);
     crate::android_login::cancel(&app)?;
     crate::qzone::clear_qq_credential_caches(&app);
+    crate::archive::qq_login_restored(&app);
     Ok(LoginStatus {
         status: "success",
         message: "登录成功".into(),
