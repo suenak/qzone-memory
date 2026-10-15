@@ -41,6 +41,8 @@ try {
     $source = Join-Path $bundleDir "$($tauriConfig.productName)_$($package.version)_x64-setup.exe"
     $destination = Join-Path $bundleDir "qzone-memory_$($package.version)_x64-local-setup.exe"
     Copy-Item -LiteralPath $source -Destination $destination -Force
+    $export = & (Join-Path $PSScriptRoot 'export-windows-installer.ps1') -Source $destination
+    $destination = $export.Path
     $reportDir = Join-Path $projectRoot 'build-output/local'
     New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
     @{ built = (Get-Date).ToString('o'); server = $env:QZA_LICENSE_SERVER; installer = $destination; bytes = (Get-Item -LiteralPath $destination).Length; sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash } | ConvertTo-Json | Set-Content (Join-Path $reportDir 'manifest.json') -Encoding UTF8

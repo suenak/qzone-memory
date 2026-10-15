@@ -20,9 +20,10 @@ Tauri 默认使用 `productName` 同时生成显示名及 NSIS 注册表键。�
 - 安装位置键与默认安装目录保留原有 `qzone-memory` 名称，覆盖安装继续读取旧位置。
 - 应用 Bundle ID 和 MSI UpgradeCode 均保持不变。
 - 安装完成后处理旧 `qzone-memory.lnk`：只有指向本安装目录程序的快捷方式才会重命名或去重，不覆盖指向其他程序的同名快捷方式。
+- 同一 NSIS 应用升级及同版本修复直接覆盖安装，不先运行旧卸载器；MSI 迁移和降级仍保留原有处理。
 - 英文 MSI 使用支持中文名称的代码页 936；界面语言仍为英文，避免默认 1252 代码页导致打包失败。
 
-模板与 CLI 版本固定对应。升级 `@tauri-apps/cli` 时，需要同步比较上游模板，保留 `INSTALLIDENTITY`、旧 MSI 名称匹配和安装目录兼容改动，并重新验证安装包。模板原文来源与许可证见 `THIRD_PARTY_NOTICES.md`。
+模板与 CLI 版本固定对应。升级 `@tauri-apps/cli` 时，需要同步比较上游模板，保留 `INSTALLIDENTITY`、旧 MSI 名称匹配、安装目录兼容和直接升级的处理，并重新验证安装包。模板原文来源与许可证见 `THIRD_PARTY_NOTICES.md`。
 
 ## 2026-10-15 验证
 
@@ -34,5 +35,7 @@ Tauri 默认使用 `productName` 同时生成显示名及 NSIS 注册表键。�
 - `git diff --check` 通过。本次没有改动 Rust 业务代码；生产构建包含 Rust 编译和前端类型检查。
 
 本机 NSIS 安装包保存在工作区 `output/client-display-name-1.2.8/拾忆_1.2.8_x64-setup.exe`，约 4.33 MiB，SHA-256：`39683EEEB014B7778DAE0F2298D1F1B34A6E38186F6F2C9C104F7932759D35FF`。这是未发布的本地 1.2.8 构建，包含此前手机页面的调整。
+
+注意：工作区产物可能继承 Low 完整性标签，不能直接作为本机安装交付。Windows 本地安装前，运行 `scripts/export-windows-installer.ps1 -Source <安装包>`，使用导出到下载目录并通过标签检查的文件。最新安装修复及验证记录见 [INSTALL-UPGRADE-REPAIR-2026-10-15.md](INSTALL-UPGRADE-REPAIR-2026-10-15.md)。
 
 尚未替换已安装客户端或执行正式覆盖安装；未生成新的 Android、Apple 或 Linux 包，也未完成这些平台的安装实测。已经安装的旧版本，需要安装后续新包后才会应用新的显示名；系统固定的旧快捷方式可能需要重新固定。
