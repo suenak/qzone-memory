@@ -1,8 +1,11 @@
 name: CI Build
 
 on:
-  push:
-    branches: [main]
+  # 不再跟着 push main 跑：发布流程是「推 main 再打标签」，两者在同一分钟触发，
+  # 于是每次发布都会同时跑两套五平台构建（release.yml 那套才是要用的），
+  # 白白多花十几分钟机器时间。nightly 改成每天定时刷新一次，需要时手动触发。
+  schedule:
+    - cron: "0 19 * * *"
   workflow_dispatch:
 
 permissions:
@@ -37,6 +40,11 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
       - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri build --bundles nsis
@@ -67,6 +75,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
+          # 两个 matrix 腿跑在同一个 job 里，默认的 job 键会把它们指向同一份缓存。
+          key: ${{ matrix.target }}
       - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri build --target ${{ matrix.target }} --bundles dmg
@@ -88,6 +103,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -164,6 +184,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
       - uses: ./.github/actions/qza-config
       - run: npm ci
       - run: npx tauri ios init --ci
