@@ -36,8 +36,9 @@ try {
     if (!$nativeText.Contains($env:QZA_LICENSE_SERVER)) { throw 'Compiled client does not contain the local license URL.' }
     if (!$nativeText.Contains($localKeyBody)) { throw 'Compiled client does not contain the local licence public key.' }
     $package = Get-Content (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json
+    $tauriConfig = Get-Content (Join-Path $projectRoot 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json
     $bundleDir = Join-Path $projectRoot 'src-tauri/target/release/bundle/nsis'
-    $source = Join-Path $bundleDir "qzone-memory_$($package.version)_x64-setup.exe"
+    $source = Join-Path $bundleDir "$($tauriConfig.productName)_$($package.version)_x64-setup.exe"
     $destination = Join-Path $bundleDir "qzone-memory_$($package.version)_x64-local-setup.exe"
     Copy-Item -LiteralPath $source -Destination $destination -Force
     $reportDir = Join-Path $projectRoot 'build-output/local'

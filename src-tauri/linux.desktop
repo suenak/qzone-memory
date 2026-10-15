@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=拾忆
+Name[zh_CN]=拾忆
+GenericName=QQ 空间说说恢复
+Comment=查找并保存仍可恢复的 QQ 空间说说与互动记录
+Exec={{exec}}
+Icon={{icon}}
+Terminal=false
+Categories={{categories}}

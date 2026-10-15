@@ -7,10 +7,8 @@ import {
   Archive,
   ChevronRight,
   Database,
-  Download,
   Heart,
   Images,
-  LogIn,
   MessageCircle,
   MessageSquareQuote,
   RefreshCw,
@@ -25,17 +23,16 @@ import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import StatTile from "../components/ui/StatTile.vue";
 import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
-import { BookOpen } from "lucide-vue-next";
 import { useArchiveStore } from "../stores/archive";
 import { useAuthStore } from "../stores/auth";
-import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, listArchiveYears, IDLE_ARCHIVE_PROGRESS, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
+import { getArchiveOverview, getInteractionRanking, listArchivedFeeds, listArchiveYears, IDLE_ARCHIVE_PROGRESS, type ArchiveItem, type ArchiveOverview, type InteractionRank } from "../utils/qzone";
 
 const router = useRouter();
 const authStore = useAuthStore();
 const archiveStore = useArchiveStore();
 const { loggedIn, user } = storeToRefs(authStore);
 const overview = ref<ArchiveOverview>({ dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 });
-const progress = ref<ArchiveProgress>(IDLE_ARCHIVE_PROGRESS);
+const progress = computed(() => archiveStore.progress ?? IDLE_ARCHIVE_PROGRESS);
 const recent = ref<ArchiveItem[]>([]);
 const ranking = ref<InteractionRank[]>([]);
 /** 备份覆盖的年份列表，用于推导回忆跨度。取不到时为空，界面退回时间锚点。 */
@@ -44,6 +41,9 @@ const loading = ref(false);
 const dashboardError = ref("");
 const avatarSources = reactive<Record<string, string>>({});
 let refreshTimer: number | undefined;
+let disposed = false;
+let lastRefresh = 0;
+const avatarRequests = new Map<string, AbortController>();
 /** 登出或重新加载都会让在途请求作废，否则轮询期间旧账号的概览与排行会写回界面。 */
 let loadSequence = 0;
 const storageText = computed(() => overview.value.databaseBytes < 1024 * 1024 ? `${(overview.value.databaseBytes / 1024).toFixed(1)} KB` : `${(overview.value.databaseBytes / 1024 / 1024).toFixed(1)} MB`);
@@ -59,9 +59,7 @@ const rankingMax = computed(() => Math.max(1, ...ranking.value.map((item) => ite
 
 /** 概览是否完成过一次真实加载：用来区分「首屏骨架」与「确实还没有回忆」。 */
 const overviewLoaded = ref(false);
-watch(loading, (current, previous) => {
-  if (previous && !current && !dashboardError.value) overviewLoaded.value = true;
-});
+
 
 /** 仅首屏需要骨架；后台静默刷新时保留已有数字，避免闪烁。 */
 const firstLoadPending = computed(() => loading.value && !overviewLoaded.value);
@@ -75,7 +73,7 @@ const latestMemoryDate = computed(() => {
 });
 
 /**
- * 备份年份的年份跨度。
+ * 记录年份的年份跨度。
  *
  * 取自后端真实的年份列表（listArchiveYears），不是由最近几条推算出来的。
  * 取不到年份时返回 null，界面退回显示最近一条说说的时间锚点。
@@ -98,86 +96,107 @@ const progressWidth = computed(() => {
 });
 
 function releaseAvatars() {
+  avatarRequests.forEach((controller) => controller.abort());
+  avatarRequests.clear();
   Object.values(avatarSources).forEach((url) => URL.revokeObjectURL(url));
   Object.keys(avatarSources).forEach((uin) => delete avatarSources[uin]);
 }
 async function loadAvatar(uin: string) {
-  if (!uin || avatarSources[uin]) return;
+  if (!/^\d+$/.test(uin) || avatarSources[uin] || avatarRequests.has(uin) || disposed) return;
+  const controller = new AbortController();
+  avatarRequests.set(uin, controller);
+  const timeout = window.setTimeout(() => controller.abort(), 8_000);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
     const response = await fetch(avatarUrl(uin), {
-      method: "GET",
-      headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8", Referer: "https://user.qzone.qq.com/" },
+      method: "GET", signal: controller.signal, connectTimeout: 5_000,
+      headers: { Accept: "image/*", Referer: "https://user.qzone.qq.com/" },
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const contentType = response.headers.get("content-type") || "image/jpeg";
-    if (!contentType.startsWith("image/")) throw new Error(`无效头像类型 ${contentType}`);
-    avatarSources[uin] = URL.createObjectURL(new Blob([await response.arrayBuffer()], { type: contentType }));
-  } catch (reason) { console.warn(`QQ ${uin} 头像加载失败`, reason); }
+    reader = response.body?.getReader();
+    const contentType = response.headers.get("content-type") || "";
+    if (!response.ok || !contentType.startsWith("image/")) return;
+    // Small avatars must not turn into an unbounded download, even without Content-Length.
+    if (!reader) return;
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        length += value.byteLength;
+        if (length > 512 * 1024 || controller.signal.aborted) return;
+        chunks.push(new Uint8Array(value));
+      }
+    } finally { await reader.cancel().catch(() => {}); }
+    if (!disposed && !controller.signal.aborted && avatarRequests.get(uin) === controller) {
+      avatarSources[uin] = URL.createObjectURL(new Blob(chunks, { type: contentType }));
+    }
+  } catch { /* The fallback avatar remains usable offline. */ }
+  finally {
+    window.clearTimeout(timeout);
+    await reader?.cancel().catch(() => {});
+    if (avatarRequests.get(uin) === controller) avatarRequests.delete(uin);
+  }
 }
 
 async function loadDashboard() {
-  if (!loggedIn.value) {
-    // 登出要把在途请求一并作废：轮询每 2 秒一次，否则已登出账号的概览、排行与年份会写回界面。
-    loadSequence += 1;
-    loading.value = false;
-    overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 };
-    recent.value = [];
-    ranking.value = [];
-    archiveYears.value = [];
-    return;
-  }
-  if (loading.value) return;
+  if (loading.value || disposed) return;
   const sequence = ++loadSequence;
   loading.value = true;
   dashboardError.value = "";
+  lastRefresh = Date.now();
   try {
-    const [stats, items, task, ranks, years] = await Promise.all([
-      getArchiveOverview(),
-      listArchivedFeeds(3, 0),
-      getArchiveProgress(),
-      getInteractionRanking(8),
-      // 年份跨度取自后端真实的年份列表。带 catch：这一项失败不该拖垮整条加载链。
+    const [stats, items, ranks, years] = await Promise.all([
+      getArchiveOverview(), listArchivedFeeds(3, 0), getInteractionRanking(8),
       listArchiveYears("self").catch(() => [] as number[]),
     ]);
-    if (sequence !== loadSequence) return;
-    overview.value = stats; recent.value = items; progress.value = task; ranking.value = ranks;
+    if (sequence !== loadSequence || disposed) return;
+    overview.value = stats; recent.value = items; ranking.value = ranks;
     archiveYears.value = years.filter((year) => year > 0);
+    overviewLoaded.value = true;
     const avatarUins = [...items.flatMap((item) => item.authorUin ? [item.authorUin] : []), ...ranks.map((item) => item.uin)];
-    await Promise.all([...new Set(avatarUins)].map(loadAvatar));
-  } catch (reason) { if (sequence === loadSequence) dashboardError.value = String(reason); }
-  finally { if (sequence === loadSequence) loading.value = false; }
-}
-async function pollDashboard() {
-  if (!loggedIn.value || loading.value) return;
-  // 只记录当前序号：轮询期间若发生登出或整块重载，这次结果已经过期，不能写回界面。
-  const sequence = loadSequence;
-  try {
-    const task = await getArchiveProgress();
-    if (sequence !== loadSequence || !loggedIn.value) return;
-    const wasRunning = progress.value.status === "running";
-    progress.value = task;
-    if (task.status === "running" || wasRunning) await loadDashboard();
+    void Promise.all([...new Set(avatarUins)].map(loadAvatar));
   } catch (reason) {
-    console.warn("概览自动刷新失败", reason);
-  }
+    if (sequence !== loadSequence || disposed) return;
+    // A fresh installation has neither a session nor a last local account.
+    if (!loggedIn.value && String(reason) === "尚未登录 QQ 空间") overviewLoaded.value = true;
+    else dashboardError.value = String(reason);
+  } finally { if (sequence === loadSequence && !disposed) loading.value = false; }
 }
+function scheduleRefresh(immediate = false) {
+  if (disposed || document.visibilityState !== "visible") return;
+  if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = undefined;
+    if (loading.value) { scheduleRefresh(); return; }
+    void loadDashboard();
+  }, immediate ? 0 : Math.max(500, 10_000 - (Date.now() - lastRefresh)));
+}
+watch(() => [progress.value.status, progress.value.saved] as const, ([status], [previous]) => {
+  if (status === "running" || previous === "running") scheduleRefresh(status !== "running");
+});
 function handleVisibilityChange() {
-  // 回到前台就重新加载；账号与序号的判断统一在 loadDashboard 内处理。
-  if (document.visibilityState === "visible") void loadDashboard();
+  if (document.visibilityState === "visible") scheduleRefresh(true);
+  else if (refreshTimer !== undefined) { window.clearTimeout(refreshTimer); refreshTimer = undefined; }
 }
 function primaryAction() { loggedIn.value ? router.push("/tasks") : authStore.openLogin(); }
-watch(loggedIn, () => {
-  // 账号切换先释放上一个账号的头像 blob，否则会一直残留到下次加载。
+watch(() => user.value?.uin, () => {
+  ++loadSequence;
+  loading.value = false;
+  overviewLoaded.value = false;
+  overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 };
+  recent.value = []; ranking.value = []; archiveYears.value = [];
   releaseAvatars();
   void loadDashboard();
 });
 onMounted(() => {
   void loadDashboard();
-  refreshTimer = window.setInterval(pollDashboard, 2_000);
   document.addEventListener("visibilitychange", handleVisibilityChange);
 });
 onBeforeUnmount(() => {
-  if (refreshTimer !== undefined) window.clearInterval(refreshTimer);
+  disposed = true;
+  ++loadSequence;
+  if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   releaseAvatars();
 });
@@ -186,29 +205,30 @@ onBeforeUnmount(() => {
 <template>
   <div class="dashboard">
     <ArchiveHeading title="恢复概览" description="查看已保存的说说、照片和互动记录。" :icon="Archive">
-      <Button v-if="loggedIn" severity="secondary" outlined :loading="loading" @click="loadDashboard"><RefreshCw :size="16" :stroke-width="1.8" /><span>刷新</span></Button>
+      <Button severity="secondary" outlined :loading="loading" @click="loadDashboard"><RefreshCw :size="16" :stroke-width="1.8" /><span>刷新</span></Button>
     </ArchiveHeading>
+    <section class="recovery-intro" aria-labelledby="recovery-title">
+      <div class="recovery-intro__copy">
+        <span class="recovery-intro__eyebrow">说说恢复</span>
+        <h2 id="recovery-title">找回仍有痕迹的说说</h2>
+        <p>从历史消息、点赞和评论中查找残留记录，尝试还原已删除的说说。能找回多少，取决于空间仍保留了哪些记录。</p>
+        <div class="recovery-intro__actions">
+          <Button @click="primaryAction"><RefreshCw :size="16" :stroke-width="1.8" /><span>{{ archiveStore.running ? '查看恢复进度' : loggedIn ? '打开恢复任务' : '登录并开始恢复' }}</span></Button>
+          <Button v-if="hasMemory" severity="secondary" outlined @click="router.push('/archives')"><span>查看本地说说</span><ChevronRight :size="16" :stroke-width="1.8" /></Button>
+        </div>
+      </div>
+      <ol class="recovery-steps" aria-label="恢复流程说明">
+        <li><span>01</span><div><strong>读取空间记录</strong><small>可见说说与仍可读取的历史消息</small></div></li>
+        <li><span>02</span><div><strong>补全互动线索</strong><small>从点赞、评论中寻找内容残留</small></div></li>
+        <li><span>03</span><div><strong>保存到本机</strong><small>随时查看，也可导出留存</small></div></li>
+      </ol>
+    </section>
     <!-- ------------------------------------------------------ 回忆时光区 -->
     <SectionCard class="memory-hero">
       <div class="memory-hero__inner">
-        <EmptyState v-if="dashboardError" :icon="Archive" tone="danger" title="备份总览读取失败" description="请重试，或到「说说」查看已保存的内容。">
+        <EmptyState v-if="dashboardError" :icon="Archive" tone="danger" title="本地记录读取失败" description="请重试，或到「说说」查看已保存的内容。">
           <Button @click="loadDashboard"><RefreshCw :size="16" :stroke-width="1.8" /><span>重试</span></Button>
         </EmptyState>
-        <EmptyState
-          v-else-if="!loggedIn"
-          class="memory-hero__empty"
-          compact
-          tone="warm"
-          :icon="BookOpen"
-          title="登录 QQ 空间"
-          description="登录后可查找当前账号的历史说说，并保存空间资料。"
-        >
-          <Button @click="primaryAction">
-            <LogIn :size="16" :stroke-width="1.8" />
-            <span>登录 QQ 空间</span>
-          </Button>
-        </EmptyState>
-
         <div v-else-if="firstLoadPending" class="memory-hero__skeleton">
           <SkeletonBlock width="320px" height="28px" />
           <SkeletonBlock width="min(440px, 100%)" height="14px" />
@@ -222,16 +242,8 @@ onBeforeUnmount(() => {
           tone="warm"
           :icon="Archive"
           title="还没有保存的内容"
-          description="到「恢复任务」开始保存说说。曾有点赞或评论，且记录仍可读取的说说才有机会恢复。"
+          description="开始恢复后，找到的说说会保存在这里。没有残留记录的内容无法找回。"
         >
-          <Button severity="secondary" outlined :loading="loading" @click="loadDashboard">
-            <RefreshCw :size="16" :stroke-width="1.8" />
-            <span>刷新数据</span>
-          </Button>
-          <Button @click="primaryAction">
-            <Download :size="16" :stroke-width="1.8" />
-            <span>打开恢复任务</span>
-          </Button>
         </EmptyState>
 
         <template v-else>
@@ -248,7 +260,7 @@ onBeforeUnmount(() => {
             </p>
             <p v-if="yearSpan" class="memory-hero__stamp">
               <span class="memory-hero__stamp-dot" aria-hidden="true" />
-              <span>备份年份 {{ yearSpan.label }} · 共 {{ yearSpan.count }} 个年份</span>
+              <span>记录年份 {{ yearSpan.label }} · 共 {{ yearSpan.count }} 个年份</span>
             </p>
             <p v-else-if="latestMemoryDate" class="memory-hero__stamp">
               <span class="memory-hero__stamp-dot" aria-hidden="true" />
@@ -257,13 +269,8 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="memory-hero__actions">
-            <Button severity="secondary" outlined :loading="loading" @click="loadDashboard">
-              <RefreshCw :size="16" :stroke-width="1.8" />
-              <span>刷新数据</span>
-            </Button>
-            <Button @click="primaryAction">
-              <Download :size="16" :stroke-width="1.8" />
-              <span>打开恢复任务</span>
+            <Button severity="secondary" outlined @click="router.push('/archives')">
+              <span>查看全部说说</span><ChevronRight :size="16" :stroke-width="1.8" />
             </Button>
           </div>
         </template>
@@ -271,11 +278,11 @@ onBeforeUnmount(() => {
     </SectionCard>
 
     <!-- ---------------------------------------------------------- 统计区 -->
-    <section v-if="loggedIn && !dashboardError" class="stat-grid" aria-label="备份统计">
+    <section v-if="!dashboardError" class="stat-grid" aria-label="本地记录统计">
       <StatTile
         label="说说"
         :value="overview.dynamics.toLocaleString('zh-CN')"
-        hint="已备份的历史动态"
+        hint="已保存的说说记录"
         :icon="MessageSquareQuote"
         tone="accent"
         :loading="firstLoadPending"
@@ -307,16 +314,16 @@ onBeforeUnmount(() => {
       <StatTile
         label="本地占用"
         :value="storageText"
-        hint="备份数据库大小"
+        hint="本地数据库大小"
         :icon="Database"
         tone="neutral"
         :loading="firstLoadPending"
       />
     </section>
 
-    <SectionCard v-if="loggedIn && !dashboardError && (yearSpan || recent.length)" class="year-index" title="按年份查看">
+    <SectionCard v-if="!dashboardError && (yearSpan || recent.length)" class="year-index" title="按年份查看">
       <nav class="year-index__years" aria-label="按年份翻阅"><RouterLink v-for="year in archiveYears" :key="year" :to="{ path: '/archives', query: { year: String(year) } }"><span>{{ year }}</span><ChevronRight :size="16" :stroke-width="1.8" /></RouterLink></nav>
-      <blockquote v-if="recent[0]" class="memory-excerpt"><time>{{ latestMemoryDate }}</time><p class="selectable"><QzoneText :value="recent[0].content" /></p><RouterLink to="/archives">查看说说备份<ChevronRight :size="15" :stroke-width="1.8" /></RouterLink></blockquote>
+      <blockquote v-if="recent[0]" class="memory-excerpt"><time>{{ latestMemoryDate }}</time><p class="selectable"><QzoneText :value="recent[0].content" /></p><RouterLink to="/archives">查看本地说说<ChevronRight :size="15" :stroke-width="1.8" /></RouterLink></blockquote>
     </SectionCard>
 
     <!-- -------------------------------------------- 互动排行 · 最近保存 -->
@@ -326,7 +333,7 @@ onBeforeUnmount(() => {
           <span v-if="ranking.length" class="rank-badge">TOP {{ ranking.length }}</span>
         </template>
 
-        <div v-if="loggedIn && firstLoadPending" class="rank-list">
+        <div v-if="firstLoadPending" class="rank-list">
           <div v-for="index in 4" :key="index" class="rank-row">
             <SkeletonBlock class="row-avatar-skeleton" width="38px" circle />
             <div class="rank-row__person"><SkeletonBlock :lines="2" /></div>
@@ -370,20 +377,20 @@ onBeforeUnmount(() => {
           v-else
           compact
           :icon="Users"
-          :title="loggedIn ? '还没有互动记录' : '登录后查看互动排行'"
-          :description="loggedIn ? '备份完成后，点赞和评论最多的人会排在这里。' : '登录后查看已备份的点赞与评论。'"
+          title="还没有互动记录"
+          description="保存的点赞和评论会汇总到这里。"
         />
       </SectionCard>
 
-      <SectionCard title="最近保存" description="最近保存的三条说说">
+      <SectionCard title="说说速览" description="按发布时间排列">
         <template #actions>
-          <Button text size="small" :disabled="!loggedIn" @click="router.push('/archives')">
+          <Button text size="small" @click="router.push('/archives')">
             <span>查看全部</span>
             <ChevronRight :size="15" :stroke-width="1.8" />
           </Button>
         </template>
 
-        <div v-if="loggedIn && firstLoadPending" class="recent-list">
+        <div v-if="firstLoadPending" class="recent-list">
           <div v-for="index in 3" :key="index" class="recent-item">
             <SkeletonBlock class="row-avatar-skeleton" width="38px" circle />
             <div class="recent-item__body"><SkeletonBlock :lines="2" /></div>
@@ -421,16 +428,16 @@ onBeforeUnmount(() => {
           v-else
           compact
           :icon="MessageSquareQuote"
-          :title="loggedIn ? '还没有保存说说' : '尚未登录'"
-          :description="loggedIn ? '先在恢复任务里开始一次备份，历史动态会按时间出现在这里。' : '登录 QQ 空间后，这里会显示最近备份的动态。'"
+          title="还没有保存说说"
+          description="恢复任务保存的说说会按发布时间出现在这里。"
         />
       </SectionCard>
     </div>
 
     <!-- -------------------------------------------------- 最近任务 -->
-    <SectionCard v-if="archiveStore.hasTask" title="最近任务">
+    <SectionCard v-if="progress.status !== 'idle'" title="最近任务">
       <template #actions>
-        <Button text size="small" @click="router.push('/tasks')"><span>{{ archiveStore.running ? '查看进度' : '继续恢复' }}</span><ChevronRight :size="15" :stroke-width="1.8" /></Button>
+        <Button text size="small" @click="router.push('/tasks')"><span>{{ archiveStore.running ? '查看进度' : '打开恢复任务' }}</span><ChevronRight :size="15" :stroke-width="1.8" /></Button>
         <span class="status-chip" :class="`is-${taskSeverity ?? 'secondary'}`">
           <span class="status-chip__dot" aria-hidden="true" />
           <span>{{ taskText ?? "状态未知" }}</span>
@@ -438,7 +445,7 @@ onBeforeUnmount(() => {
       </template>
 
       <div class="archive-status">
-        <div class="archive-status__track" :class="{ 'is-running': progress.status === 'running' }" role="progressbar" :aria-valuenow="progress.status === 'completed' ? 100 : undefined" :aria-valuetext="progress.status === 'running' ? '正在读取，剩余数量未知' : taskText" aria-label="备份进度">
+        <div class="archive-status__track" :class="{ 'is-running': progress.status === 'running' }" role="progressbar" :aria-valuenow="progress.status === 'completed' ? 100 : undefined" :aria-valuetext="progress.status === 'running' ? '正在读取，剩余数量未知' : taskText" aria-label="恢复进度">
           <i :style="{ width: progressWidth }" />
         </div>
 
@@ -584,7 +591,7 @@ onBeforeUnmount(() => {
 
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: var(--space-4);
 }
 
@@ -1003,12 +1010,21 @@ onBeforeUnmount(() => {
 @media(min-width:1100px) { .dashboard-columns { grid-template-columns:minmax(0,1fr) minmax(0,1.4fr); } }
 @media(max-width:600px) { .memory-hero__actions { width:100%; } .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 
-@media(min-width:1100px) {
- .dashboard { display:grid; grid-template-columns:minmax(0,2.2fr) minmax(var(--layout-contact-cell),1fr); align-items:start; }
- .dashboard > .archive-heading,.dashboard > .memory-hero,.dashboard > .stat-grid { grid-column:1 / -1; }
- .dashboard > .year-index { grid-column:1; }
- .dashboard > .dashboard-columns { grid-column:2; grid-row:4 / span 2; display:flex; flex-direction:column; gap:var(--layout-page-gap); }
- .dashboard-columns > * { width:100%; }
- .dashboard > .qza-card:last-child:not(.memory-hero):not(.year-index) { grid-column:1; }
+/* The reading order remains the same on desktop and mobile. */
+.recovery-intro { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); gap:var(--space-8); padding:var(--space-8); border:var(--line-width) solid var(--color-border); border-radius:var(--radius-xl); background:var(--color-surface); }
+.recovery-intro__eyebrow { color:var(--color-accent); font-size:var(--text-xs); font-weight:var(--weight-semibold); }
+.recovery-intro h2 { margin:var(--space-3) 0; font-family:var(--font-display); font-size:var(--text-2xl); color:var(--color-text); }
+.recovery-intro p { max-width:52ch; margin:0; color:var(--color-text-secondary); line-height:var(--leading-relaxed); }
+.recovery-intro__actions { display:flex; flex-wrap:wrap; gap:var(--space-3); margin-top:var(--space-5); }
+.recovery-steps { margin:0; padding:0 0 0 var(--space-6); border-left:var(--line-width) solid var(--color-border); list-style:none; display:grid; gap:var(--space-5); align-content:center; }
+.recovery-steps li { display:flex; align-items:flex-start; gap:var(--space-3); }
+.recovery-steps li > span { color:var(--color-accent); background:var(--color-accent-soft); border-radius:var(--radius-sm); padding:var(--space-2); font-size:var(--text-xs); font-variant-numeric:tabular-nums; }
+.recovery-steps strong,.recovery-steps small { display:block; }
+.recovery-steps strong { font-size:var(--text-sm); font-weight:var(--weight-semibold); }
+.recovery-steps small { margin-top:var(--space-1); color:var(--color-text-secondary); line-height:var(--leading-normal); }
+@media(max-width:860px) {
+ .recovery-intro { grid-template-columns:minmax(0,1fr); padding:var(--space-5); gap:var(--space-5); }
+ .recovery-steps { padding:var(--space-5) 0 0; border-left:0; border-top:var(--line-width) solid var(--color-border); gap:var(--space-3); }
+ .memory-hero__empty { padding:var(--space-2); }
 }
 </style>

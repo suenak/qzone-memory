@@ -1,7 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "qzone-memory",
-  "version": "1.2.7",
+  "productName": "拾忆",
+  "mainBinaryName": "qzonearchive",
+  "version": "1.2.8",
   "identifier": "top.ehre.qzonearchive",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -86,11 +87,15 @@
         "displayLanguageSelector": false,
         "compression": "lzma",
         "startMenuFolder": "拾忆",
+        "template": "nsis-installer.nsi",
         "installerHooks": "nsis-hooks.nsh"
       },
       "wix": {
         "upgradeCode": "24779296-0f03-5f99-83ea-fc2fcda733b9",
-        "language": ["zh-CN", "en-US"]
+        "language": {
+          "zh-CN": {},
+          "en-US": { "localePath": "wix-en-US.wxl" }
+        }
       }
     }
   }

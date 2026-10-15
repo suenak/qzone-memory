@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "qzone-memory",
+  "bundle": {
+    "linux": {
+      "deb": { "desktopTemplate": "linux.desktop" },
+      "rpm": { "desktopTemplate": "linux.desktop" }
+    }
+  }
+}

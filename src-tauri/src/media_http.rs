@@ -2,6 +2,61 @@
 use reqwest::{redirect::Policy, Client, RequestBuilder};
 use url::Url;
 
+/// Bound decoded bytes as they arrive, including responses without Content-Length.
+pub(crate) async fn bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err("响应内容超过大小限制".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "读取响应内容失败")? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err("响应内容超过大小限制".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+pub(crate) async fn image_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<(String, Vec<u8>), String> {
+    let mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        mime.as_str(),
+        "image/jpeg"
+            | "image/png"
+            | "image/gif"
+            | "image/webp"
+            | "image/avif"
+            | "image/bmp"
+            | "image/x-icon"
+            | "image/vnd.microsoft.icon"
+    ) {
+        return Err("返回的内容不是支持的图片格式".into());
+    }
+    let bytes = bounded_body(response, limit).await?;
+    if bytes.is_empty() {
+        return Err("图片内容为空".into());
+    }
+    Ok((mime, bytes))
+}
+
 pub fn accepts_qq_credentials(url: &Url) -> bool {
     url.scheme() == "https"
         && url.username().is_empty()
@@ -91,6 +146,70 @@ pub fn request(client: &Client, url: &Url, cookie: &str, with_cookie: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn fixture(headers: &str, body: &[u8]) -> reqwest::Response {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let response = [
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{headers}\r\n").as_bytes(),
+            body,
+        ]
+        .concat();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            // The client may close early after checking Content-Length or MIME.
+            let _ = socket.write_all(&response);
+        });
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(endpoint)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preview_downloads_are_bounded_with_and_without_a_declared_length() {
+        let response = fixture(
+            "Content-Type: image/png\r\nContent-Length: 9\r\n",
+            b"123456789",
+        )
+        .await;
+        assert!(image_body(response, 8)
+            .await
+            .unwrap_err()
+            .contains("大小限制"));
+        let response = fixture("Content-Type: image/png\r\n", b"123456789").await;
+        assert!(image_body(response, 8)
+            .await
+            .unwrap_err()
+            .contains("大小限制"));
+        let response = fixture("Content-Type: image/PNG; charset=binary\r\n", b"12345678").await;
+        let (mime, bytes) = image_body(response, 8).await.unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, b"12345678");
+    }
+
+    #[tokio::test]
+    async fn previews_reject_html_svg_and_empty_responses() {
+        for mime in ["text/html", "image/svg+xml", "application/octet-stream"] {
+            let response = fixture(&format!("Content-Type: {mime}\r\n"), b"not-a-photo").await;
+            assert!(image_body(response, 100).await.is_err());
+        }
+        let response = fixture("Content-Type: image/png\r\nContent-Length: 0\r\n", b"").await;
+        assert!(image_body(response, 100)
+            .await
+            .unwrap_err()
+            .contains("为空"));
+    }
 
     #[test]
     fn credentials_require_https_and_a_domain_boundary() {

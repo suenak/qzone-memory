@@ -87,7 +87,7 @@ async function declineDisclaimer() {
   <AppShell v-if="disclaimerAccepted && licenseStore.initialized" :page-title="pageTitle">
     <RouterView v-slot="{ Component, route: currentRoute }">
       <Transition name="native-page">
-        <component :is="Component" :key="currentRoute.name" />
+        <component :is="Component" :key="`${String(currentRoute.name)}:${authStore.user?.uin ?? 'local'}`" />
       </Transition>
     </RouterView>
   </AppShell>

@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -322,6 +322,11 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     let mut connection = Connection::open(database_path(app)?)
         .map_err(|error| format!("无法打开归档数据库：{error}"))?;
+    initialize_database(&mut connection)?;
+    Ok(connection)
+}
+
+fn initialize_database(connection: &mut Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -466,14 +471,14 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
             )
             .map_err(|error| format!("升级归档分类失败：{error}"))?;
     }
-    migrate_legacy_dynamics(&mut connection)?;
-    migrate_dynamic_categories(&mut connection)?;
-    migrate_history_v1_records(&mut connection)?;
-    migrate_qzone_mood_aliases(&mut connection)?;
-    migrate_history_mood_timestamps(&mut connection)?;
-    migrate_history_guestbook_records(&mut connection)?;
-    migrate_library_guestbook_timestamps(&mut connection)?;
-    Ok(connection)
+    migrate_legacy_dynamics(connection)?;
+    migrate_dynamic_categories(connection)?;
+    migrate_history_v1_records(connection)?;
+    migrate_qzone_mood_aliases(connection)?;
+    migrate_history_mood_timestamps(connection)?;
+    migrate_history_guestbook_records(connection)?;
+    migrate_library_guestbook_timestamps(connection)?;
+    Ok(())
 }
 
 fn migrate_library_guestbook_timestamps(connection: &mut Connection) -> Result<(), String> {
@@ -499,17 +504,16 @@ fn migrate_library_guestbook_timestamps(connection: &mut Connection) -> Result<(
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| format!("查询待修复留言时间失败：{error}"))?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取待迁移记录失败：{error}"))?;
         rows
     };
     let transaction = connection
         .transaction()
         .map_err(|error| format!("开始修复留言时间失败：{error}"))?;
     for (id, raw_json) in candidates {
-        let Some(raw) = serde_json::from_str::<Value>(&raw_json).ok() else {
-            continue;
-        };
+        let raw = serde_json::from_str::<Value>(&raw_json)
+            .map_err(|error| format!("留言原始数据损坏，未完成迁移：{error}"))?;
         let created_at = library_created_at(&raw);
         if created_at > 0 {
             transaction
@@ -562,8 +566,8 @@ fn migrate_history_mood_timestamps(connection: &mut Connection) -> Result<(), St
                 ))
             })
             .map_err(|error| format!("查询待修复历史说说时间失败：{error}"))?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取待迁移记录失败：{error}"))?;
         rows
     };
     let transaction = connection
@@ -652,7 +656,8 @@ fn migrate_history_guestbook_records(connection: &mut Connection) -> Result<(), 
                 ))
             })
             .map_err(|error| format!("查询待修复历史留言失败：{error}"))?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取待迁移记录失败：{error}"))?
     };
     let transaction = connection
         .transaction()
@@ -666,8 +671,9 @@ fn migrate_history_guestbook_records(connection: &mut Connection) -> Result<(), 
         let new_cell_id = format!("history-guestbook:{stable_id}");
         let content = strip_history_guestbook_prefix(content.as_deref().unwrap_or_default());
         let raw_original_json = serde_json::from_str::<Value>(&raw_json)
-            .ok()
-            .and_then(|value| value.get("original").cloned())
+            .map_err(|error| format!("历史留言数据损坏，未完成迁移：{error}"))?
+            .get("original")
+            .cloned()
             .unwrap_or_else(|| json!({}))
             .to_string();
         transaction
@@ -766,7 +772,9 @@ fn migrate_qzone_mood_aliases(connection: &mut Connection) -> Result<(), String>
                 ))
             })
             .map_err(|error| format!("查询待合并说说别名失败：{error}"))?;
-        rows.filter_map(Result::ok)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取说说别名失败：{error}"))?
+            .into_iter()
             .filter(|row| row.2.is_some())
             .collect::<Vec<_>>()
     };
@@ -914,15 +922,16 @@ fn migrate_dynamic_categories(connection: &mut Connection) -> Result<(), String>
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| format!("查询待分类归档失败：{error}"))?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取待迁移记录失败：{error}"))?
     };
     let transaction = connection
         .transaction()
         .map_err(|error| format!("开始归档分类迁移失败：{error}"))?;
     for (owner_uin, raw_json) in feeds {
-        if let Ok(feed) = serde_json::from_str::<Value>(&raw_json) {
-            save_original_dynamic(&transaction, &owner_uin, &feed)?;
-        }
+        let feed = serde_json::from_str::<Value>(&raw_json)
+            .map_err(|error| format!("待分类原始数据损坏，未完成迁移：{error}"))?;
+        save_original_dynamic(&transaction, &owner_uin, &feed)?;
     }
     transaction.execute(
         "UPDATE archive_dynamics SET category=CASE WHEN author_uin=owner_uin THEN 'self' ELSE 'other' END WHERE category=''",
@@ -951,7 +960,8 @@ fn migrate_legacy_dynamics(connection: &mut Connection) -> Result<(), String> {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| format!("查询旧归档失败：{error}"))?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取待迁移记录失败：{error}"))?
     };
     if legacy.is_empty() {
         return Ok(());
@@ -960,9 +970,9 @@ fn migrate_legacy_dynamics(connection: &mut Connection) -> Result<(), String> {
         .transaction()
         .map_err(|error| format!("开始旧归档迁移失败：{error}"))?;
     for (owner_uin, raw_json) in legacy {
-        if let Ok(feed) = serde_json::from_str::<Value>(&raw_json) {
-            save_original_dynamic(&transaction, &owner_uin, &feed)?;
-        }
+        let feed = serde_json::from_str::<Value>(&raw_json)
+            .map_err(|error| format!("旧原始数据损坏，未完成迁移：{error}"))?;
+        save_original_dynamic(&transaction, &owner_uin, &feed)?;
     }
     transaction
         .commit()
@@ -1044,9 +1054,29 @@ fn save_feed_rows(
 ) -> Result<u64, String> {
     let mut saved = 0;
     for feed in feeds {
-        save_original_dynamic(transaction, owner_uin, feed)?;
-        let feed = parse_feed(feed)?;
-        let changed = transaction.execute(
+        let parsed = parse_feed(feed)?;
+        let stored = transaction
+            .prepare_cached("SELECT raw_json FROM archive_feeds WHERE owner_uin=?1 AND feed_key=?2")
+            .map_err(|error| format!("准备已有互动查询失败：{error}"))?
+            .query_row(params![owner_uin, parsed.feed_key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|error| format!("读取已有互动失败：{error}"))?;
+        let feed = match stored {
+            Some(raw) => {
+                let mut snapshot = serde_json::from_str(&raw)
+                    .map_err(|error| format!("已有互动数据损坏，未覆盖原记录：{error}"))?;
+                merge_recovery_snapshot(&mut snapshot, feed);
+                save_original_dynamic(transaction, owner_uin, &snapshot)?;
+                parse_feed(&snapshot)?
+            }
+            None => {
+                save_original_dynamic(transaction, owner_uin, feed)?;
+                parsed
+            }
+        };
+        let changed = transaction.prepare_cached(
             "INSERT INTO archive_feeds
              (owner_uin, feed_key, cell_id, event_type, event_time, title, content, event_summary,
               actor_uin, actor_name, original_author_uin, original_author_name, picture_count,
@@ -1060,6 +1090,7 @@ fn save_feed_rows(
               picture_count=excluded.picture_count,pictures_json=excluded.pictures_json,
               video_json=excluded.video_json,comments_json=excluded.comments_json,
               raw_json=excluded.raw_json,archived_at=excluded.archived_at",
+        ).map_err(|error| format!("准备动态写入失败：{error}"))?.execute(
             params![owner_uin, feed.feed_key, feed.cell_id, feed.event_type, feed.event_time,
                 feed.title, feed.content, feed.event_summary, feed.actor_uin, feed.actor_name,
                 feed.original_author_uin, feed.original_author_name, feed.picture_count,
@@ -1068,61 +1099,6 @@ fn save_feed_rows(
         saved += changed as u64;
     }
     Ok(saved)
-}
-
-fn reconcile_history_dynamics(
-    transaction: &rusqlite::Transaction<'_>,
-    owner_uin: &str,
-) -> Result<(), String> {
-    let history_rows = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT cell_id,content FROM archive_dynamics
-                 WHERE owner_uin=?1 AND category='self' AND cell_id LIKE 'history-v2:%'
-                   AND TRIM(COALESCE(content,''))<>''",
-            )
-            .map_err(|error| format!("读取待合并历史动态失败：{error}"))?;
-        let rows = statement
-            .query_map(params![owner_uin], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| format!("查询待合并历史动态失败：{error}"))?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
-    };
-    for (history_cell_id, content) in history_rows {
-        let candidates = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT cell_id FROM archive_dynamics
-                     WHERE owner_uin=?1 AND category='self'
-                       AND cell_id NOT LIKE 'history-v2:%'
-                       AND TRIM(COALESCE(content,''))=TRIM(?2)
-                     LIMIT 2",
-                )
-                .map_err(|error| format!("查找可见说说匹配项失败：{error}"))?;
-            let rows = statement
-                .query_map(params![owner_uin, content], |row| row.get::<_, String>(0))
-                .map_err(|error| format!("查询可见说说匹配项失败：{error}"))?;
-            rows.filter_map(Result::ok).collect::<Vec<_>>()
-        };
-        if candidates.len() != 1 {
-            continue;
-        }
-        transaction
-            .execute(
-                "UPDATE archive_feeds SET cell_id=?1
-                 WHERE owner_uin=?2 AND cell_id=?3",
-                params![candidates[0], owner_uin, history_cell_id],
-            )
-            .map_err(|error| format!("合并历史互动失败：{error}"))?;
-        transaction
-            .execute(
-                "DELETE FROM archive_dynamics WHERE owner_uin=?1 AND cell_id=?2",
-                params![owner_uin, history_cell_id],
-            )
-            .map_err(|error| format!("清理重复历史动态失败：{error}"))?;
-    }
-    Ok(())
 }
 
 fn save_page(
@@ -1174,11 +1150,20 @@ fn save_retried_page(
     feeds: &[Value],
 ) -> Result<u64, String> {
     let mut connection = open_database(app)?;
+    save_retried_rows(&mut connection, owner_uin, feeds)
+}
+
+fn save_retried_rows(
+    connection: &mut Connection,
+    owner_uin: &str,
+    feeds: &[Value],
+) -> Result<u64, String> {
     let transaction = connection
         .transaction()
         .map_err(|error| format!("无法开始重试事务：{error}"))?;
     let saved = save_feed_rows(&transaction, owner_uin, feeds)?;
-    reconcile_history_dynamics(&transaction, owner_uin)?;
+    // A matching body is not a stable post identity. Keep hash-only history
+    // records separate; canonical Qzone IDs already merge through the unique key.
     transaction
         .commit()
         .map_err(|error| format!("提交重试事务失败：{error}"))?;
@@ -1546,6 +1531,28 @@ fn load_checkpoint(
     }
 }
 
+// History and interaction endpoints often return only part of the same post.
+// Missing fields and empty containers must not erase an earlier full snapshot.
+fn merge_recovery_snapshot(stored: &mut Value, incoming: &Value) {
+    match incoming {
+        Value::Null => {}
+        Value::String(text) if text.trim().is_empty() => {}
+        Value::Array(items) if items.is_empty() => {}
+        Value::Object(fields) if fields.is_empty() => {}
+        Value::Number(number)
+            if number.as_i64() == Some(0) && stored.as_i64().is_some_and(|value| value > 0) => {}
+        Value::Object(fields) => {
+            if !stored.is_object() {
+                *stored = json!({});
+            }
+            for (key, value) in fields {
+                merge_recovery_snapshot(&mut stored[key], value);
+            }
+        }
+        _ => *stored = incoming.clone(),
+    }
+}
+
 fn save_original_dynamic(
     transaction: &rusqlite::Transaction<'_>,
     owner_uin: &str,
@@ -1557,6 +1564,24 @@ fn save_original_dynamic(
     let Some(cell_id) = text_at(original, "/cell_id/cellid") else {
         return Ok(());
     };
+    let stored = transaction
+        .prepare_cached(
+            "SELECT raw_original_json FROM archive_dynamics WHERE owner_uin=?1 AND cell_id=?2",
+        )
+        .map_err(|error| format!("准备已有说说查询失败：{error}"))?
+        .query_row(params![owner_uin, cell_id], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|error| format!("读取已有说说失败：{error}"))?;
+    let snapshot = match stored {
+        Some(raw) => {
+            let mut snapshot = serde_json::from_str(&raw)
+                .map_err(|error| format!("已有说说数据损坏，未覆盖原记录：{error}"))?;
+            merge_recovery_snapshot(&mut snapshot, original);
+            snapshot
+        }
+        None => original.clone(),
+    };
+    let original = &snapshot;
     let original_appid = original
         .pointer("/cell_comm/appid")
         .and_then(Value::as_i64)
@@ -1598,7 +1623,7 @@ fn save_original_dynamic(
         .get("cell_video")
         .filter(|value| !value.is_null())
         .map(Value::to_string);
-    transaction.execute(
+    transaction.prepare_cached(
         "INSERT INTO archive_dynamics
          (owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,raw_original_json,archived_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
@@ -1608,10 +1633,15 @@ fn save_original_dynamic(
             WHEN excluded.published_at<=0 THEN archive_dynamics.published_at
             ELSE MIN(archive_dynamics.published_at,excluded.published_at)
           END,
-          content=excluded.content,author_uin=excluded.author_uin,
-          author_name=excluded.author_name,category=excluded.category,pictures_json=COALESCE(excluded.pictures_json,archive_dynamics.pictures_json),
+          content=CASE WHEN TRIM(COALESCE(excluded.content,''))='' THEN archive_dynamics.content ELSE excluded.content END,
+          author_uin=COALESCE(excluded.author_uin,archive_dynamics.author_uin),
+          author_name=COALESCE(excluded.author_name,archive_dynamics.author_name),
+          category=CASE WHEN excluded.author_uin IS NULL AND excluded.category<>'guestbook'
+            THEN archive_dynamics.category ELSE excluded.category END,
+          pictures_json=COALESCE(excluded.pictures_json,archive_dynamics.pictures_json),
           video_json=COALESCE(excluded.video_json,archive_dynamics.video_json),
           raw_original_json=excluded.raw_original_json,archived_at=excluded.archived_at",
+    ).map_err(|error| format!("准备原动态写入失败：{error}"))?.execute(
         params![owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,original.to_string(),now()],
     ).map_err(|error| format!("保存原动态失败：{error}"))?;
     Ok(())
@@ -3245,54 +3275,70 @@ pub async fn list_archived_feeds(
     .map_err(|error| format!("归档查询任务异常退出：{error}"))?
 }
 
+// Keep below SQLite's conservative 999-parameter limit (two keys per item).
+const INTERACTION_BATCH_SIZE: usize = 200;
+
 fn hydrate_archive_item_interactions(
     connection: &Connection,
     items: &mut [ArchiveItem],
 ) -> Result<(), String> {
-    let mut comment_statement = connection
-        .prepare(
-            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
-             WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
-        )
-        .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    for item in items.iter_mut() {
-        let comments = comment_statement
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(comment_from_values(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|error| format!("查询动态评论失败：{error}"))?;
-        item.comments = merge_comments(comments.filter_map(Result::ok));
-        item.comment_count = comment_interaction_count(&item.comments);
-    }
-    drop(comment_statement);
-    let mut like_statement = connection
-        .prepare(
-            "SELECT actor_uin,actor_name,
-                    (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%'),event_time
-             FROM archive_feeds
-             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217
-             ORDER BY (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%') ASC,event_time ASC",
-        )
-        .map_err(|error| format!("准备点赞查询失败：{error}"))?;
-    for item in items.iter_mut() {
-        let likes = like_statement
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(LikeUser {
-                    uin: row.get(0)?,
-                    nickname: row.get(1)?,
-                    historical: row.get(2)?,
-                    liked_at: row.get(3)?,
-                })
-            })
-            .map_err(|error| format!("查询点赞用户失败：{error}"))?;
-        item.likes = deduplicate_likes(likes.filter_map(Result::ok));
-        item.like_count = item.likes.len() as i64;
+    for batch in items.chunks_mut(INTERACTION_BATCH_SIZE) {
+        let placeholders = vec!["(?,?)"; batch.len()].join(",");
+        let sql = format!(
+            "WITH requested(owner_uin,cell_id) AS (VALUES {placeholders})
+             SELECT f.owner_uin,f.cell_id,f.event_type,f.comments_json,f.actor_uin,
+                    f.actor_name,f.event_summary,f.event_time,
+                    (f.feed_key LIKE 'history-v2-event:%' OR f.feed_key LIKE 'history-event:%')
+             FROM requested r JOIN archive_feeds f
+               ON f.owner_uin=r.owner_uin AND f.cell_id=r.cell_id
+             WHERE f.event_type IN (2,311,217)
+             ORDER BY CASE WHEN f.event_type=217 THEN
+               (f.feed_key LIKE 'history-v2-event:%' OR f.feed_key LIKE 'history-event:%')
+               ELSE 0 END ASC,f.event_time ASC,f.id ASC"
+        );
+        let values = batch
+            .iter()
+            .flat_map(|item| [&item.owner_uin, &item.cell_id]);
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| format!("准备互动查询失败：{error}"))?;
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(values))
+            .map_err(|error| format!("查询互动记录失败：{error}"))?;
+        let mut interactions: HashMap<_, (Vec<ArchiveComment>, Vec<LikeUser>)> = HashMap::new();
+        let read_error = |error| format!("读取互动记录失败：{error}");
+        while let Some(row) = rows.next().map_err(&read_error)? {
+            let key = (
+                row.get::<_, String>(0).map_err(&read_error)?,
+                row.get::<_, String>(1).map_err(&read_error)?,
+            );
+            let (comments, likes) = interactions.entry(key).or_default();
+            if row.get::<_, i64>(2).map_err(&read_error)? == 217 {
+                likes.push(LikeUser {
+                    uin: row.get(4).map_err(&read_error)?,
+                    nickname: row.get(5).map_err(&read_error)?,
+                    historical: row.get(8).map_err(&read_error)?,
+                    liked_at: row.get(7).map_err(&read_error)?,
+                });
+            } else {
+                comments.push(comment_from_values(
+                    row.get(3).map_err(&read_error)?,
+                    row.get(4).map_err(&read_error)?,
+                    row.get(5).map_err(&read_error)?,
+                    row.get(6).map_err(&read_error)?,
+                    row.get(7).map_err(&read_error)?,
+                ));
+            }
+        }
+        for item in batch {
+            let (comments, likes) = interactions
+                .remove(&(item.owner_uin.clone(), item.cell_id.clone()))
+                .unwrap_or_default();
+            item.comments = merge_comments(comments);
+            item.comment_count = comment_interaction_count(&item.comments);
+            item.likes = deduplicate_likes(likes);
+            item.like_count = item.likes.len() as i64;
+        }
     }
     Ok(())
 }
@@ -3453,6 +3499,7 @@ pub async fn get_archived_feed(
 ) -> Result<ArchiveItem, String> {
     crate::license::require_read_access()?;
     let owner_uin = owner_uin_for_reads(&app, login.inner()).await?;
+    tauri::async_runtime::spawn_blocking(move || {
     let connection = open_database(&app)?;
     let mut item = connection.query_row(
         "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
@@ -3468,53 +3515,9 @@ pub async fn get_archived_feed(
                 like_count: 0, comment_count: 0, likes: vec![], comments: vec![] })
         },
     ).map_err(|error| match error { rusqlite::Error::QueryReturnedNoRows => "原始动态不存在或已删除".into(), _ => format!("读取原始动态失败：{error}") })?;
-    let mut comments = connection
-        .prepare(
-            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
-        )
-        .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    item.comments = merge_comments(
-        comments
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(comment_from_values(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|error| format!("查询动态评论失败：{error}"))?
-            .filter_map(Result::ok),
-    );
-    item.comment_count = comment_interaction_count(&item.comments);
-    drop(comments);
-    let mut likes_stmt = connection
-        .prepare(
-            "SELECT actor_uin,actor_name,
-                    (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%'),event_time
-             FROM archive_feeds
-             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217
-             ORDER BY (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%') ASC,event_time ASC",
-        )
-        .map_err(|error| format!("准备点赞查询失败：{error}"))?;
-    item.likes = deduplicate_likes(
-        likes_stmt
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(LikeUser {
-                    uin: row.get(0)?,
-                    nickname: row.get(1)?,
-                    historical: row.get(2)?,
-                    liked_at: row.get(3)?,
-                })
-            })
-            .map_err(|error| format!("查询点赞用户失败：{error}"))?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>(),
-    );
-    item.like_count = item.likes.len() as i64;
+    hydrate_archive_item_interactions(&connection, std::slice::from_mut(&mut item))?;
     Ok(item)
+    }).await.map_err(|error| format!("说说详情查询任务异常退出：{error}"))?
 }
 
 fn comment_from_values(
@@ -3651,7 +3654,8 @@ fn merge_comments(comments: impl IntoIterator<Item = ArchiveComment>) -> Vec<Arc
     for mut comment in comments {
         let existing = merged.iter_mut().find(|candidate| {
             (comment.comment_id.is_some() && candidate.comment_id == comment.comment_id)
-                || (candidate.uin == comment.uin
+                || ((candidate.comment_id.is_none() || comment.comment_id.is_none())
+                    && candidate.uin == comment.uin
                     && candidate.content == comment.content
                     && candidate.created_at == comment.created_at)
         });
@@ -3782,7 +3786,7 @@ fn archive_items_for_export(
                 video_url: video_urls.first().cloned(),
                 video_urls,
                 video_cover_url: video_cover_url(video_json),
-                // 导出路径随后逐条填充评论与点赞，这里不再用子查询预先计数。
+                // 列表、详情和导出共用批量互动查询。
                 like_count: 0,
                 comment_count: 0,
                 likes: vec![],
@@ -3797,51 +3801,7 @@ fn archive_items_for_export(
         items.retain(|item| ids.contains(&item.id));
     }
     drop(statement);
-    let mut comments = connection
-        .prepare(
-            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
-        )
-        .map_err(|error| format!("准备导出评论失败：{error}"))?;
-    for item in &mut items {
-        let rows = comments
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(comment_from_values(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|error| format!("查询导出评论失败：{error}"))?;
-        item.comments = merge_comments(rows.filter_map(Result::ok));
-        item.comment_count = comment_interaction_count(&item.comments);
-    }
-    drop(comments);
-    let mut export_likes = connection
-        .prepare(
-            "SELECT actor_uin,actor_name,
-                    (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%'),event_time
-             FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217
-         ORDER BY (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%') ASC,event_time ASC",
-        )
-        .map_err(|error| format!("准备导出点赞查询失败：{error}"))?;
-    for item in &mut items {
-        let likes = export_likes
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(LikeUser {
-                    uin: row.get(0)?,
-                    nickname: row.get(1)?,
-                    historical: row.get(2)?,
-                    liked_at: row.get(3)?,
-                })
-            })
-            .map_err(|error| format!("查询导出点赞用户失败：{error}"))?;
-        item.likes = deduplicate_likes(likes.filter_map(Result::ok));
-        item.like_count = item.likes.len() as i64;
-    }
+    hydrate_archive_item_interactions(connection, &mut items)?;
     Ok(items)
 }
 
@@ -4630,6 +4590,50 @@ pub async fn link_library_video(
 pub struct LibraryMedia {
     path: String,
     is_video: bool,
+}
+
+/// Covers can be private or use old HTTP links; native loading shares the authenticated cache.
+#[tauri::command]
+pub async fn load_library_cover(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+    id: i64,
+) -> Result<String, String> {
+    crate::license::require_read_access()?;
+    let owner = owner_uin_for_reads(&app, login.inner()).await?;
+    let dir = crate::account_storage::directory(&app)?.join("images");
+    let (cover, timestamp): (Option<String>, i64) = open_database(&app)?
+        .query_row(
+            "SELECT cover_url,created_at FROM archive_library_items WHERE id=?1 AND owner_uin=?2",
+            params![id, owner],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| "当前账号中不存在这张封面")?;
+    let cover = cover
+        .filter(|url| !url.trim().is_empty())
+        .ok_or("这条记录没有封面地址")?;
+    let urls = vec![if cover.starts_with("//") {
+        format!("https:{cover}")
+    } else {
+        cover
+    }];
+    if let Some(path) = crate::media_store::cached(&dir, &urls)? {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    crate::license::require_archive_access()?;
+    let auth = login.qzone_auth().await?;
+    if auth.uin != owner {
+        return Err("账号已切换，请重新打开封面".into());
+    }
+    let _permit = state
+        .image_downloads
+        .acquire()
+        .await
+        .map_err(|_| "图片队列已关闭")?;
+    crate::media_store::download(&dir, &auth, urls, timestamp, false)
+        .await
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -5982,3 +5986,6 @@ mod source_resume_tests {
         assert_eq!(count, 1);
     }
 }
+
+#[cfg(test)]
+mod data_tests;

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import { getQzoneLoginUser, type LoginCredentials, openWebLogin, checkWebLogin, syncCookiesToWebview } from "../utils/qlogin";
+import { getQzoneLoginUser, type LoginIdentity, openWebLogin, checkWebLogin, syncCookiesToWebview } from "../utils/qlogin";
 import router from "../router";
 import { platform } from "../utils/platform";
 import { useLicenseStore } from "./license";
@@ -17,7 +17,7 @@ interface LoginUser {
 interface LoginStatus {
   status: "waiting" | "scanned" | "expired" | "success" | "error" | "loggedOut" | "webLoginOpened" | "webLoginWaiting" | "webLoginCancelled";
   message: string;
-  auth?: LoginCredentials;
+  auth?: LoginIdentity;
 }
 
 interface QrLoginStart {
@@ -42,11 +42,13 @@ export const useAuthStore = defineStore("auth", () => {
   async function restoreSession() {
     if (restoringSession || loggedIn.value) return;
     restoringSession = true;
+    const run = pollingRun;
     try {
       // Restoring an online QQ session is subject to the same license as a new login.
       // Local archive browsing uses independent local-data commands.
       const license = useLicenseStore();
       await license.refresh();
+      if (run !== pollingRun) return;
       if (!license.canArchive) {
         status.value = "loggedOut";
         user.value = undefined;
@@ -54,19 +56,28 @@ export const useAuthStore = defineStore("auth", () => {
         return;
       }
       const result = await invoke<LoginStatus>("get_login_status");
+      if (run !== pollingRun) return;
       status.value = result.status;
       message.value = result.message;
       if (result.status === "success" && result.auth) {
         // 本地会话已恢复；昵称或头像联网失败不能挡住已有备份。
         user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
-        try { user.value = await getQzoneLoginUser(result.auth); } catch { /* 保留本地账号 */ }
+        await loadProfile(run);
+        if (run !== pollingRun) return;
         syncCookiesToWebview().catch(() => {});
       }
     } catch {
-      status.value = "loggedOut";
+      if (run === pollingRun) status.value = "loggedOut";
     } finally {
       restoringSession = false;
     }
+  }
+
+  async function loadProfile(run: number) {
+    try {
+      const profile = await getQzoneLoginUser();
+      if (run === pollingRun && profile.uin === user.value?.uin) user.value = profile;
+    } catch { /* A missing nickname or avatar must not undo a valid login. */ }
   }
 
   async function ensureLoginAccess() {
@@ -118,10 +129,10 @@ export const useAuthStore = defineStore("auth", () => {
         status.value = result.status;
         message.value = result.message;
         if (result.status === "success") {
-          if (!result.auth) throw new Error("Rust 后端未返回完整登录凭证");
+          if (!result.auth) throw new Error("登录响应中缺少 QQ 账号");
           message.value = "正在获取用户资料…";
           user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
-          try { user.value = await getQzoneLoginUser(result.auth); } catch { /* Profile failure must not undo a valid session. */ }
+          await loadProfile(run);
           if (run !== pollingRun) return;
           syncCookiesToWebview().catch(() => {});
           await delay(700);
@@ -168,9 +179,9 @@ export const useAuthStore = defineStore("auth", () => {
         status.value = result.status;
         message.value = result.message;
         if (result.status === "success") {
-          if (!result.auth) throw new Error("后端未返回登录凭证");
+          if (!result.auth) throw new Error("登录响应中缺少 QQ 账号");
           user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
-          try { user.value = await getQzoneLoginUser(result.auth); } catch { /* Profile failure must not undo a valid session. */ }
+          await loadProfile(run);
           if (run !== pollingRun) return;
           syncCookiesToWebview().catch(() => {});
           await delay(700);

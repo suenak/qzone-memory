@@ -23,7 +23,7 @@ import QzoneText from "../components/QzoneText.vue";
 import EmptyState from "../components/ui/EmptyState.vue";
 import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
-import { loadRemoteImageBlob, mediaFileName } from "../utils/archiveImage";
+import { ImageRequestScope, mediaFileName } from "../utils/archiveImage";
 import { getArchivedFeed, listArchivedMedia, loadArchivedImage, loadArchivedVideo, type ArchiveItem, type ArchiveMediaItem } from "../utils/qzone";
 
 const PAGE_SIZE = 60;
@@ -41,6 +41,7 @@ const detailTarget = ref<ArchiveMediaItem>();
 let loadSequence = 0;
 let detailSequence = 0;
 const detail = ref<ArchiveItem>();
+const imageRequests = new ImageRequestScope();
 const imageSources = reactive<Record<string, string>>({});
 const imageLoading = reactive<Record<string, boolean>>({});
 const imageErrors = reactive<Record<string, string>>({});
@@ -161,24 +162,31 @@ function observeImages() {
 
 async function loadImage(url: string, dynamicId?: number, pictureIndex?: number) {
   if (!url || imageSources[url] || imageLoading[url]) return;
+  const generation = imageRequests.generation;
   imageLoading[url] = true;
   delete imageErrors[url];
   delete imageFallbackAttempted[url];
   try {
     if (dynamicId !== undefined && pictureIndex !== undefined) {
       try {
-        imageSources[url] = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
+        const source = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
+        if (generation !== imageRequests.generation) return;
+        imageSources[url] = source;
         return;
       } catch (reason) {
+        if (generation !== imageRequests.generation) return;
         console.warn("本地媒体图片加载失败，改用原始地址", reason);
       }
     }
     await loadRemoteImage(url);
-  } catch (reason) { imageErrors[url] = String(reason); console.error("媒体图片加载失败", reason); }
-  finally { imageLoading[url] = false; }
+  } catch (reason) { if (generation === imageRequests.generation) imageErrors[url] = String(reason); }
+  finally { if (generation === imageRequests.generation) imageLoading[url] = false; }
 }
 async function loadRemoteImage(url: string) {
-  imageSources[url] = await loadRemoteImageBlob(url);
+  const generation = imageRequests.generation;
+  const source = await imageRequests.load(url);
+  if (generation === imageRequests.generation) imageSources[url] = source;
+  else URL.revokeObjectURL(source);
 }
 async function handleImageError(url: string) {
   if (!url || imageLoading[url]) return;
@@ -189,11 +197,12 @@ async function handleImageError(url: string) {
     imageErrors[url] = "图片文件无法显示，可点击重试";
     return;
   }
+  const generation = imageRequests.generation;
   imageFallbackAttempted[url] = true;
   imageLoading[url] = true;
   try { await loadRemoteImage(url); }
-  catch (reason) { imageErrors[url] = String(reason); }
-  finally { imageLoading[url] = false; }
+  catch (reason) { if (generation === imageRequests.generation) imageErrors[url] = String(reason); }
+  finally { if (generation === imageRequests.generation) imageLoading[url] = false; }
 }
 
 async function openOriginal(item: ArchiveMediaItem) {
@@ -208,22 +217,28 @@ async function openOriginal(item: ArchiveMediaItem) {
     const result = await getArchivedFeed(item.dynamicId);
     if (sequence !== detailSequence) return;
     detail.value = result;
-    await Promise.all(detail.value.pictureUrls.map((url, index) => loadImage(url, detail.value?.id, index)));
-    if (detail.value.videoCoverUrl) await loadImage(detail.value.videoCoverUrl);
+    await Promise.all(result.pictureUrls.map((url, index) => loadImage(url, result.id, index)));
+    if (sequence !== detailSequence) return;
+    if (result.videoCoverUrl) await loadImage(result.videoCoverUrl);
   } catch (reason) { if (sequence === detailSequence) detailError.value = describeError(reason, "说说详情读取失败，请重试。"); }
   finally { if (sequence === detailSequence) detailLoading.value = false; }
 }
 
 async function playVideo() {
   if (!detail.value?.videoUrl || videoLoading.value) return;
+  const sequence = detailSequence;
+  const id = detail.value.id;
   videoLoading.value = true;
   videoError.value = "";
-  try { videoSource.value = convertFileSrc(await loadArchivedVideo(detail.value.id)); }
-  catch (reason) { videoError.value = `视频加载失败：${String(reason)}`; }
-  finally { videoLoading.value = false; }
+  try {
+    const source = convertFileSrc(await loadArchivedVideo(id));
+    if (sequence === detailSequence) videoSource.value = source;
+  } catch (reason) { if (sequence === detailSequence) videoError.value = `视频加载失败：${String(reason)}`; }
+  finally { if (sequence === detailSequence) videoLoading.value = false; }
 }
 
 function releaseVideo() {
+  videoLoading.value = false;
   if (videoSource.value.startsWith("blob:")) URL.revokeObjectURL(videoSource.value);
   videoSource.value = "";
   videoError.value = "";
@@ -314,6 +329,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  ++loadSequence; ++detailSequence;
+  imageRequests.clear();
   imageObserver?.disconnect(); loadObserver?.disconnect(); releaseVideo();
   Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
 

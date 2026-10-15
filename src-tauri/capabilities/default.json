@@ -12,7 +12,6 @@
     {
       "identifier": "http:default",
       "allow": [
-        { "url": "https://h5.qzone.qq.com/*" },
         { "url": "https://q1.qlogo.cn/*" },
         { "url": "https://qlogo2.store.qq.com/*" },
         { "url": "https://photovideo.photo.qq.com/*" },

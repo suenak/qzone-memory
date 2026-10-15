@@ -44,7 +44,7 @@ import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import { useToast } from "../composables/useToast";
-import { loadRemoteImageBlob, mediaFileName } from "../utils/archiveImage";
+import { ImageRequestScope, mediaFileName } from "../utils/archiveImage";
 import { countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, listArchiveYears, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 
 const route = useRoute();
@@ -82,6 +82,7 @@ const avatarTimestamp = ref(Date.now());
 const videoSources = reactive<Record<number, string>>({});
 const videoLoading = reactive<Record<number, boolean>>({});
 const videoErrors = reactive<Record<number, string>>({});
+const imageRequests = new ImageRequestScope();
 const imageSources = reactive<Record<string, string>>({});
 const imageLoading = reactive<Record<string, boolean>>({});
 const imageErrors = reactive<Record<string, string>>({});
@@ -106,6 +107,7 @@ let sentinelObserver: IntersectionObserver | undefined;
 let sentinelVisible = false;
 
 const viewMode = ref<"timeline" | "cards">("timeline");
+const toolsOpen = ref(false);
 const refinementsOpen = ref(false);
 const monthFilter = ref(0);
 const fromDate = ref("");
@@ -185,7 +187,10 @@ async function load() {
     first.value = items.length;
     years.value = availableYears;
     if (selectedYear.value && !availableYears.includes(selectedYear.value)) selectedYear.value = 0;
-    await nextTick(); observeArchiveImages();
+    // The timeline is hidden while loading; observe only after it has rendered.
+    loading.value = false;
+    await nextTick();
+    if (sequence === loadSequence) observeArchiveImages();
   }
   catch (reason) { if (sequence === loadSequence) error.value = String(reason); }
   finally { if (sequence === loadSequence) { loading.value = false; void ensureFilled(); } }
@@ -240,9 +245,11 @@ function isHeldByLightbox(blobUrl: string) {
   return previewSources.value.some((entry) => entry.source === blobUrl);
 }
 function releaseVideos() {
+  imageRequests.clear();
   imageObserver?.disconnect();
   Object.values(videoSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
   Object.keys(videoSources).forEach((key) => delete videoSources[Number(key)]);
+  Object.keys(videoLoading).forEach((key) => delete videoLoading[Number(key)]);
   Object.keys(videoErrors).forEach((key) => delete videoErrors[Number(key)]);
   Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:") && !isHeldByLightbox(url)) URL.revokeObjectURL(url); });
   Object.keys(imageSources).forEach((key) => delete imageSources[key]);
@@ -267,24 +274,31 @@ function observeArchiveImages() {
 }
 async function loadArchiveImage(url: string, dynamicId?: number, pictureIndex?: number) {
   if (!url || imageSources[url] || imageLoading[url]) return;
+  const generation = imageRequests.generation;
   imageLoading[url] = true;
   delete imageErrors[url];
   delete imageFallbackAttempted[url];
   try {
     if (dynamicId !== undefined && pictureIndex !== undefined) {
       try {
-        imageSources[url] = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
+        const source = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
+        if (generation !== imageRequests.generation) return;
+        imageSources[url] = source;
         return;
       } catch (reason) {
+        if (generation !== imageRequests.generation) return;
         console.warn("本地图片备份加载失败，改用原始地址", reason);
       }
     }
     await loadRemoteArchiveImage(url);
-  } catch (reason) { imageErrors[url] = String(reason); console.error("备份图片加载失败", reason); }
-  finally { imageLoading[url] = false; }
+  } catch (reason) { if (generation === imageRequests.generation) imageErrors[url] = String(reason); }
+  finally { if (generation === imageRequests.generation) imageLoading[url] = false; }
 }
 async function loadRemoteArchiveImage(url: string) {
-  imageSources[url] = await loadRemoteImageBlob(url);
+  const generation = imageRequests.generation;
+  const source = await imageRequests.load(url);
+  if (generation === imageRequests.generation) imageSources[url] = source;
+  else URL.revokeObjectURL(source);
 }
 async function handleArchiveImageError(url: string) {
   if (!url || imageLoading[url]) return;
@@ -296,11 +310,12 @@ async function handleArchiveImageError(url: string) {
     imageErrors[url] = "图片文件无法显示，可点击重试";
     return;
   }
+  const generation = imageRequests.generation;
   imageFallbackAttempted[url] = true;
   imageLoading[url] = true;
   try { await loadRemoteArchiveImage(url); }
-  catch (reason) { imageErrors[url] = String(reason); }
-  finally { imageLoading[url] = false; }
+  catch (reason) { if (generation === imageRequests.generation) imageErrors[url] = String(reason); }
+  finally { if (generation === imageRequests.generation) imageLoading[url] = false; }
 }
 function imageExtension(url: string) {
   const match = url.match(/\.([a-zA-Z0-9]{2,5})(?:[?#]|$)/);
@@ -364,16 +379,19 @@ async function exportHtml(selectedOnly: boolean) {
 }
 async function loadVideo(item: ArchiveItem) {
   if (!item.videoUrl || videoLoading[item.id]) return;
+  const generation = imageRequests.generation;
   videoLoading[item.id] = true; delete videoErrors[item.id];
   try {
     const path = await loadArchivedVideo(item.id);
+    if (generation !== imageRequests.generation) return;
     videoSources[item.id] = convertFileSrc(path);
     await nextTick();
+    if (generation !== imageRequests.generation) return;
     const video = document.querySelector<HTMLVideoElement>(`#archive-video-${item.id}`);
     if (!video) throw new Error("视频播放器创建失败");
     await video.play().catch((reason) => { throw new Error(`播放器无法播放该视频：${String(reason)}`); });
-  } catch (reason) { videoErrors[item.id] = `视频加载失败：${String(reason)}`; }
-  finally { videoLoading[item.id] = false; }
+  } catch (reason) { if (generation === imageRequests.generation) videoErrors[item.id] = `视频加载失败：${String(reason)}`; }
+  finally { if (generation === imageRequests.generation) videoLoading[item.id] = false; }
 }
 function toggleVisible() {
   const visible = new Set(visibleIds.value);
@@ -438,6 +456,8 @@ watch(
 );
 watch(() => route.query.year, (value) => { selectedYear.value = Number(value) || 0; });
 onBeforeUnmount(() => {
+  ++loadSequence;
+  closeImagePreview();
   if (searchTimer) clearTimeout(searchTimer);
 
   imageObserver?.disconnect();
@@ -461,11 +481,13 @@ onBeforeUnmount(() => {
             class="ar-segment"
             :class="{ 'is-active': category === option.value }"
             :title="option.hint"
+            :aria-label="option.label"
             :aria-pressed="category === option.value"
             @click="category = option.value"
           >
             <component :is="option.icon" :size="15" :stroke-width="1.8" />
-            <span>{{ option.label }}</span>
+            <span class="ar-category-label">{{ option.label }}</span>
+            <span class="ar-category-short">{{ option.value === 'self' ? '我的' : '其他' }}</span>
           </button>
         </div>
 
@@ -492,44 +514,52 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div class="ar-view-tools">
-        <div class="ar-segments" role="group" aria-label="展示方式"><button class="ar-btn" type="button" :aria-pressed="viewMode === 'timeline'" @click="viewMode = 'timeline'"><List :size="15" :stroke-width="1.8" />时间轴</button><button class="ar-btn" type="button" :aria-pressed="viewMode === 'cards'" @click="viewMode = 'cards'"><LayoutGrid :size="15" :stroke-width="1.8" />卡片</button></div>
-        <button class="ar-btn" type="button" :aria-expanded="refinementsOpen" aria-controls="archive-refinements" @click="refinementsOpen = !refinementsOpen"><SlidersHorizontal :size="15" :stroke-width="1.8" /><span>筛选已加载内容{{ hasRefinements ? ' · 已开启' : '' }}</span></button>
-      </div>
-      <div v-show="refinementsOpen" id="archive-refinements" class="ar-refinements">
-        <p>以下条件仅筛选已加载的 {{ records.length }} 条。查找全部备份请使用上方的年份和搜索。</p>
-        <div class="ar-refinements__fields"><Select v-model="monthFilter" :options="monthOptions" option-label="label" option-value="value" aria-label="月份（已加载内容）" /><label>开始日期<input v-model="fromDate" type="date" :max="toDate || undefined" /></label><label>结束日期<input v-model="toDate" type="date" :min="fromDate || undefined" /></label><label><input v-model="onlyPhotos" type="checkbox" />仅有图片</label><label><input v-model="onlyInteractions" type="checkbox" />仅有互动</label><button class="ar-btn" type="button" @click="resetRefinements">重置筛选已加载内容</button></div>
-      </div>
       <div class="ar-row ar-row--meta">
         <p class="ar-count">
           <Calendar :size="14" :stroke-width="1.8" />
-          <template v-if="loading">正在读取备份…</template>
-          <template v-else-if="error">备份数量尚未读取</template>
+          <template v-if="loading">正在读取…</template>
+          <template v-else-if="error">数量尚未读取</template>
           <template v-else>
-            <span><strong>{{ totalRecords }}</strong> 条{{ categoryLabel }}</span>
+            <span><strong>{{ totalRecords }}</strong> 条<span class="ar-count__category">{{ categoryLabel }}</span></span>
             <span v-if="records.length < totalRecords">已加载 {{ records.length }} 条</span>
           </template>
         </p>
-
-        <div class="ar-bulk">
-          <button v-if="records.length" type="button" class="ar-btn" @click="toggleVisible">
-            <SquareCheck :size="15" :stroke-width="1.8" />
-            <span>{{ allVisibleSelected ? "取消选择" : `选择已显示的 ${visibleIds.length} 条` }}</span>
-          </button>
-          <span v-if="selectedIds.length" class="ar-pill">已选 {{ selectedIds.length }} 条</span>
-          <button v-if="selectedIds.length" type="button" class="ar-btn" :disabled="exporting" @click="exportHtml(true)">
-            <Download :size="15" :stroke-width="1.8" />
-            <span>导出所选</span>
-          </button>
-          <button v-if="selectedIds.length" type="button" class="ar-btn is-danger" :disabled="deleting" @click="askDelete">
-            <Trash2 :size="15" :stroke-width="1.8" />
-            <span>删除所选</span>
-          </button>
-          <span class="ar-bulk__divider" aria-hidden="true" />
-          <button type="button" class="ar-btn" title="导出此分类的全部说说，不受年份和搜索条件限制" :disabled="!totalRecords || loading || exporting" @click="exportHtml(false)">
-            <Download :size="15" :stroke-width="1.8" />
-            <span>{{ exporting ? "正在导出…" : `导出全部${categoryLabel}` }}</span>
-          </button>
+        <button class="ar-btn ar-mobile-tools" type="button" :aria-expanded="toolsOpen" aria-controls="archive-extra-tools" @click="toolsOpen = !toolsOpen">
+          <SlidersHorizontal :size="15" :stroke-width="1.8" />
+          <span>{{ selectedIds.length ? `已选 ${selectedIds.length} 条` : hasRefinements ? '筛选已开启' : '筛选与导出' }}</span>
+          <ChevronDown :size="14" :stroke-width="1.8" />
+        </button>
+      </div>
+      <div id="archive-extra-tools" class="ar-extra-tools" :class="{ 'is-open': toolsOpen }">
+        <div class="ar-view-tools">
+          <div class="ar-segments" role="group" aria-label="展示方式"><button class="ar-btn" type="button" :aria-pressed="viewMode === 'timeline'" @click="viewMode = 'timeline'"><List :size="15" :stroke-width="1.8" />时间轴</button><button class="ar-btn" type="button" :aria-pressed="viewMode === 'cards'" @click="viewMode = 'cards'"><LayoutGrid :size="15" :stroke-width="1.8" />卡片</button></div>
+          <button class="ar-btn" type="button" :aria-expanded="refinementsOpen" aria-controls="archive-refinements" @click="refinementsOpen = !refinementsOpen"><SlidersHorizontal :size="15" :stroke-width="1.8" /><span>筛选已加载内容{{ hasRefinements ? ' · 已开启' : '' }}</span></button>
+        </div>
+        <div v-show="refinementsOpen" id="archive-refinements" class="ar-refinements">
+          <p>以下条件仅筛选已加载的 {{ records.length }} 条。查找全部备份请使用上方的年份和搜索。</p>
+          <div class="ar-refinements__fields"><Select v-model="monthFilter" :options="monthOptions" option-label="label" option-value="value" aria-label="月份（已加载内容）" /><label>开始日期<input v-model="fromDate" type="date" :max="toDate || undefined" /></label><label>结束日期<input v-model="toDate" type="date" :min="fromDate || undefined" /></label><label><input v-model="onlyPhotos" type="checkbox" />仅有图片</label><label><input v-model="onlyInteractions" type="checkbox" />仅有互动</label><button class="ar-btn" type="button" @click="resetRefinements">重置筛选已加载内容</button></div>
+        </div>
+        <div class="ar-row ar-row--meta">
+          <div class="ar-bulk">
+            <button v-if="records.length" type="button" class="ar-btn" @click="toggleVisible">
+              <SquareCheck :size="15" :stroke-width="1.8" />
+              <span>{{ allVisibleSelected ? "取消选择" : `选择已显示的 ${visibleIds.length} 条` }}</span>
+            </button>
+            <span v-if="selectedIds.length" class="ar-pill">已选 {{ selectedIds.length }} 条</span>
+            <button v-if="selectedIds.length" type="button" class="ar-btn" :disabled="exporting" @click="exportHtml(true)">
+              <Download :size="15" :stroke-width="1.8" />
+              <span>导出所选</span>
+            </button>
+            <button v-if="selectedIds.length" type="button" class="ar-btn is-danger" :disabled="deleting" @click="askDelete">
+              <Trash2 :size="15" :stroke-width="1.8" />
+              <span>删除所选</span>
+            </button>
+            <span class="ar-bulk__divider" aria-hidden="true" />
+            <button type="button" class="ar-btn" title="导出此分类的全部说说，不受年份和搜索条件限制" :disabled="!totalRecords || loading || exporting" @click="exportHtml(false)">
+              <Download :size="15" :stroke-width="1.8" />
+              <span>{{ exporting ? "正在导出…" : `导出全部${categoryLabel}` }}</span>
+            </button>
+          </div>
         </div>
       </div>
     </SectionCard>
@@ -622,7 +652,7 @@ onBeforeUnmount(() => {
             <div class="ar-publisher">
               <strong>{{ item.authorName || "我" }}</strong>
               <span>
-                <span v-if="item.authorUin">QQ {{ item.authorUin }}</span>
+                <span v-if="item.authorUin" class="ar-publisher__uin">QQ {{ item.authorUin }}</span>
                 <time>{{ formatTime(item.publishedAt) }}</time>
               </span>
             </div>
@@ -1774,4 +1804,56 @@ onBeforeUnmount(() => {
 .ar-search { background:var(--color-surface); }
 .ar-bulk { background:var(--color-accent-soft); border-radius:var(--radius-md); padding:var(--space-2) var(--space-3); }
 @media(max-width:600px) { .ar-toolbar { position:static; } .ar-row { gap:var(--space-2); } .ar-btn,.ar-segment { min-height:var(--touch-target); } }
+
+/* On phones, the real year remains the timeline anchor; content uses the full width. */
+.ar-extra-tools { display:contents; }
+.ar-mobile-tools { display:none; }
+.ar-category-short { display:none; }
+@media(max-width:860px) {
+ .archive-page { --ar-rail-width:0px; }
+ .ar-toolbar :deep(.qza-card__body) { padding:var(--space-3); }
+ .ar-toolbar > :deep(.qza-card__body) > .ar-row:first-child { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:var(--space-2); }
+ .ar-segments { padding:0; }
+ .ar-segment { min-width:var(--touch-target); gap:var(--space-1); }
+ .ar-segment .ar-category-short { display:inline; }
+ .ar-search { height:var(--touch-target); grid-column:1 / -1; grid-row:1; }
+ .ar-search input { min-height:var(--touch-target); }
+ .ar-search__clear { width:var(--touch-target); height:var(--touch-target); margin-right:calc(-1 * var(--space-3)); }
+ .ar-toolbar > :deep(.qza-card__body) > .ar-row:first-child > .ar-segments { grid-column:1; grid-row:2; justify-self:start; }
+ .ar-filters { grid-column:1 / -1; grid-row:3; }
+ .ar-filters :deep(.p-select) { min-height:var(--touch-target); }
+ .ar-quick { grid-column:2; grid-row:2; }
+ .ar-quick .is-icon { width:var(--touch-target); min-height:var(--touch-target); }
+ .ar-row--meta { justify-content:space-between; gap:var(--space-2); margin-top:var(--space-2); padding-top:var(--space-2); }
+ .ar-count { flex:1; }
+ .ar-count__category { display:none; }
+ .ar-mobile-tools { display:inline-flex; min-height:var(--touch-target); }
+ .ar-mobile-tools[aria-expanded="true"] > svg:last-child { transform:rotate(180deg); }
+ .ar-extra-tools { display:none; }
+ .ar-extra-tools.is-open { display:block; }
+ .ar-entry { display:block; }
+ .ar-rail { display:none; }
+ .ar-year { margin:var(--space-4) 0 var(--space-3); letter-spacing:normal; }
+ .ar-card { padding:var(--space-4); }
+ .ar-head { gap:var(--space-2); }
+ .ar-avatar { width:var(--space-8); height:var(--space-8); }
+ .ar-publisher strong { font-size:var(--text-base); }
+ .ar-publisher > span { font-size:var(--text-xs); }
+ .ar-publisher__uin { display:none; }
+ .ar-card :deep(.p-checkbox) { width:var(--touch-target); height:var(--touch-target); display:grid; place-items:center; }
+ .ar-content { font-size:var(--text-md); margin-top:var(--space-3); }
+ .ar-record-actions { justify-content:flex-start; gap:var(--space-4); margin-block:var(--space-2); }
+ .ar-link,.ar-retry { min-height:var(--touch-target); display:inline-flex; align-items:center; }
+ .ar-pictures.is-1,.ar-pictures.is-2 { grid-template-columns:repeat(2,minmax(0,1fr)); }
+ .ar-pictures.is-1 { grid-template-columns:minmax(0,1fr); }
+ .ar-picture-pending { align-content:center; gap:var(--space-2); }
+ .ar-comment-meta { gap:var(--space-1) var(--space-2); }
+ .ar-comment-meta > span { display:none; }
+ .ar-comment-meta time { flex-basis:100%; }
+ .ar-comments { padding:var(--space-3); }
+ .ar-bulk { padding:var(--space-2); background:var(--color-surface-sunken); }
+ .ar-bulk .ar-btn { flex:1 1 auto; }
+ .ar-view-tools { gap:var(--space-2); }
+ .ar-toolbar { position:static; }
+}
 </style>

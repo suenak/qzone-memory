@@ -2,7 +2,9 @@ mod account_storage;
 #[cfg(target_os = "android")]
 mod android_login;
 mod archive;
+mod history_response;
 mod license;
+mod login_profile;
 mod media_http;
 mod media_store;
 mod offline_export;
@@ -71,6 +73,7 @@ pub fn run() {
             qlogin::start_qr_login,
             qlogin::poll_qr_login,
             qlogin::get_login_status,
+            login_profile::get_login_user,
             qlogin::logout_qzone,
             qlogin::open_web_login,
             qlogin::check_web_login,
@@ -106,6 +109,7 @@ pub fn run() {
             archive::list_interactors,
             archive::list_contact_comment_threads,
             archive::load_library_media,
+            archive::load_library_cover,
             archive::link_library_video,
             archive::sync_qzone_library,
             archive::list_qzone_library,
