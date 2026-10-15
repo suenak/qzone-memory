@@ -1,13 +1,11 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import { getArchiveProgress, type ArchiveProgress } from "../utils/qzone";
+import { getArchiveProgress, IDLE_ARCHIVE_PROGRESS, type ArchiveProgress } from "../utils/qzone";
 
 /** 任务进行中时的轮询间隔。 */
 const ACTIVE_INTERVAL_MS = 2000;
 /** 空闲时的轮询间隔。侧边栏需要常驻显示状态，但没任务时没必要每 2 秒问一次。 */
 const IDLE_INTERVAL_MS = 15000;
-/** 本地直写进度后的保护窗口，见 holdProgress()。 */
-const PROGRESS_HOLD_MS = 2500;
 
 /**
  * 归档进度的全局状态。
@@ -21,12 +19,14 @@ export const useArchiveStore = defineStore("archive", () => {
 
   let timer: number | null = null;
   let polling = false;
+  let pollRevision = 0;
   /** 进行中的刷新请求。并发调用共享同一个 Promise，见 refresh()。 */
   let pending: Promise<void> | null = null;
-  /** holdProgress() 设置的截止时刻。 */
-  let progressHeldUntil = 0;
+  let revision = 0;
+  let pendingRevision = -1;
+  const taskPending = ref(false);
 
-  const running = computed(() => progress.value?.status === "running");
+  const running = computed(() => taskPending.value || progress.value?.status === "running");
   const limited = computed(() => progress.value?.status === "limited");
   const completed = computed(() => progress.value?.status === "completed");
   const hasTask = computed(() => progress.value !== null);
@@ -50,23 +50,26 @@ export const useArchiveStore = defineStore("archive", () => {
   /** 是否出现了未解决的跳页记录（断点续传的异常条目）。 */
   const hasSkips = computed(() => (progress.value?.skipped ?? 0) > 0);
 
-  /**
-   * 声明「刚刚本地写入过进度」，在窗口期内不接受轮询响应覆盖。
-   *
-   * 「开始 / 停止归档」会直接写 progress，而轮询请求可能**更早发出**、
-   * 在直写之后才返回旧快照。没有这个窗口，按钮状态会回跳
-   * （「停止备份」变回「备份中…」），用户无法判断任务是否在跑。
-   *
-   * 这个判断必须放在 store 里而不是各页面：侧边栏的轮询与任务页的刷新
-   * 走的是同一份状态，只在页面内做保护挡不住侧边栏那一路。
-   */
-  function holdProgress(ttlMs = PROGRESS_HOLD_MS) {
-    progressHeldUntil = Date.now() + ttlMs;
+  // The native start command returns only when the entire run ends. Show the new
+  // run immediately, and reject snapshots requested before either action boundary.
+  function beginRun() {
+    revision += 1;
+    taskPending.value = true;
+    progress.value = {
+      ...IDLE_ARCHIVE_PROGRESS,
+      status: "running",
+      message: "正在从上次断点继续读取…",
+      librarySyncing: progress.value?.librarySyncing ?? false,
+    };
+    error.value = "";
+    reschedule();
   }
 
-  /** 是否仍在保护窗口内。 */
-  function progressHeld() {
-    return Date.now() < progressHeldUntil;
+  function finishRun(snapshot?: ArchiveProgress) {
+    revision += 1;
+    taskPending.value = false;
+    if (snapshot) progress.value = snapshot;
+    reschedule();
   }
 
   /**
@@ -76,19 +79,31 @@ export const useArchiveStore = defineStore("archive", () => {
    * 否则紧跟「开始/停止归档」的那次刷新会被丢弃，调用方读到的仍是旧状态。
    */
   function refresh(): Promise<void> {
-    if (pending) return pending;
-    pending = (async () => {
+    if (pending && pendingRevision === revision) return pending;
+    const requestedRevision = revision;
+    pendingRevision = requestedRevision;
+    const request = (async () => {
       try {
         const snapshot = await getArchiveProgress();
-        if (!progressHeld()) progress.value = snapshot;
+        if (requestedRevision !== revision) return;
+        // A pre-start idle/partial response may arrive after IPC dispatch. The
+        // pending start command supplies the authoritative terminal snapshot.
+        if (!taskPending.value || snapshot.status === "running") progress.value = snapshot;
         error.value = "";
       } catch (reason) {
-        error.value = String(reason);
+        if (requestedRevision === revision) error.value = String(reason);
       } finally {
-        pending = null;
+        if (pendingRevision === requestedRevision) pending = null;
       }
     })();
-    return pending;
+    pending = request;
+    return request;
+  }
+
+  function reschedule() {
+    pollRevision += 1;
+    if (timer !== null) window.clearTimeout(timer);
+    schedule();
   }
 
   function schedule() {
@@ -96,10 +111,11 @@ export const useArchiveStore = defineStore("archive", () => {
     // 资料同步期间也走活跃间隔：设置页要靠这份状态去禁用清空/删除/退出登录，
     // 15 秒的延迟足够用户点下去。
     const delay = busy.value || limited.value ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
+    const scheduledRevision = pollRevision;
     timer = window.setTimeout(async () => {
-      if (!polling) return;
+      if (!polling || scheduledRevision !== pollRevision) return;
       await refresh();
-      schedule();
+      if (scheduledRevision === pollRevision) schedule();
     }, delay);
   }
 
@@ -113,6 +129,7 @@ export const useArchiveStore = defineStore("archive", () => {
 
   function stopPolling() {
     polling = false;
+    pollRevision += 1;
     if (timer !== null) {
       window.clearTimeout(timer);
       timer = null;
@@ -129,8 +146,8 @@ export const useArchiveStore = defineStore("archive", () => {
     completed,
     hasTask,
     hasSkips,
-    holdProgress,
-    progressHeld,
+    beginRun,
+    finishRun,
     refresh,
     startPolling,
     stopPolling,

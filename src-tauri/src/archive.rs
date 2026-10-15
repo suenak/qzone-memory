@@ -48,6 +48,23 @@ impl Default for ArchiveProgress {
     }
 }
 
+fn clear_expired_login_progress(progress: &mut ArchiveProgress) {
+    if progress.status != "running" && qzone::qq_login_required(&progress.message) {
+        progress.status = "cancelled";
+        progress.message = "QQ 已重新登录，可以继续恢复。已保存的记录和读取断点会保留。".into();
+        progress.retry_at = None;
+    }
+}
+
+pub(crate) fn qq_login_restored(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(state) = app.try_state::<ArchiveState>() {
+        if let Ok(mut progress) = state.progress.lock() {
+            clear_expired_login_progress(&mut progress);
+        }
+    }
+}
+
 pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
@@ -2489,9 +2506,10 @@ fn interaction_failure_can_finish(
     visible_moments: u64,
     saved_history_records: u64,
 ) -> bool {
-    qzone::feed_error_is_waf_block(error)
-        || ((visible_moments > 0 || saved_history_records > 0)
-            && interaction_error_can_be_partial(error))
+    !qzone::qq_login_required(error)
+        && (qzone::feed_error_is_waf_block(error)
+            || ((visible_moments > 0 || saved_history_records > 0)
+                && interaction_error_can_be_partial(error)))
 }
 
 #[tauri::command]
@@ -2570,6 +2588,7 @@ pub async fn start_feed_archive(
     let interaction_result: Result<(), String> = async {
         match sync_visible_moments(&app, &login, &archive, &owner_uin, interval_ms).await {
             Ok(summary) => visible_summary = summary,
+            Err(error) if qzone::qq_login_required(&error) => return Err(error),
             Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => return Err(error),
             Err(error) => {
                 visible_sync_error = Some(concise_archive_error(&error));
@@ -2610,6 +2629,7 @@ pub async fn start_feed_archive(
         .await
         {
             Ok(summary) => history_summary = summary,
+            Err(error) if qzone::qq_login_required(&error) => return Err(error),
             Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => return Err(error),
             Err(error) => {
                 history_sync_error = Some(concise_archive_error(&error));
@@ -2808,17 +2828,32 @@ pub async fn start_feed_archive(
         }
     }
     .await;
-    let nickname_repair_error = match enrich_archive_actor_names(&app, &login, &owner_uin).await {
-        Ok(updated) => {
-            if updated > 0 {
-                set_progress(&archive, |progress| {
-                    progress.message =
-                        format!("已补全 {updated} 条互动记录的 QQ 昵称，正在整理结果…");
-                });
-            }
-            None
+    let login_required = interaction_result
+        .as_ref()
+        .is_err_and(|error| qzone::qq_login_required(error));
+    let interaction_result = interaction_result.map_err(|error| {
+        if login_required {
+            "QQ_LOGIN_REQUIRED: QQ 登录已失效，请重新登录后继续恢复。已保存的记录和读取断点会保留。"
+                .to_owned()
+        } else {
+            error
         }
-        Err(error) => Some(concise_archive_error(&error)),
+    });
+    let nickname_repair_error = if login_required {
+        None
+    } else {
+        match enrich_archive_actor_names(&app, &login, &owner_uin).await {
+            Ok(updated) => {
+                if updated > 0 {
+                    set_progress(&archive, |progress| {
+                        progress.message =
+                            format!("已补全 {updated} 条互动记录的 QQ 昵称，正在整理结果…");
+                    });
+                }
+                None
+            }
+            Err(error) => Some(concise_archive_error(&error)),
+        }
     };
     let quality_summary = archive_quality_summary(&app, &owner_uin).unwrap_or_default();
     let interaction_result = if interaction_result.is_ok()
@@ -5901,6 +5936,44 @@ mod tests {
 #[cfg(test)]
 mod source_resume_tests {
     use super::*;
+    #[test]
+    fn expired_login_is_not_partial_success_from_cached_sources() {
+        for error in [
+            "历史消息接口返回错误（-3000）",
+            "QQ 空间动态接口返回错误 -3000：请先登录",
+            "QQ_LOGIN_REQUIRED: QQ 登录已失效",
+        ] {
+            assert!(qzone::qq_login_required(error));
+            assert!(!interaction_failure_can_finish(error, 2, 9));
+            assert!(!qzone::feed_error_can_skip(error));
+        }
+        assert!(!qzone::qq_login_required("QQ 空间动态接口返回错误 -30001"));
+        assert!(!qzone::qq_login_required("获取空间动态失败：请求超时"));
+        assert!(interaction_failure_can_finish(
+            "获取空间动态失败：请求超时",
+            2,
+            9
+        ));
+    }
+    #[test]
+    fn new_login_releases_auth_error_without_discarding_progress() {
+        let mut progress = ArchiveProgress {
+            status: "error",
+            message: "归档失败：QQ_LOGIN_REQUIRED: QQ 登录已失效".into(),
+            saved: 9,
+            pages: 3,
+            ..Default::default()
+        };
+        clear_expired_login_progress(&mut progress);
+        assert_eq!(progress.status, "cancelled");
+        assert!(!qzone::qq_login_required(&progress.message));
+        assert_eq!(progress.saved, 9);
+        assert_eq!(progress.pages, 3);
+        progress.status = "running";
+        progress.message = "QQ_LOGIN_REQUIRED: old message".into();
+        clear_expired_login_progress(&mut progress);
+        assert_eq!(progress.status, "running");
+    }
     fn database() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE archive_source_checkpoints(owner_uin TEXT,source TEXT,state_json TEXT,updated_at INTEGER,PRIMARY KEY(owner_uin,source));").unwrap();

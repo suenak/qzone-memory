@@ -2786,7 +2786,16 @@ pub(crate) async fn fetch_feeds_once(
 }
 
 pub(crate) fn feed_error_can_skip(error: &str) -> bool {
-    !feed_error_is_transient(error) && error.starts_with("QQ 空间动态接口返回错误")
+    !qq_login_required(error)
+        && !feed_error_is_transient(error)
+        && error.starts_with("QQ 空间动态接口返回错误")
+}
+
+pub(crate) fn qq_login_required(error: &str) -> bool {
+    error
+        .split(|c: char| c != '-' && !c.is_ascii_digit())
+        .any(|code| code == "-3000")
+        || error.contains("QQ_LOGIN_REQUIRED:")
 }
 
 pub(crate) fn feed_error_is_transient(error: &str) -> bool {
