@@ -100,6 +100,9 @@ FileProvider and the OS unknown-app-source permission; iOS retains the external 
 Server side, `QZA_DOWNLOAD_PAGE` remains a fallback. Published file digests are streamed and
 cached without a database schema migration. Publishing does not require minisign signatures.
 Release steps: [docs/RELEASE-AUTO-UPDATE.md](docs/RELEASE-AUTO-UPDATE.md).
+Release notes format and wording: [docs/RELEASE-NOTES.md](docs/RELEASE-NOTES.md). One source file
+feeds the in-app update dialog, the GitHub release body, `CHANGELOG.md` and the README line; never
+edit those four by hand, the next release overwrites them.
 
 ### Frontend design system
 
