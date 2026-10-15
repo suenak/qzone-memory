@@ -61,6 +61,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
+
       - name: Install frontend dependencies
         run: npm ci
 
@@ -111,6 +117,12 @@ jobs:
         with:
           targets: x86_64-apple-darwin
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
+
       - name: Install frontend dependencies
         run: npm ci
 
@@ -157,6 +169,12 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
+
       - name: Install frontend dependencies
         run: npm ci
 
@@ -202,6 +220,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -347,6 +371,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-bin: "false"
 
       - name: Show Xcode version
         shell: bash
@@ -683,10 +713,24 @@ jobs:
 
 
 
-      - name: Show release files
+      - name: Normalize release file names
         shell: bash
         run: |
           set -euo pipefail
+
+          # productName 是中文（「拾忆」）时，GitHub 上传 release 资产会把开头的非 ASCII
+          # 段整段吃掉：拾忆_1.2.8_x64-setup.exe → _1.2.8_x64-setup.exe。
+          # 这里在打包前统一改成 ASCII 前缀，让资产名与 README、发布脚本、SHA256SUMS 一致。
+          for f in artifacts/windows/*.exe artifacts/macos-x64/*.dmg artifacts/macos-arm64/*.dmg; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f")"
+            case "$base" in
+              [A-Za-z0-9]*) continue ;;
+            esac
+            ascii="$(printf '%s' "$base" | sed -E 's/^[^A-Za-z0-9]+//')"
+            mv "$f" "$(dirname "$f")/qzone-memory_${ascii}"
+            echo "renamed: $base -> qzone-memory_${ascii}"
+          done
 
           find artifacts \
             -type f \
