@@ -34,6 +34,8 @@ static USER_AGENT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const WEB_LOGIN_URL: &str = "https://i.qq.com";
 #[cfg(not(target_os = "android"))]
 const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
+#[cfg(not(target_os = "android"))]
+const WEB_LOGIN_USER_AGENT: &str = MOBILE_USER_AGENTS[0];
 
 const XLOGIN_URL: &str = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin";
 const S_URL: &str = "https://h5.qzone.qq.com/mqzone/index";
@@ -45,6 +47,41 @@ const LOGIN_CANCELLED: &str = "登录已被取消";
 /// `pgv_*`、`RK` 等）留在内存里即可。前端只接收账号标识，不接收会话凭证。
 const SESSION_COOKIE_WHITELIST: &[&str] =
     &["uin", "skey", "p_uin", "pt4_token", "p_skey", "pt2gguin"];
+
+#[cfg(target_os = "android")]
+static LOGIN_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+#[cfg(target_os = "android")]
+pub(crate) fn init_android_storage(app: tauri::AppHandle) {
+    let _ = LOGIN_APP.set(app);
+}
+#[cfg(target_os = "android")]
+fn android_storage(command: &str, session: Option<String>) -> Result<Option<String>, String> {
+    crate::android_login::session_storage(
+        LOGIN_APP.get().ok_or("安卓安全登录存储尚未就绪")?,
+        command,
+        session,
+    )
+}
+
+#[cfg(target_os = "android")]
+fn load_persisted_login() -> Result<Option<LoginSession>, String> {
+    android_storage("loadSession", None)?
+        .map(|encoded| {
+            serde_json::from_str::<PersistedLoginSession>(&encoded)
+                .map_err(|_| "已保存的 QQ 登录无法读取，请重新登录".to_owned())?
+                .into_session()
+        })
+        .transpose()
+}
+#[cfg(target_os = "android")]
+fn save_persisted_login(session: PersistedLoginSession) -> Result<(), String> {
+    let encoded = serde_json::to_string(&session).map_err(|_| "无法安全保存 QQ 登录")?;
+    android_storage("saveSession", Some(encoded)).map(|_| ())
+}
+#[cfg(target_os = "android")]
+fn delete_persisted_login() -> Result<(), String> {
+    android_storage("deleteSession", None).map(|_| ())
+}
 
 fn allowed_session_cookies(cookies: &HashMap<String, String>) -> HashMap<String, String> {
     cookies
@@ -132,6 +169,7 @@ fn load_persisted_login() -> Result<Option<LoginSession>, String> {
 }
 
 #[cfg(not(any(
+    target_os = "android",
     target_os = "macos",
     target_os = "ios",
     target_os = "windows",
@@ -157,6 +195,7 @@ fn save_persisted_login(session: PersistedLoginSession) -> Result<(), String> {
 }
 
 #[cfg(not(any(
+    target_os = "android",
     target_os = "macos",
     target_os = "ios",
     target_os = "windows",
@@ -182,6 +221,7 @@ fn delete_persisted_login() -> Result<(), String> {
 }
 
 #[cfg(not(any(
+    target_os = "android",
     target_os = "macos",
     target_os = "ios",
     target_os = "windows",
@@ -196,6 +236,8 @@ pub struct QLoginState {
     session: Mutex<Option<LoginSession>>,
     last_user_agent: Mutex<Option<String>>,
     restore_attempted: Mutex<bool>,
+    // Serialize vault mutations and track which login owns the saved value.
+    credential_epoch: Mutex<Option<u64>>,
     /// 会话代数：登录流程在开始与写回之间比对它，用于发现“期间已经登出/切换账号”。
     session_epoch: AtomicU64,
 }
@@ -228,6 +270,7 @@ impl QLoginState {
             session: Mutex::new(None),
             last_user_agent: Mutex::new(None),
             restore_attempted: Mutex::new(false),
+            credential_epoch: Mutex::new(None),
             session_epoch: AtomicU64::new(0),
         }
     }
@@ -245,7 +288,14 @@ impl QLoginState {
         self.restore_session().await?;
         let guard = self.session.lock().await;
         let session = guard.as_ref().ok_or("尚未登录 QQ 空间")?;
-        let g_tk = session.g_tk.ok_or("登录会话缺少 g_tk")?;
+        // Warmup may rotate p_skey. Always derive the request token from the
+        // very same cookie snapshot rather than the pre-warmup cached value.
+        let g_tk = session
+            .cookies
+            .get("p_skey")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| bkn(value))
+            .ok_or("登录会话缺少有效的 p_skey")?;
         if session
             .cookies
             .get("p_skey")
@@ -273,17 +323,22 @@ impl QLoginState {
     pub(crate) async fn clear_session(&self) {
         // 先自增代数再清会话：任何仍在飞行中的登录流程都会在写回前发现代数变化，
         // 否则用户点了登出，下一次启动仍会从系统凭据库自动恢复登录。
-        self.session_epoch.fetch_add(1, Ordering::SeqCst);
+        let logout_epoch = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         *self.session.lock().await = None;
         *self.restore_attempted.lock().await = true;
+        let mut stored_epoch = self.credential_epoch.lock().await;
+        if stored_epoch.is_some_and(|saved| saved >= logout_epoch) {
+            return; // A newer login already replaced the logged-out credentials.
+        }
         match tokio::task::spawn_blocking(delete_persisted_login).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => *stored_epoch = None,
             Ok(Err(error)) => eprintln!("{error}"),
             Err(error) => eprintln!("清除系统凭据任务失败：{error}"),
         }
     }
 
     async fn restore_session(&self) -> Result<bool, String> {
+        let epoch = self.session_epoch();
         if self.session.lock().await.is_some() {
             return Ok(true);
         }
@@ -301,13 +356,27 @@ impl QLoginState {
             .await
             .map_err(|_| "读取系统凭据超时，请重新登录以授权当前应用".to_owned())?
             .map_err(|error| format!("读取系统凭据任务失败：{error}"))??;
+        self.finish_restore(epoch, restored).await
+    }
+
+    async fn finish_restore(
+        &self,
+        epoch: u64,
+        restored: Option<LoginSession>,
+    ) -> Result<bool, String> {
         // A locked desktop session can temporarily deny keychain access. Only
         // cache a completed lookup; transient credential-store errors must be
         // allowed to retry after the user unlocks or focuses the app again.
+        let mut current = self.session.lock().await;
         let mut attempted = self.restore_attempted.lock().await;
+        // A delayed vault read must never revive a logged-out session or replace
+        // a newer QR/web login that completed while the vault was being read.
+        if self.session_epoch() != epoch || current.is_some() {
+            return Ok(current.is_some());
+        }
         *attempted = true;
         if let Some(session) = restored {
-            *self.session.lock().await = Some(session);
+            *current = Some(session);
             return Ok(true);
         }
         Ok(false)
@@ -317,6 +386,7 @@ impl QLoginState {
     /// 此时这次登录结果必须整体丢弃，不能让已注销的会话重新落盘。
     async fn persist_session(&self, session: &LoginSession, epoch: u64) -> Result<(), String> {
         let persisted = PersistedLoginSession::from_session(session).ok_or("登录凭证不完整")?;
+        let mut stored_epoch = self.credential_epoch.lock().await;
         if self.session_epoch() != epoch {
             return Err(LOGIN_CANCELLED.to_owned());
         }
@@ -328,7 +398,11 @@ impl QLoginState {
             // 写盘期间发生登出：刚写进去的凭据必须立刻回删，否则用户以为已注销的会话
             // 会在下次启动时被自动恢复。
             let _ = tokio::task::spawn_blocking(delete_persisted_login).await;
+            *stored_epoch = None;
             return Err(LOGIN_CANCELLED.to_owned());
+        }
+        if saved.is_ok() {
+            *stored_epoch = Some(epoch);
         }
         saved
     }
@@ -399,13 +473,6 @@ fn select_mobile_user_agent(previous: Option<&str>) -> String {
         index = (index + 1) % MOBILE_USER_AGENTS.len();
     }
     MOBILE_USER_AGENTS[index].to_owned()
-}
-
-fn account_user_agent(uin: &str) -> String {
-    let hash = uin
-        .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-    MOBILE_USER_AGENTS[hash as usize % MOBILE_USER_AGENTS.len()].to_owned()
 }
 
 fn callback_query_value(text: &str, name: &str) -> Option<String> {
@@ -518,6 +585,76 @@ mod tests {
     fn login_hashes_match_reference_algorithm() {
         assert_eq!(ptqr_token("abc"), 108_966);
         assert_eq!(bkn("abc"), 193_485_963);
+    }
+
+    #[test]
+    fn web_login_waits_until_the_official_account_page_is_committed() {
+        for value in [
+            "https://user.qzone.qq.com/12345",
+            "https://user.qzone.qq.com/12345/main",
+            "https://h5.qzone.qq.com/mqzone/index",
+        ] {
+            assert!(super::web_login_page_ready(
+                &url::Url::parse(value).unwrap()
+            ));
+        }
+        for value in [
+            "https://i.qq.com/",
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin",
+            "http://user.qzone.qq.com/12345",
+            "https://user.qzone.qq.com.evil.test/12345",
+            "https://user.qzone.qq.com/",
+            "https://user:secret@user.qzone.qq.com/12345",
+        ] {
+            assert!(!super::web_login_page_ready(
+                &url::Url::parse(value).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn desktop_web_login_uses_only_matching_origin_and_prefers_specific_cookie_domain() {
+        let cookie = |name: &str, value: &str, domain: &str| {
+            cookie::Cookie::build((name.to_owned(), value.to_owned()))
+                .domain(domain.to_owned())
+                .path("/")
+                .build()
+        };
+        let cookies = vec![
+            cookie("uin", "o012345", ".qq.com"),
+            cookie("p_uin", "o012345", ".qzone.qq.com"),
+            cookie("p_skey", "old-parent-key", ".qq.com"),
+            cookie("p_skey", "qzone-key", ".qzone.qq.com"),
+            cookie("p_skey", "unrelated-key", ".mail.qq.com"),
+        ];
+        let selected = super::scoped_web_login_cookies("user.qzone.qq.com", &cookies).unwrap();
+        assert_eq!(
+            selected.get("p_skey").map(String::as_str),
+            Some("qzone-key")
+        );
+        let mut reversed = cookies.clone();
+        reversed.reverse();
+        assert_eq!(
+            super::scoped_web_login_cookies("user.qzone.qq.com", &reversed),
+            Some(selected)
+        );
+        assert!(super::scoped_web_login_cookies(
+            "user.qzone.qq.com",
+            &[
+                cookie("uin", "o012345", ".qq.com"),
+                cookie("p_skey", "wrong-service", ".mail.qq.com")
+            ]
+        )
+        .is_none());
+        assert!(super::scoped_web_login_cookies(
+            "user.qzone.qq.com",
+            &[
+                cookie("uin", "o012345", ".qq.com"),
+                cookie("p_uin", "o067890", ".qzone.qq.com"),
+                cookie("p_skey", "key", ".qzone.qq.com")
+            ]
+        )
+        .is_none());
     }
 
     #[test]
@@ -639,6 +776,81 @@ fn normalized_uin(value: &str) -> String {
         .trim_start_matches('o')
         .trim_start_matches('0')
         .to_owned()
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn web_login_page_ready(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && match url.host_str() {
+            Some("user.qzone.qq.com") => url
+                .path()
+                .split('/')
+                .any(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+            Some("h5.qzone.qq.com") => url.path().starts_with("/mqzone/"),
+            _ => false,
+        }
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn scoped_web_login_cookies(
+    host: &str,
+    cookies: &[cookie::Cookie<'static>],
+) -> Option<HashMap<String, String>> {
+    let mut selected: HashMap<String, (usize, String)> = HashMap::new();
+    for cookie in cookies {
+        let domain = cookie
+            .domain()
+            .unwrap_or(host)
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if domain != "qq.com" && !domain.ends_with(".qq.com") {
+            continue;
+        }
+        if host != domain && !host.ends_with(&format!(".{domain}")) {
+            continue;
+        }
+        if cookie.path().is_some_and(|path| path != "/") {
+            continue;
+        }
+        let value = cookie.value();
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| byte <= 0x20 || byte == 0x7f || matches!(byte, b';' | b'\r' | b'\n'))
+        {
+            continue;
+        }
+        let score = domain.len();
+        if selected
+            .get(cookie.name())
+            .is_none_or(|(old, _)| score > *old)
+        {
+            selected.insert(cookie.name().into(), (score, value.into()));
+        }
+    }
+    let map = selected
+        .into_iter()
+        .map(|(name, (_, value))| (name, value))
+        .collect::<HashMap<_, _>>();
+    map.get("p_skey").filter(|value| !value.trim().is_empty())?;
+    let identity = map
+        .get("p_uin")
+        .or_else(|| map.get("uin"))
+        .map(|value| normalized_uin(value))?;
+    if identity.is_empty() || !identity.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if ["uin", "p_uin"]
+        .iter()
+        .filter_map(|name| map.get(*name))
+        .any(|value| normalized_uin(value) != identity)
+    {
+        return None;
+    }
+    Some(map)
 }
 
 async fn fetch_login_sig(
@@ -960,7 +1172,7 @@ pub async fn poll_qr_login(
         .ok_or("登录 Cookie 中缺少有效的 p_skey")?;
     session.g_tk = Some(bkn(p_skey));
     session.uin = Some(uin.clone());
-    session.user_agent = account_user_agent(&uin);
+    // Keep the browser identity used to obtain these cookies for this session.
     // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
     let warmup_ua = session.user_agent.clone();
     warmup_qzone_session(&state.client, &mut session.cookies, &warmup_ua, &uin).await;
@@ -994,8 +1206,8 @@ pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<Lo
     if let Some(session) = guard.as_ref() {
         if let Some(auth) = login_identity(session) {
             return Ok(LoginStatus {
-                status: "success",
-                message: "已恢复上次登录".into(),
+                status: "restored",
+                message: "已读取保存的会话，正在确认登录状态".into(),
                 auth: Some(auth),
             });
         }
@@ -1045,6 +1257,9 @@ pub async fn open_web_login(app: tauri::AppHandle) -> Result<LoginStatus, String
         ),
     )
     .title("QQ 账号登录")
+    // A reauthentication must not immediately recycle the old profile's cookies.
+    .incognito(true)
+    .user_agent(WEB_LOGIN_USER_AGENT)
     .inner_size(800.0, 720.0);
     #[cfg(desktop)]
     let builder = builder.center();
@@ -1076,29 +1291,37 @@ pub async fn check_web_login(
         });
     };
 
-    let url = Url::parse("https://i.qq.com").map_err(|e| format!("{e}"))?;
-
-    let (cookies, all_cookies) = tokio::task::spawn_blocking(move || {
-        let cookies = window.cookies_for_url(url).unwrap_or_default();
-        let all = window.cookies().unwrap_or_default();
-        (cookies, all)
+    if !window.url().is_ok_and(|url| web_login_page_ready(&url)) {
+        return Ok(LoginStatus {
+            status: "webLoginWaiting",
+            message: "请在 QQ 页面完成登录，进入个人空间后会自动返回".into(),
+            auth: None,
+        });
+    }
+    let cookie_map = tokio::task::spawn_blocking(move || {
+        // Never combine cookies across origins or use an unrelated QQ service's p_skey.
+        for host in ["user.qzone.qq.com", "h5.qzone.qq.com"] {
+            let Ok(url) = Url::parse(&format!("https://{host}/")) else {
+                continue;
+            };
+            if let Ok(cookies) = window.cookies_for_url(url) {
+                if let Some(map) = scoped_web_login_cookies(host, &cookies) {
+                    return Some(map);
+                }
+            }
+        }
+        None
     })
     .await
     .map_err(|e| format!("读取 Cookie 线程异常: {e}"))?;
 
-    let mut cookie_map: HashMap<String, String> = HashMap::new();
-    for c in &cookies {
-        cookie_map.insert(c.name().to_string(), c.value().to_string());
-    }
-    // Fallback: merge all_cookies if url-scoped didn't get p_skey
-    if !cookie_map.get("p_skey").is_some_and(|v| !v.is_empty()) {
-        for c in &all_cookies {
-            let name = c.name().to_string();
-            if !cookie_map.contains_key(&name) {
-                cookie_map.insert(name, c.value().to_string());
-            }
-        }
-    }
+    let Some(mut cookie_map) = cookie_map else {
+        return Ok(LoginStatus {
+            status: "webLoginWaiting",
+            message: "正在等待 QQ 空间登录凭证…".into(),
+            auth: None,
+        });
+    };
 
     let p_skey = match cookie_map.get("p_skey").filter(|v| !v.is_empty()) {
         Some(v) => v.clone(),
@@ -1120,7 +1343,8 @@ pub async fn check_web_login(
         .ok_or_else(|| "登录 Cookie 不完整：缺少账号标识".to_owned())?;
 
     let g_tk = bkn(&p_skey);
-    let user_agent = account_user_agent(&uin);
+    // The login WebView and subsequent mobile requests must describe the same browser.
+    let user_agent = WEB_LOGIN_USER_AGENT.to_owned();
     let normalized = normalized_uin(&uin);
 
     // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
@@ -1264,6 +1488,10 @@ pub async fn check_web_login(
     )
     .await;
     let auth = login_identity(&session).ok_or("登录信息不完整")?;
+    let persistence_result = state.persist_session(&session, epoch).await;
+    if matches!(&persistence_result, Err(reason) if reason.as_str() == LOGIN_CANCELLED) {
+        return Err(LOGIN_CANCELLED.to_owned());
+    }
     let mut current = state.session.lock().await;
     if epoch != state.session_epoch() {
         return Err(LOGIN_CANCELLED.into());
@@ -1275,7 +1503,9 @@ pub async fn check_web_login(
     crate::archive::qq_login_restored(&app);
     Ok(LoginStatus {
         status: "success",
-        message: "登录成功".into(),
+        message: persistence_result
+            .map(|_| "登录成功，已安全保存会话".into())
+            .unwrap_or_else(|_| "登录成功，但未能安全保存会话，下次启动需重新登录".into()),
         auth: Some(auth),
     })
 }
@@ -1342,3 +1572,57 @@ mod native_login_tests {
 
 #[cfg(all(test, target_os = "windows"))]
 mod live_tests;
+
+#[cfg(test)]
+mod session_stability_tests {
+    use super::*;
+    fn session(uin: &str, key: &str) -> LoginSession {
+        LoginSession {
+            uin: Some(uin.into()),
+            cookies: HashMap::from([("p_skey".into(), key.into())]),
+            g_tk: Some(bkn("pre-warmup-key")),
+            user_agent: "fixture-login-browser".into(),
+            ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn requests_use_the_token_for_the_current_cookie_snapshot() {
+        let state = QLoginState::new();
+        *state.session.lock().await = Some(session("12345", "rotated-key"));
+        let auth = state.qzone_auth().await.unwrap();
+        assert_eq!(auth.g_tk, bkn("rotated-key"));
+        assert_ne!(auth.g_tk, bkn("pre-warmup-key"));
+        assert_eq!(auth.user_agent, "fixture-login-browser");
+        assert!(auth.cookie_header.contains("p_skey=rotated-key"));
+    }
+    #[tokio::test]
+    async fn delayed_vault_reads_never_restore_logged_out_credentials() {
+        let state = QLoginState::new();
+        let read_epoch = state.session_epoch();
+        state.session_epoch.fetch_add(1, Ordering::SeqCst);
+        assert!(!state
+            .finish_restore(read_epoch, Some(session("12345", "old")))
+            .await
+            .unwrap());
+        assert!(state.session.lock().await.is_none());
+    }
+    #[tokio::test]
+    async fn delayed_vault_reads_do_not_replace_a_new_login() {
+        let state = QLoginState::new();
+        *state.session.lock().await = Some(session("67890", "new"));
+        assert!(state
+            .finish_restore(0, Some(session("12345", "old")))
+            .await
+            .unwrap());
+        assert_eq!(state.current_uin().unwrap().as_deref(), Some("67890"));
+        assert_eq!(state.qzone_auth().await.unwrap().g_tk, bkn("new"));
+    }
+    #[test]
+    fn persisted_session_retains_the_browser_identity_and_current_key() {
+        let source = session("12345", "rotated-key");
+        let saved = PersistedLoginSession::from_session(&source).unwrap();
+        let restored = saved.into_session().unwrap();
+        assert_eq!(restored.user_agent, source.user_agent);
+        assert_eq!(restored.g_tk, Some(bkn("rotated-key")));
+    }
+}

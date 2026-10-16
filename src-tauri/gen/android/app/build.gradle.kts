@@ -29,6 +29,7 @@ android {
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "top.ehre.qzonearchive"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // 支持 Android 8.0 及以上；发行 APK 仅包含 ARM / ARM64；x86 模拟器使用 Debug 包。
         minSdk = 26
         targetSdk = 36

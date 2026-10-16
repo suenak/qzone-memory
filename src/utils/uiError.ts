@@ -1,6 +1,13 @@
+import { qqSourceNotice } from "./qqSourceNotice";
+import { requiresQqLogin } from "./qqSession";
+
 /** 只改变错误呈现，不改变返回值、登录状态或重试路径。 */
 export function describeError(reason: unknown, fallback = "操作失败，请重试。") {
   const message = reason instanceof Error ? reason.message : String(reason ?? "");
+  if (/QQ|qzone|空间|历史消息|桌面历史|腾讯\s*WAF/i.test(message)) {
+    const notice = qqSourceNotice(reason);
+    if (notice) return notice;
+  }
   if (/__TAURI|undefined.*invoke|reading ['"]invoke|IPC/i.test(message)) return "当前页面无法连接本地服务。请在桌面或手机应用中打开，再试一次。";
   if (/归档.*进行|归档.*运行|archive.*running|正在归档/i.test(message)) return "请先停止备份，再进行此操作。";
   if (/登录|login|session.*expired|unauthorized|401/i.test(message)) return "请重新登录 QQ 空间后再试。";
@@ -26,7 +33,12 @@ export function describeLicenseError(reason: unknown, fallback = "授权操作�
 
 /** 诊断保留错误类别；带凭据和临时签名的内容不呈现在界面。 */
 export function diagnosticError(reason: unknown) {
+  if (requiresQqLogin(reason)) return "QQ 登录已失效，请重新登录后继续。已保存的记录会保留。";
   const message = String(reason ?? "");
+  if (/QQ|qzone|空间|历史消息|桌面历史|腾讯\s*WAF/i.test(message)) {
+    const notice = qqSourceNotice(reason);
+    if (notice) return notice;
+  }
   if (/cookie|token|pwd2sig|password|authorization|p_skey|g_tk|skey/i.test(message)) return "详细信息涉及登录或授权凭据，已隐藏。请重新登录或检查授权状态后重试。";
   return redactPaths(message).slice(0, 1200);
 }

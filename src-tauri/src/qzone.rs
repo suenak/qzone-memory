@@ -13,6 +13,9 @@ use url::Url;
 
 use crate::qlogin::QLoginState;
 
+#[path = "desktop_history.rs"]
+pub(crate) mod desktop_history;
+
 const FEEDS_URL: &str = "https://mobile.qzone.qq.com/get_feeds";
 const OWN_MOMENTS_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6";
@@ -1346,7 +1349,7 @@ fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<
     if is_tencent_waf_response(status, body) {
         return None;
     }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+    if retryable_http_status(status) {
         return Some(format!("HTTP {status}"));
     }
     if !status.is_success() {
@@ -1381,9 +1384,24 @@ fn is_tencent_waf_response(status: reqwest::StatusCode, body: &str) -> bool {
         && body.contains("501page")
 }
 
+fn retryable_http_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status.is_server_error()
+            && status != reqwest::StatusCode::NOT_IMPLEMENTED
+            && status != reqwest::StatusCode::HTTP_VERSION_NOT_SUPPORTED)
+}
+
+fn history_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    if is_tencent_waf_response(status, body) {
+        "QQ_REQUEST_BLOCKED: 历史消息请求被 QQ 空间拦截（HTTP 501）".into()
+    } else {
+        format!("获取历史消息失败：HTTP {status}")
+    }
+}
+
 fn feed_http_error(status: reqwest::StatusCode, body: &str) -> String {
     if is_tencent_waf_response(status, body) {
-        "获取空间动态失败：腾讯 WAF 拦截了移动端互动接口（HTTP 501 Not Implemented）".into()
+        "QQ_REQUEST_BLOCKED: 互动通知请求被 QQ 空间拦截（HTTP 501）".into()
     } else {
         format!("获取空间动态失败：HTTP {status}")
     }
@@ -1393,27 +1411,6 @@ fn feed_retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(1_500 * 2_u64.pow(attempt.saturating_sub(1)))
 }
 
-fn sec_ch_ua(user_agent: &str) -> String {
-    if let Some(start) = user_agent.find("Chrome/") {
-        let version_start = start + 7;
-        let major = user_agent[version_start..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>();
-        let version = if major.is_empty() { "131" } else { &major };
-        format!("\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"{version}\", \"Microsoft Edge\";v=\"{version}\"")
-    } else {
-        "\"Not;A=Brand\";v=\"8\", \"Apple\";v=\"0\", \"Safari\";v=\"18\"".to_owned()
-    }
-}
-
-fn sec_platform(user_agent: &str) -> &'static str {
-    if user_agent.contains("iPhone") {
-        "\"iOS\""
-    } else {
-        "\"Android\""
-    }
-}
 fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<Value> {
     headers
         .iter()
@@ -1550,7 +1547,6 @@ fn log_feed_request_error(
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-site",
-                "Sec-Ch-Ua-Mobile": "?1",
                 "User-Agent": user_agent,
                 "Cookie": "[已隐藏：登录凭证不会写入控制台]"
             }
@@ -1588,6 +1584,7 @@ pub(crate) struct VisibleMomentPage {
 
 #[derive(Debug)]
 pub(crate) struct HistoryMessagePage {
+    pub(crate) has_more: Option<bool>,
     pub(crate) feeds: Vec<Value>,
     pub(crate) record_count: usize,
 }
@@ -2097,6 +2094,7 @@ fn history_record_hash(parts: &[&str]) -> u64 {
         })
 }
 
+#[cfg(test)]
 fn decode_history_html(response: &str) -> Result<String, String> {
     crate::history_response::html(response)
 }
@@ -2159,28 +2157,48 @@ static ELEMENT_PATTERNS: OnceLock<Mutex<HashMap<String, Arc<regex::Regex>>>> = O
 fn history_elements(markup: &str, tag: &str, class_name: &str) -> Vec<(String, String)> {
     let Some(pattern) = cached_history_regex(
         &ELEMENT_PATTERNS,
-        format!(r#"(?is)<{tag}\b(?P<attrs>[^>]*)>(?P<body>.*?)</{tag}>"#),
+        format!(r#"(?is)<(?P<close>/?){tag}\b(?P<attrs>[^>]*)>"#),
     ) else {
         return Vec::new();
     };
-    pattern
-        .captures_iter(markup)
-        .filter_map(|captures| {
-            let attrs = captures.name("attrs")?.as_str();
-            let classes = history_attribute(attrs, "class")?;
-            classes
-                .split_whitespace()
-                .any(|class| class == class_name)
-                .then(|| {
-                    (
-                        attrs.to_owned(),
-                        captures
-                            .name("body")
-                            .map(|body| body.as_str().to_owned())
-                            .unwrap_or_default(),
-                    )
-                })
-        })
+    let mut stack = Vec::new();
+    let mut found = Vec::new();
+    let mut capturing = false;
+    for token in pattern.captures_iter(markup) {
+        let whole = token.get(0).expect("matched HTML tag");
+        if token
+            .name("close")
+            .is_some_and(|value| value.as_str() == "/")
+        {
+            if let Some((start, body_start, attrs, matches)) = stack.pop() {
+                if matches {
+                    capturing = false;
+                    found.push((start, attrs, markup[body_start..whole.start()].to_owned()));
+                }
+            }
+        } else {
+            let attrs = token
+                .name("attrs")
+                .expect("matched tag attributes")
+                .as_str();
+            let matches = !capturing
+                && history_attribute(attrs, "class").is_some_and(|classes| {
+                    class_name
+                        .split_whitespace()
+                        .all(|required| classes.split_whitespace().any(|class| class == required))
+                });
+            if !attrs.trim_end().ends_with('/') {
+                if matches {
+                    capturing = true;
+                }
+                stack.push((whole.start(), whole.end(), attrs.to_owned(), matches));
+            }
+        }
+    }
+    found.sort_by_key(|(start, _, _)| *start);
+    found
+        .into_iter()
+        .map(|(_, attrs, body)| (attrs, body))
         .collect()
 }
 
@@ -2399,26 +2417,23 @@ fn history_html_as_feeds(
     owner_name: Option<&str>,
     _offset: u32,
 ) -> (usize, Vec<Value>) {
-    let card_pattern = regex::Regex::new(r"(?is)<li\b(?P<attrs>[^>]*)>(?P<body>.*?)</li>")
-        .expect("fixed history card regex");
-    let cards = card_pattern
-        .captures_iter(html)
-        .filter(|card| {
-            card.name("attrs")
-                .and_then(|attrs| history_attribute(attrs.as_str(), "class"))
-                .is_some_and(|classes| {
-                    ["f-single", "f-s-s"]
-                        .iter()
-                        .all(|required| classes.split_whitespace().any(|class| class == *required))
-                })
+    let cards = ["li", "div"]
+        .into_iter()
+        .flat_map(|tag| history_elements(html, tag, "f-single f-s-s"))
+        .filter(|(attrs, _)| {
+            history_attribute(attrs, "class").is_some_and(|classes| {
+                ["f-single", "f-s-s"]
+                    .iter()
+                    .all(|required| classes.split_whitespace().any(|class| class == *required))
+            })
         })
         .collect::<Vec<_>>();
     let scanned_count = cards.len();
     let feeds = cards
         .into_iter()
-        .filter_map(|card| {
-            let card_attrs = card.name("attrs")?.as_str();
-            let card_body = card.name("body")?.as_str();
+        .filter_map(|(card_attrs, card_body)| {
+            let card_attrs = card_attrs.as_str();
+            let card_body = card_body.as_str();
             let stable_id = history_attribute(card_attrs, "data-key")
                 .or_else(|| history_attribute(card_attrs, "id"))?;
             let (actor_uin, family, subtype, key_time) = history_event_key(&stable_id)?;
@@ -2568,6 +2583,30 @@ fn decode_history_response(bytes: &[u8]) -> Result<String, String> {
     Ok(text.into_owned())
 }
 
+fn decode_history_page(
+    body: &str,
+    owner_uin: &str,
+    owner_name: Option<&str>,
+    offset: u32,
+) -> Result<HistoryMessagePage, String> {
+    let decoded = crate::history_response::decode(&body)?;
+    let (record_count, feeds) = history_html_as_feeds(&decoded.html, owner_uin, owner_name, offset);
+    if record_count == 0 && decoded.entry_count.is_some_and(|count| count > 0) {
+        return Err("历史消息存在记录，但卡片格式暂未识别；已保留当前位置，未按空页跳过".into());
+    }
+    if record_count > 0
+        && owner_name.map(str::trim).is_none_or(|name| name.is_empty())
+        && feeds.is_empty()
+    {
+        return Err("历史消息包含记录，但无法确认本人昵称；为避免错配正文，本页未写入".into());
+    }
+    Ok(HistoryMessagePage {
+        has_more: decoded.has_more,
+        record_count,
+        feeds,
+    })
+}
+
 pub(crate) async fn fetch_history_messages(
     state: &QLoginState,
     offset: u32,
@@ -2598,23 +2637,20 @@ pub(crate) async fn fetch_history_messages(
         let response = state
             .client()
             .get(HISTORY_MESSAGES_URL)
-            .header(
-                ACCEPT,
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            )
+            .header(ACCEPT, "application/json, text/javascript, */*;q=0.8")
             .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.6")
             .header(CACHE_CONTROL, "no-cache")
             .header(PRAGMA, "no-cache")
-            .header(REFERER, format!("https://user.qzone.qq.com/{}/main", auth.uin))
-            .header(USER_AGENT, DESKTOP_QZONE_USER_AGENT)
+            .header(
+                REFERER,
+                format!("https://user.qzone.qq.com/{}/main", auth.uin),
+            )
+            // Preserve the login session's UA; do not claim a different browser or OS.
+            .header(USER_AGENT, &auth.user_agent)
             .header(COOKIE, &auth.desktop_cookie_header)
-            .header("Sec-Ch-Ua", "\"Not A(Brand\";v=\"99\", \"Chromium\";v=\"128\"")
-            .header("Sec-Ch-Ua-Mobile", "?0")
-            .header("Sec-Ch-Ua-Platform", "\"Linux\"")
-            .header("Sec-Fetch-Dest", "document")
-            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Site", "same-origin")
-            .header("Upgrade-Insecure-Requests", "1")
             .query(&query)
             .send()
             .await;
@@ -2623,27 +2659,14 @@ pub(crate) async fn fetch_history_messages(
                 let status = response.status();
                 let bytes = crate::media_http::bounded_body(response, 4 * 1024 * 1024).await?;
                 let body = decode_history_response(&bytes)?;
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                if is_tencent_waf_response(status, &body) {
+                    return Err(history_http_error(status, &body));
+                } else if retryable_http_status(status) {
                     last_error = format!("HTTP {status}");
                 } else if !status.is_success() {
-                    return Err(format!("获取历史消息失败：HTTP {status}"));
+                    return Err(history_http_error(status, &body));
                 } else {
-                    let html = decode_history_html(&body)?;
-                    let (record_count, feeds) =
-                        history_html_as_feeds(&html, &auth.uin, owner_name, offset);
-                    if record_count > 0
-                        && owner_name.map(str::trim).is_none_or(|name| name.is_empty())
-                        && feeds.is_empty()
-                    {
-                        return Err(
-                            "历史消息包含记录，但无法确认本人昵称；为避免错配正文，本页未写入"
-                                .into(),
-                        );
-                    }
-                    return Ok(HistoryMessagePage {
-                        record_count,
-                        feeds,
-                    });
+                    return decode_history_page(&body, &auth.uin, owner_name, offset);
                 }
             }
             Err(error) => last_error = error.to_string(),
@@ -2799,7 +2822,8 @@ pub(crate) fn qq_login_required(error: &str) -> bool {
 }
 
 pub(crate) fn feed_error_is_transient(error: &str) -> bool {
-    error.starts_with("解析空间动态失败：")
+    feed_error_is_waf_block(error)
+        || error.starts_with("解析空间动态失败：")
         || error.starts_with("动态响应中缺少 data")
         || error.starts_with("动态响应中缺少有效的 vFeeds")
         || error.starts_with("动态响应中的 hasmore")
@@ -2816,7 +2840,7 @@ pub(crate) fn feed_error_is_transient(error: &str) -> bool {
 }
 
 pub(crate) fn feed_error_is_waf_block(error: &str) -> bool {
-    error.contains("腾讯 WAF 拦截了移动端互动接口")
+    error.contains("QQ_REQUEST_BLOCKED:") || error.contains("腾讯 WAF 拦截了移动端互动接口")
 }
 
 async fn fetch_feeds_with_attempts(
@@ -2879,9 +2903,6 @@ async fn fetch_feeds_with_attempts(
             .header("Sec-Fetch-Dest", "empty")
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Site", "same-site")
-            .header("Sec-Ch-Ua", sec_ch_ua(&auth.user_agent))
-            .header("Sec-Ch-Ua-Mobile", "?1")
-            .header("Sec-Ch-Ua-Platform", sec_platform(&auth.user_agent))
             .query(&query)
             .send()
             .await
@@ -3047,6 +3068,10 @@ async fn fetch_feeds_with_attempts(
 }
 
 #[cfg(test)]
+#[path = "qzone_network_diagnostic.rs"]
+mod network_diagnostic;
+
+#[cfg(test)]
 mod tests {
     use super::{
         decode_history_html, ensure_qzone_success, extract_qzone_token,
@@ -3185,11 +3210,43 @@ mod tests {
     fn leaves_unrelated_501_responses_as_regular_server_errors() {
         let body = "upstream proxy does not implement this request";
         assert!(!is_tencent_waf_response(StatusCode::NOT_IMPLEMENTED, body));
-        assert!(retryable_response_reason(StatusCode::NOT_IMPLEMENTED, body).is_some());
+        assert!(retryable_response_reason(StatusCode::NOT_IMPLEMENTED, body).is_none());
         assert!(!feed_error_is_waf_block(&feed_http_error(
             StatusCode::NOT_IMPLEMENTED,
             body
         )));
+    }
+
+    #[test]
+    fn history_and_interactions_share_waf_classification_and_retry_policy() {
+        let body = r#"<script>location.href='https://waf.tencent.com/501page.html'</script>"#;
+        assert!(feed_error_is_waf_block(&super::history_http_error(
+            StatusCode::NOT_IMPLEMENTED,
+            body
+        )));
+        assert!(!feed_error_can_skip(&super::history_http_error(
+            StatusCode::NOT_IMPLEMENTED,
+            body
+        )));
+        assert!(!feed_error_is_waf_block(&super::history_http_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "not implemented"
+        )));
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(super::retryable_http_status(status));
+        }
+        for status in [
+            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
+        ] {
+            assert!(!super::retryable_http_status(status));
+        }
     }
 
     #[test]
@@ -3484,5 +3541,60 @@ mod historical_author_tests {
     fn a_friend_with_the_same_nickname_is_not_assigned_to_the_owner() {
         let html = r#"<a class="q_namecard" data-uin="67890">同名用户</a>的说说：好友内容"#;
         assert!(history_original_content_from_markup(html, "12345", Some("同名用户")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod older_history_tests {
+    use super::*;
+    #[test]
+    fn nested_cards_before_2018_keep_the_body_and_original_publish_time() {
+        for year in [2010, 2014, 2016, 2017] {
+            for tag in ["li", "div"] {
+                let owner = 10001u32;
+                let published = history_date_to_timestamp(year, 5, 6, 12, 0, 0);
+                let hex = |value: u32| {
+                    value
+                        .to_le_bytes()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                };
+                let cell_id = format!("{}{}00000000", hex(owner), hex(published as u32));
+                let markup = format!(
+                    r#"<{tag} class="f-single f-s-s" data-key="fct_20001_217_3_1514764800_1_1"><div class="nested"><div>装饰</div></div><ul><li>嵌套列表</li></ul><p class="txt-box-title"><a class="q_namecard" link="nameCard_10001">本人</a>：{year} 年的旧说说</p><a href="https://user.qzone.qq.com/10001/mood/{cell_id}">查看说说</a></{tag}>"#
+                );
+                let response = json!({"code":0,"data":{"main":{"hasMoreFeeds":true,"total_number":1},"data":[{"html":markup},null]}}).to_string();
+                let page = decode_history_page(&response, "10001", Some("本人"), 8000).unwrap();
+                assert_eq!(page.record_count, 1, "{year} {tag}");
+                assert_eq!(page.feeds.len(), 1, "{year} {tag}");
+                assert_eq!(page.feeds[0]["original"]["cell_comm"]["time"], published);
+                assert_eq!(page.has_more, Some(true));
+            }
+        }
+    }
+    #[test]
+    fn unrecognised_history_fragments_are_not_counted_as_empty_tail() {
+        let response = json!({"code":0,"data":{"main":{"hasMoreFeeds":true},"data":[{"html":"<section>尚未识别的历史卡片</section>"},null]}}).to_string();
+        let error = decode_history_page(&response, "10001", Some("本人"), 8000).unwrap_err();
+        assert!(error.contains("未按空页跳过"));
+    }
+    #[test]
+    fn history_pagination_metadata_survives_html_decoding() {
+        for flag in [json!(true), json!(1), json!("1")] {
+            let response =
+                json!({"code":0,"data":{"main":{"hasMoreFeeds":flag},"html":"<ul></ul>"}})
+                    .to_string();
+            let page = decode_history_page(&response, "10001", Some("本人"), 8000).unwrap();
+            assert_eq!(page.record_count, 0);
+            assert_eq!(page.has_more, Some(true));
+        }
+        assert!(decode_history_page(
+            r#"{"code":0,"data":{"main":{"hasMoreFeeds":"unknown"},"html":"<ul></ul>"}}"#,
+            "10001",
+            Some("本人"),
+            0
+        )
+        .is_err());
     }
 }

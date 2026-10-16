@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { qqProgressNotice } from "../utils/qqSourceNotice";
 import type { Component } from "vue";
 import { storeToRefs } from "pinia";
 import { useRoute, useRouter } from "vue-router";
@@ -158,6 +159,8 @@ const archiveRunning = computed(() => archiveStore.running);
 const archiveSummary = computed(() => {
   const progress = archiveStore.progress;
   if (!progress) return "";
+  const notice = qqProgressNotice(progress);
+  if (notice) return notice.label;
   if (progress.status === "running") return `已保存 ${progress.saved} 条`;
   if (progress.status === "partial") return "上次有部分来源未读取完成";
   if (progress.status === "completed") return "上轮读取已完成";
@@ -290,7 +293,7 @@ onBeforeUnmount(() => {
       <div class="sidebar__foot">
         <button class="sidebar-profile" type="button" :aria-label="loggedIn ? '打开账号菜单' : '登录 QQ 空间'" @click="handleAccountClick">
           <span class="account-chip__avatar"><img v-if="user?.avatarImage" :src="user.avatarImage" alt="" decoding="async" /><User v-else :size="17" :stroke-width="1.8" /></span>
-          <span class="sidebar-profile__copy"><strong>{{ user?.nickname || '尚未登录' }}</strong><small>{{ loggedIn ? `QQ ${user?.uin}` : '登录 QQ 空间后开始备份' }}</small></span>
+          <span class="sidebar-profile__copy"><strong>{{ authStore.accountLabel }}</strong><small>{{ loggedIn ? `QQ ${user?.uin}` : '点击登录 QQ 空间' }}</small></span>
         </button>
         <RouterLink
           v-if="archiveStore.progress"
@@ -366,8 +369,8 @@ onBeforeUnmount(() => {
               <User v-else :size="16" :stroke-width="1.8" />
             </span>
             <span class="account-chip__copy">
-              <strong>{{ user?.nickname ?? "尚未登录" }}</strong>
-              <small>{{ user ? `QQ ${user.uin}` : "点击登录" }}</small>
+              <strong>{{ authStore.accountLabel }}</strong>
+              <small>{{ loggedIn && user ? `QQ ${user.uin}` : "点击登录" }}</small>
             </span>
           </button>
         </div>

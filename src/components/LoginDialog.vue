@@ -171,7 +171,7 @@ const webState = computed(() =>
 
       <p class="qzl-footnote">
         <Lock :size="14" :stroke-width="1.8" aria-hidden="true" />
-        <span>登录凭证只用于连接 QQ 空间。桌面端由系统凭据库保存，退出登录即可清除。</span>
+        <span>登录凭证只用于连接 QQ 空间，由本机安全存储保存，退出登录即可清除。</span>
       </p>
     </div>
   </Dialog>
