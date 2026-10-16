@@ -19,12 +19,35 @@ pub struct NativeLogin {
 
 pub fn init() -> TauriPlugin<Wry> {
     Builder::new("qq-login-native")
+        // Tauri otherwise forwards unhandled mobile plugin commands from JS to
+        // Kotlin. Only Rust's PluginHandle may read QQ cookies or vault values.
+        .invoke_handler(|invoke| {
+            invoke.resolver.reject("QQ 登录服务仅供原生客户端调用");
+            true
+        })
         .setup(|app, api| {
             let handle = api.register_android_plugin("top.ehre.qzonearchive", "QqLoginPlugin")?;
             app.manage(AndroidLogin(handle));
+            crate::qlogin::init_android_storage(app.clone());
             Ok(())
         })
         .build()
+}
+
+pub(crate) fn session_storage(
+    app: &tauri::AppHandle,
+    command: &str,
+    session: Option<String>,
+) -> Result<Option<String>, String> {
+    #[derive(Deserialize)]
+    struct StoredSession {
+        session: Option<String>,
+    }
+    app.state::<AndroidLogin>()
+        .0
+        .run_mobile_plugin::<StoredSession>(command, serde_json::json!({"session": session}))
+        .map(|result| result.session)
+        .map_err(|_| "无法访问安卓安全登录存储，请重新登录".to_owned())
 }
 
 pub fn call(app: &tauri::AppHandle, command: &str) -> Result<NativeLogin, String> {

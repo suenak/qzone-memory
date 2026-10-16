@@ -300,7 +300,7 @@ async function refreshSeats() {
           <span class="setting-row__icon"><User :size="17" :stroke-width="1.8" /></span>
           <div>
             <strong>QQ 空间账号</strong>
-            <small>{{ loggedIn ? `${user?.nickname || user?.uin}（QQ ${user?.uin}）` : "尚未登录，登录后才能备份内容" }}</small>
+            <small>{{ loggedIn ? `${user?.nickname || user?.uin}（QQ ${user?.uin}）` : authStore.message }}</small>
           </div>
         </div>
         <Button

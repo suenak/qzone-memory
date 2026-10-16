@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, onScopeDispose, ref } from "vue";
+import { qqSession, requiresQqLogin } from "../utils/qqSession";
 import { getQzoneLoginUser, type LoginIdentity, openWebLogin, checkWebLogin, syncCookiesToWebview } from "../utils/qlogin";
 import router from "../router";
 import { platform } from "../utils/platform";
@@ -15,7 +16,7 @@ interface LoginUser {
 }
 
 interface LoginStatus {
-  status: "waiting" | "scanned" | "expired" | "success" | "error" | "loggedOut" | "webLoginOpened" | "webLoginWaiting" | "webLoginCancelled";
+  status: "restored" | "checking" | "unverified" | "waiting" | "scanned" | "expired" | "success" | "error" | "loggedOut" | "webLoginOpened" | "webLoginWaiting" | "webLoginCancelled";
   message: string;
   auth?: LoginIdentity;
 }
@@ -36,13 +37,33 @@ export const useAuthStore = defineStore("auth", () => {
   const webLoginMode = ref(false);
   let pollingRun = 0;
   let restoringSession = false;
+  let lastSessionCheck = 0;
 
   const loggedIn = computed(() => status.value === "success" && Boolean(user.value));
+  const accountLabel = computed(() => status.value === "checking" ? "正在确认登录"
+    : status.value === "unverified" ? "登录状态待确认"
+    : status.value === "expired" ? "QQ 登录已失效" : user.value?.nickname || "尚未登录");
 
-  async function restoreSession() {
-    if (restoringSession || loggedIn.value) return;
+  function expireSession() {
+    pollingRun += 1;
+    user.value = undefined;
+    qrImage.value = "";
+    loading.value = false;
+    webLoginMode.value = false;
+    status.value = "expired";
+    message.value = "QQ 登录已失效，请重新登录";
+    useRecycleSessionStore().clear();
+  }
+  onScopeDispose(qqSession.onExpired(expireSession));
+
+  async function restoreSession(force = false) {
+    if (restoringSession || dialogVisible.value || qqSession.expired) return;
+    if (!force && Date.now() - lastSessionCheck < 60_000) return;
     restoringSession = true;
+    lastSessionCheck = Date.now();
     const run = pollingRun;
+    status.value = "checking";
+    message.value = "正在确认 QQ 登录状态…";
     try {
       // Restoring an online QQ session is subject to the same license as a new login.
       // Local archive browsing uses independent local-data commands.
@@ -57,17 +78,26 @@ export const useAuthStore = defineStore("auth", () => {
       }
       const result = await invoke<LoginStatus>("get_login_status");
       if (run !== pollingRun) return;
-      status.value = result.status;
-      message.value = result.message;
-      if (result.status === "success" && result.auth) {
-        // 本地会话已恢复；昵称或头像联网失败不能挡住已有备份。
-        user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
-        await loadProfile(run);
+      if ((result.status === "restored" || result.status === "success") && result.auth) {
+        // Reading the vault is not proof of an online login. Confirm with QQ first.
+        const profile = await getQzoneLoginUser();
         if (run !== pollingRun) return;
+        if (profile.uin !== result.auth.uin) throw new Error("QQ_LOGIN_REQUIRED: QQ 账号已变化，请重新登录");
+        user.value = profile;
+        status.value = "success";
+        message.value = "QQ 已登录";
         syncCookiesToWebview().catch(() => {});
+      } else {
+        user.value = undefined;
+        status.value = result.status === "expired" ? "expired" : "loggedOut";
+        message.value = result.message;
       }
-    } catch {
-      if (run === pollingRun) status.value = "loggedOut";
+    } catch (error) {
+      if (run !== pollingRun) return;
+      if (requiresQqLogin(error)) { qqSession.expire(); return; }
+      user.value = undefined;
+      status.value = "unverified";
+      message.value = "暂时无法确认 QQ 登录状态，可稍后重试或重新登录。本地记录仍可查看。";
     } finally {
       restoringSession = false;
     }
@@ -101,8 +131,7 @@ export const useAuthStore = defineStore("auth", () => {
   async function reauthenticate() {
     // Keep native credentials and the local account directory until the user
     // completes a new login; a dismissed dialog must not delete saved records.
-    status.value = "expired";
-    message.value = "QQ 登录已失效，请重新登录";
+    qqSession.expire();
     await openLogin();
   }
 
@@ -119,6 +148,7 @@ export const useAuthStore = defineStore("auth", () => {
     // 扫码与网页登录互斥：一进入扫码流程就退出网页登录模式，保证模板走二维码分支。
     webLoginMode.value = false;
     const run = ++pollingRun;
+    qqSession.beginLogin();
     loading.value = true;
     qrImage.value = "";
     status.value = "waiting";
@@ -138,6 +168,8 @@ export const useAuthStore = defineStore("auth", () => {
         message.value = result.message;
         if (result.status === "success") {
           if (!result.auth) throw new Error("登录响应中缺少 QQ 账号");
+          qqSession.authenticated();
+          lastSessionCheck = Date.now();
           message.value = "正在获取用户资料…";
           user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
           await loadProfile(run);
@@ -168,6 +200,7 @@ export const useAuthStore = defineStore("auth", () => {
     if (!(await ensureLoginAccess())) return;
     dialogVisible.value = true;
     const run = ++pollingRun;
+    qqSession.beginLogin();
     loading.value = true;
     webLoginMode.value = true;
     qrImage.value = "";
@@ -188,6 +221,8 @@ export const useAuthStore = defineStore("auth", () => {
         message.value = result.message;
         if (result.status === "success") {
           if (!result.auth) throw new Error("登录响应中缺少 QQ 账号");
+          qqSession.authenticated();
+          lastSessionCheck = Date.now();
           user.value = { uin: result.auth.uin, nickname: `QQ ${result.auth.uin}` };
           await loadProfile(run);
           if (run !== pollingRun) return;
@@ -238,6 +273,7 @@ export const useAuthStore = defineStore("auth", () => {
 
   async function logout() {
     pollingRun += 1;
+    qqSession.loggedOut();
     loading.value = true;
     dialogVisible.value = false;
     try {
@@ -252,5 +288,5 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
-  return { dialogVisible, loading, qrImage, status, message, user, webLoginMode, loggedIn, restoreSession, openLogin, reauthenticate, closeLogin, refreshQrCode, startWebLogin, cancelWebLogin, logout };
+  return { dialogVisible, loading, qrImage, status, message, user, webLoginMode, loggedIn, accountLabel, restoreSession, openLogin, reauthenticate, closeLogin, refreshQrCode, startWebLogin, cancelWebLogin, logout };
 });

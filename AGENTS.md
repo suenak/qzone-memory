@@ -25,8 +25,15 @@ Archiving is based on QQ Zone's **mobile interaction list API**
 current account — new feeds from friends, likes, comments, replies, messages — and the
 application reconstructs original feed content from them.
 
-Three sources are merged: the currently visible feed API, the legacy history-message API, and
-the mobile interaction list. Records are merged by feed ID, QQ number and event time.
+Three sources are merged: the currently visible feed API, desktop personal interaction
+history (`feeds3_html_more`, scope=1), and the mobile interaction list. Legacy
+`feeds2_html_pav_all` is used only when the desktop route is unsupported (404/405), not
+as a retry after WAF or an authentication failure. Desktop history uses a separate
+`history-desktop-v1` checkpoint containing only numeric pagination fields; never persist
+advertising cookies or authentication fields from `externparam`. Scope=0 is a friends
+stream and must not be substituted for personal recovery. Records are merged by feed ID,
+QQ number and event time. A completed desktop scan does not prove the supplementary
+mobile channel completed: a mobile WAF response retains partial status and cooldown.
 
 **Feeds that were never liked or commented on cannot be recovered**, because they never appear
 in the interaction list. This is a property of the upstream API, not a limitation of the code.
@@ -40,10 +47,19 @@ Never present archive results as complete or as a substitute for a server-side b
 
 Login credentials live in Rust memory while the app runs. Login IPC returns only the QQ
 account identity; nickname and bounded avatar lookup use native `get_login_user` without
-returning cookies or derived tokens to JavaScript. On supported desktop platforms only
-the minimal restorable session is persisted, and only into the operating system credential
-store (macOS Keychain / Windows Credential Manager / Linux Secret Service). **Credentials must
-never be written to SQLite, frontend storage, console output or logs.**
+returning cookies or derived tokens to JavaScript. Only the minimal restorable session is
+persisted: on supported desktop platforms it goes into the operating system credential
+store (macOS Keychain / Windows Credential Manager / Linux Secret Service), or an authenticated
+AES-GCM ciphertext file in Android's no-backup directory with a non-exportable Android Keystore
+key. Android vault commands are called through the Rust native bridge, never frontend IPC.
+**Credentials must never be written to SQLite, frontend storage, console output or logs.**
+
+Reading persisted QQ credentials is provisional: `get_login_status` returns `restored`, not
+`success`. The frontend confirms the session through native profile lookup before displaying
+a logged-in identity. Explicit QQ authentication failures clear the displayed identity;
+network failures and HTTP 501 use an unverified state and retain the saved credentials.
+Focus and visible foreground checks revalidate the session with throttling. These checks
+must never delete local archives or recovery checkpoints.
 
 ### License layer
 

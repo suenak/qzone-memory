@@ -495,7 +495,59 @@ fn initialize_database(connection: &mut Connection) -> Result<(), String> {
     migrate_history_mood_timestamps(connection)?;
     migrate_history_guestbook_records(connection)?;
     migrate_library_guestbook_timestamps(connection)?;
+    migrate_extended_dynamic_content(connection)?;
     Ok(())
+}
+
+fn migrate_extended_dynamic_content(connection: &mut Connection) -> Result<(), String> {
+    const MIGRATION: &str = "extended-dynamic-content-v1";
+    let applied = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_migrations WHERE name=?1)",
+            [MIGRATION],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查动态正文修复状态失败：{error}"))?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始修复动态正文失败：{error}"))?;
+    // Replay only existing local source data. Never fetch the network or invent a mood body.
+    {
+        let mut statement = transaction
+            .prepare(
+                "SELECT f.owner_uin,f.raw_json FROM archive_feeds f
+             JOIN archive_dynamics d ON d.owner_uin=f.owner_uin AND d.cell_id=f.cell_id
+             WHERE TRIM(COALESCE(d.content,''))='' ORDER BY f.id",
+            )
+            .map_err(|error| format!("查询待修复动态失败：{error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("读取待修复动态失败：{error}"))?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let owner: String = row.get(0).map_err(|error| error.to_string())?;
+            let raw: String = row.get(1).map_err(|error| error.to_string())?;
+            let feed: Value =
+                serde_json::from_str(&raw).map_err(|_| "动态原始数据损坏，正文修复未完成")?;
+            let Some(original) = dynamic_original(&feed) else {
+                continue;
+            };
+            if dynamic_content(&original).is_some() {
+                save_original_dynamic(&transaction, &owner, &feed)?;
+            }
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO archive_migrations(name,applied_at) VALUES (?1,?2)",
+            params![MIGRATION, now()],
+        )
+        .map_err(|error| format!("保存动态正文修复状态失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交动态正文修复失败：{error}"))
 }
 
 fn migrate_library_guestbook_timestamps(connection: &mut Connection) -> Result<(), String> {
@@ -1005,6 +1057,7 @@ fn text_at(value: &Value, pointer: &str) -> Option<String> {
 }
 
 fn parse_feed(feed: &Value) -> Result<ParsedFeed, String> {
+    let original = dynamic_original(feed);
     let cell_id = text_at(feed, "/original/cell_id/cellid");
     let event_time = feed
         .pointer("/comm/time")
@@ -1050,7 +1103,7 @@ fn parse_feed(feed: &Value) -> Result<ParsedFeed, String> {
         event_type,
         event_time,
         title: text_at(feed, "/title/title"),
-        content: text_at(feed, "/original/cell_summary/summary"),
+        content: original.as_deref().and_then(dynamic_content),
         event_summary: text_at(feed, "/summary/summary"),
         actor_uin,
         actor_name: text_at(feed, "/userinfo/user/nickname"),
@@ -1570,14 +1623,59 @@ fn merge_recovery_snapshot(stored: &mut Value, incoming: &Value) {
     }
 }
 
+// Some QQ applications put their payload beside `original`, not inside it.
+// Carry it only for the same application; a gift notification must never replace a mood body.
+fn dynamic_original(feed: &Value) -> Option<std::borrow::Cow<'_, Value>> {
+    let original = feed.get("original").filter(|value| value.is_object())?;
+    let appid = original.pointer("/cell_comm/appid").and_then(Value::as_i64);
+    if appid != feed.pointer("/comm/appid").and_then(Value::as_i64) {
+        return Some(std::borrow::Cow::Borrowed(original));
+    }
+    let field = match appid {
+        Some(333) => ("gift", "cell_gift"),
+        Some(202) => ("cell_left_thumb", "cell_left_thumb"),
+        _ => return Some(std::borrow::Cow::Borrowed(original)),
+    };
+    let Some(payload) = feed.get(field.0).filter(|value| value.is_object()) else {
+        return Some(std::borrow::Cow::Borrowed(original));
+    };
+    let mut enriched = original.clone();
+    merge_recovery_snapshot(&mut enriched[field.1], payload);
+    Some(std::borrow::Cow::Owned(enriched))
+}
+
+fn dynamic_content(original: &Value) -> Option<String> {
+    let text = |path: &str| text_at(original, path).filter(|value| !value.trim().is_empty());
+    if let Some(summary) = text("/cell_summary/summary") {
+        return Some(summary);
+    }
+    let (title, description) = match original.pointer("/cell_comm/appid").and_then(Value::as_i64) {
+        Some(333) => (text("/cell_gift/giftname"), text("/cell_gift/giftdesc")),
+        Some(202) => (
+            text("/cell_left_thumb/title"),
+            text("/cell_left_thumb/summary"),
+        ),
+        Some(4) => (text("/cell_title/title"), None),
+        _ => return None,
+    };
+    match (title, description) {
+        (Some(title), Some(description)) if title != description => {
+            Some(format!("{title}\n{description}"))
+        }
+        (Some(title), _) => Some(title),
+        (_, description) => description,
+    }
+}
+
 fn save_original_dynamic(
     transaction: &rusqlite::Transaction<'_>,
     owner_uin: &str,
     feed: &Value,
 ) -> Result<(), String> {
-    let Some(original) = feed.get("original") else {
+    let Some(enriched) = dynamic_original(feed) else {
         return Ok(());
     };
+    let original = enriched.as_ref();
     let Some(cell_id) = text_at(original, "/cell_id/cellid") else {
         return Ok(());
     };
@@ -1613,7 +1711,7 @@ fn save_original_dynamic(
     let content = if is_guestbook {
         text_at(feed, "/summary/summary")
     } else {
-        text_at(original, "/cell_summary/summary")
+        dynamic_content(original)
     };
     let author_uin = if is_guestbook {
         text_at(feed, "/userinfo/user/uin")
@@ -2178,11 +2276,34 @@ struct VisibleCheckpoint {
 }
 #[derive(Default, Serialize, Deserialize)]
 struct HistoryCheckpoint {
+    #[serde(default)]
+    scan_version: u8,
     next_offset: u32,
     empty_tail: u32,
     last_hit: Option<u32>,
     complete: bool,
     summary: HistorySyncSummary,
+}
+
+const HISTORY_SCAN_VERSION: u8 = 2;
+const HISTORY_EMPTY_TAIL_POSITIONS: u32 = 6_000;
+
+fn resume_history_checkpoint(mut checkpoint: HistoryCheckpoint) -> HistoryCheckpoint {
+    // Recheck old pages once: the old parser could have silently missed cards
+    // before the saved offset, as well as stopping despite hasMoreFeeds=true.
+    // This resets only scan bookkeeping; saved records are retained and merged.
+    if checkpoint.scan_version < HISTORY_SCAN_VERSION {
+        return HistoryCheckpoint {
+            scan_version: HISTORY_SCAN_VERSION,
+            ..Default::default()
+        };
+    }
+    checkpoint.scan_version = HISTORY_SCAN_VERSION;
+    checkpoint
+}
+
+fn history_tail_complete(empty_positions: u32, has_more: Option<bool>) -> bool {
+    empty_positions >= HISTORY_EMPTY_TAIL_POSITIONS && has_more != Some(true)
 }
 fn load_source_checkpoint<T: serde::de::DeserializeOwned>(
     connection: &Connection,
@@ -2341,6 +2462,18 @@ struct HistorySyncSummary {
     saved: u64,
     estimated_end_offset: u32,
     deepest_probe_offset: u32,
+    #[serde(default)]
+    desktop: bool,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesktopHistoryCheckpoint {
+    next: Option<qzone::desktop_history::Cursor>,
+    complete: bool,
+    #[serde(default)]
+    fetched: u64,
+    summary: HistorySyncSummary,
 }
 
 #[derive(Default)]
@@ -2393,19 +2526,143 @@ async fn sync_history_messages(
     owner_name: Option<&str>,
     interval_ms: u64,
 ) -> Result<HistorySyncSummary, String> {
+    // Cursor-based desktop history and offset-based legacy history must never
+    // share a checkpoint. Old records remain intact and are merged by event ID.
+    const SOURCE: &str = "history-desktop-v1";
+    let mut checkpoint = load_source_checkpoint::<DesktopHistoryCheckpoint>(
+        &open_database(app)?,
+        owner_uin,
+        SOURCE,
+        now(),
+    )?
+    .unwrap_or_default();
+    checkpoint.summary.desktop = true;
+    set_progress(archive, |p| {
+        p.pages = p.pages.saturating_add(checkpoint.summary.pages);
+        p.fetched = p.fetched.saturating_add(checkpoint.fetched);
+        p.saved = p.saved.saturating_add(checkpoint.summary.saved);
+    });
+    if checkpoint.complete {
+        return Ok(checkpoint.summary);
+    }
+    let mut seen = HashSet::new();
+    if let Some(cursor) = checkpoint.next.as_ref() {
+        seen.insert(cursor.clone());
+    }
+    set_progress(archive, |p| {
+        p.message = "正在读取本人历史互动，查找仍可还原的说说…".into()
+    });
+    loop {
+        if archive.cancel.load(Ordering::Relaxed) {
+            return Ok(checkpoint.summary);
+        }
+        if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
+            return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
+        }
+        let mut busy_retried = false;
+        let page = loop {
+            match qzone::desktop_history::fetch(
+                login,
+                owner_uin,
+                checkpoint.next.as_ref(),
+                owner_name,
+            )
+            .await
+            {
+                Ok(page) => break page,
+                Err(error) if error.starts_with("QQ_SOURCE_BUSY:") && !busy_retried => {
+                    busy_retried = true;
+                    set_progress(archive, |p| {
+                        p.message = "QQ 空间历史接口繁忙，将在 45 秒后重试当前页。已读取的内容和断点会保留。".into()
+                    });
+                    for _ in 0..45 {
+                        if archive.cancel.load(Ordering::Relaxed) {
+                            return Ok(checkpoint.summary);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    if archive.cancel.load(Ordering::Relaxed) {
+                        return Ok(checkpoint.summary);
+                    }
+                    if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
+                        return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
+                    }
+                }
+                Err(error)
+                    if error == "DESKTOP_HISTORY_UNSUPPORTED" && checkpoint.next.is_none() =>
+                {
+                    return sync_legacy_history_messages(
+                        app,
+                        login,
+                        archive,
+                        owner_uin,
+                        owner_name,
+                        interval_ms,
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(next) = page.next.as_ref() {
+            if !seen.insert(next.clone()) {
+                return Err("桌面历史返回了重复分页位置，已保留断点".into());
+            }
+        }
+        let saved = save_retried_page(app, owner_uin, &page.history.feeds)?;
+        checkpoint.fetched = checkpoint
+            .fetched
+            .saturating_add(page.history.record_count as u64);
+        checkpoint.summary.pages = checkpoint.summary.pages.saturating_add(1);
+        checkpoint.summary.records = checkpoint
+            .summary
+            .records
+            .saturating_add(page.history.feeds.len() as u64);
+        checkpoint.summary.saved = checkpoint.summary.saved.saturating_add(saved);
+        checkpoint.complete = page.next.is_none();
+        checkpoint.next = page.next;
+        save_source_checkpoint(&open_database(app)?, owner_uin, SOURCE, &checkpoint, now())?;
+        set_progress(archive, |p| {
+            p.pages = p.pages.saturating_add(1);
+            p.fetched = p.fetched.saturating_add(page.history.record_count as u64);
+            p.saved = p.saved.saturating_add(saved);
+            p.message = format!(
+                "已读取 {} 条归属明确的历史互动，正在继续查找更早记录…",
+                checkpoint.summary.records
+            );
+        });
+        if checkpoint.complete {
+            return Ok(checkpoint.summary);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+            interval_ms,
+        )))
+        .await;
+    }
+}
+
+async fn sync_legacy_history_messages(
+    app: &tauri::AppHandle,
+    login: &QLoginState,
+    archive: &ArchiveState,
+    owner_uin: &str,
+    owner_name: Option<&str>,
+    interval_ms: u64,
+) -> Result<HistorySyncSummary, String> {
     // Read the upstream-compatible ten-position window; don't assume that a
     // larger requested count is honored when choosing the next offset.
     // Holes still require a verified empty tail, and checkpoints carry it across pauses.
     const PAGE_SIZE: u32 = 10;
     const MAX_HISTORY_OFFSET: u32 = 10_000_000;
-    const EMPTY_TAIL_POSITIONS: u32 = 6_000;
-    let checkpoint = load_source_checkpoint::<HistoryCheckpoint>(
-        &open_database(app)?,
-        owner_uin,
-        "history",
-        now(),
-    )?
-    .unwrap_or_default();
+    let checkpoint = resume_history_checkpoint(
+        load_source_checkpoint::<HistoryCheckpoint>(
+            &open_database(app)?,
+            owner_uin,
+            "history",
+            now(),
+        )?
+        .unwrap_or_default(),
+    );
     if checkpoint.complete {
         return Ok(checkpoint.summary);
     }
@@ -2417,7 +2674,8 @@ async fn sync_history_messages(
     let mut offset = checkpoint.next_offset;
     let mut consecutive_empty_positions = checkpoint.empty_tail;
     let mut last_nonempty_offset = checkpoint.last_hit;
-    while offset <= MAX_HISTORY_OFFSET && consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
+    let mut tail_complete = false;
+    while offset <= MAX_HISTORY_OFFSET {
         if archive.cancel.load(Ordering::Relaxed) {
             return Ok(summary);
         }
@@ -2449,20 +2707,27 @@ async fn sync_history_messages(
             consecutive_empty_positions =
                 consecutive_empty_positions.saturating_add(requested_count);
             set_progress(archive, |progress| {
-                progress.message = format!(
-                    "历史 offset {offset} 暂无内容；已连续验证 {}/{} 个位置…",
-                    consecutive_empty_positions, EMPTY_TAIL_POSITIONS
-                );
+                progress.message = if consecutive_empty_positions >= HISTORY_EMPTY_TAIL_POSITIONS
+                    && page.has_more == Some(true)
+                {
+                    format!("已连续验证 {consecutive_empty_positions} 个空位置；接口仍提示有更早记录，将继续读取…")
+                } else {
+                    format!(
+                        "历史 offset {offset} 暂无内容；已连续验证 {}/{} 个位置…",
+                        consecutive_empty_positions, HISTORY_EMPTY_TAIL_POSITIONS
+                    )
+                };
             });
         }
         offset = offset.saturating_add(requested_count);
         summary.estimated_end_offset = last_nonempty_offset.unwrap_or(0);
-        let complete = consecutive_empty_positions >= EMPTY_TAIL_POSITIONS;
+        tail_complete = history_tail_complete(consecutive_empty_positions, page.has_more);
         let checkpoint = HistoryCheckpoint {
+            scan_version: HISTORY_SCAN_VERSION,
             next_offset: offset,
             empty_tail: consecutive_empty_positions,
             last_hit: last_nonempty_offset,
-            complete,
+            complete: tail_complete,
             summary: summary.clone(),
         };
         save_source_checkpoint(
@@ -2472,15 +2737,16 @@ async fn sync_history_messages(
             &checkpoint,
             now(),
         )?;
-        if consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
-            tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
-                interval_ms,
-            )))
-            .await;
+        if tail_complete {
+            break;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+            interval_ms,
+        )))
+        .await;
     }
     summary.estimated_end_offset = last_nonempty_offset.unwrap_or(0);
-    if offset > MAX_HISTORY_OFFSET && consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
+    if offset > MAX_HISTORY_OFFSET && !tail_complete {
         return Err("历史读取已达到安全上限，仍有未验证的位置；不能确认读取完整".into());
     }
     set_progress(archive, |progress| {
@@ -2507,9 +2773,29 @@ fn interaction_failure_can_finish(
     saved_history_records: u64,
 ) -> bool {
     !qzone::qq_login_required(error)
-        && (qzone::feed_error_is_waf_block(error)
-            || ((visible_moments > 0 || saved_history_records > 0)
-                && interaction_error_can_be_partial(error)))
+        && !qzone::feed_error_is_waf_block(error)
+        && (visible_moments > 0 || saved_history_records > 0)
+        && interaction_error_can_be_partial(error)
+}
+
+fn desktop_history_can_preserve_partial(error: &str, desktop_complete: bool) -> bool {
+    // An unavailable supplementary channel does not invalidate an independently
+    // completed desktop history scan. It remains partial, with a cooldown.
+    desktop_complete && error.starts_with("QQ_REQUEST_BLOCKED: 互动通知请求被 QQ 空间拦截")
+}
+
+const REMOTE_BLOCK_COOLDOWN_SECONDS: i64 = 600;
+
+fn remote_block_wait(progress: &ArchiveProgress, now: i64) -> bool {
+    (qzone::feed_error_is_waf_block(&progress.message)
+        || progress.message.starts_with("QQ_SOURCE_BUSY:"))
+        && progress.retry_at.is_some_and(|retry_at| retry_at > now)
+}
+
+fn pause_for_remote_block(progress: &mut ArchiveProgress, now: i64) {
+    progress.status = "limited";
+    progress.retry_at = Some(now.saturating_add(REMOTE_BLOCK_COOLDOWN_SECONDS));
+    progress.message = "QQ_REQUEST_BLOCKED: QQ 空间暂时拒绝访问（HTTP 501），恢复已暂停。已保存的内容和读取断点会保留。请等待 10 分钟后重试；如仍被拦截，请通过网页登录确认 QQ 空间能正常访问后再试。这段等待是软件的请求保护时间，不代表腾讯限制会在此时解除。".into();
 }
 
 #[tauri::command]
@@ -2525,6 +2811,9 @@ pub async fn start_feed_archive(
         let mut progress = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?;
         if progress.status == "running" {
             return Err("已有归档任务正在运行".into());
+        }
+        if remote_block_wait(&progress, now()) {
+            return Ok(progress.clone());
         }
         // 在状态切到 running 之前清零取消标记：此后用户按下的“取消”一定属于本轮任务，
         // 不会出现“锁已释放、取消却被 store(false) 抹掉”的窗口。
@@ -2589,6 +2878,7 @@ pub async fn start_feed_archive(
         match sync_visible_moments(&app, &login, &archive, &owner_uin, interval_ms).await {
             Ok(summary) => visible_summary = summary,
             Err(error) if qzone::qq_login_required(&error) => return Err(error),
+            Err(error) if qzone::feed_error_is_waf_block(&error) => return Err(error),
             Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => return Err(error),
             Err(error) => {
                 visible_sync_error = Some(concise_archive_error(&error));
@@ -2630,6 +2920,8 @@ pub async fn start_feed_archive(
         {
             Ok(summary) => history_summary = summary,
             Err(error) if qzone::qq_login_required(&error) => return Err(error),
+            Err(error) if qzone::feed_error_is_waf_block(&error) => return Err(error),
+            Err(error) if error.starts_with("QQ_SOURCE_BUSY:") => return Err(error),
             Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => return Err(error),
             Err(error) => {
                 history_sync_error = Some(concise_archive_error(&error));
@@ -2839,7 +3131,17 @@ pub async fn start_feed_archive(
             error
         }
     });
-    let nickname_repair_error = if login_required {
+    let remote_blocked = interaction_result
+        .as_ref()
+        .is_err_and(|error| qzone::feed_error_is_waf_block(error));
+    let source_busy = interaction_result
+        .as_ref()
+        .is_err_and(|error| error.starts_with("QQ_SOURCE_BUSY:"));
+    let nickname_repair_error = if login_required
+        || remote_blocked
+        || source_busy
+        || archive.cancel.load(Ordering::Relaxed)
+    {
         None
     } else {
         match enrich_archive_actor_names(&app, &login, &owner_uin).await {
@@ -2876,6 +3178,9 @@ pub async fn start_feed_archive(
                 &error,
                 visible_summary.moments,
                 history_summary.saved,
+            ) || desktop_history_can_preserve_partial(
+                &error,
+                history_summary.desktop && history_sync_error.is_none(),
             ) =>
         {
             Err(format!("ARCHIVE_INTERACTIONS_UNAVAILABLE:{error}"))
@@ -2903,10 +3208,8 @@ pub async fn start_feed_archive(
                 )
             } else if let Some(error) = visible_sync_error.as_deref() {
                 format!(
-                    "已读取 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}）并完成互动补充；但可见说说接口暂时不可用（{error}），可稍后重试这一来源",
-                    history_summary.records,
-                    history_summary.estimated_end_offset,
-                    history_summary.deepest_probe_offset
+                    "已读取 {} 条历史互动并完成互动补充；但可见说说接口暂时不可用（{error}），可稍后重试这一来源",
+                    history_summary.records
                 )
             } else if let Some(error) = history_sync_error.as_deref() {
                 format!(
@@ -2915,28 +3218,38 @@ pub async fn start_feed_archive(
                 )
             } else if p.skipped > 0 {
                 format!(
-                    "归档完成：已同步 {} / {} 条本人可见说说、{} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}），共保存 {} 条接口记录；另有 {} 个异常位置可单独重试",
+                    "本轮读取完成：已同步 {} / {} 条本人可见说说、{} 条历史互动，共保存 {} 条接口记录；另有 {} 个异常位置可单独重试",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
-                    history_summary.estimated_end_offset,
-                    history_summary.deepest_probe_offset,
                     p.saved,
                     p.skipped
                 )
             } else {
                 format!(
-                    "归档完成：已同步 {} / {} 条本人可见说说及评论回复，并合并 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}），共保存 {} 条接口记录",
+                    "本轮读取完成：已同步 {} / {} 条本人可见说说及评论回复，并合并 {} 条历史互动，共保存 {} 条接口记录",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
-                    history_summary.estimated_end_offset,
-                    history_summary.deepest_probe_offset,
                     p.saved
                 )
             };
             p.retry_at = None;
         }),
+        Err(error) if error.starts_with("QQ_SOURCE_BUSY:") => set_progress(&archive, |p| {
+            p.status = "limited";
+            p.retry_at = Some(now().saturating_add(60));
+            p.message = format!(
+                "{error}。本轮已读取 {} 页、保存 {} 条记录，尚未读取的页面没有跳过。",
+                p.pages, p.saved
+            );
+        }),
+        Err(error)
+            if qzone::feed_error_is_waf_block(error)
+                && !error.starts_with("ARCHIVE_INTERACTIONS_UNAVAILABLE:") =>
+        {
+            set_progress(&archive, |progress| pause_for_remote_block(progress, now()));
+        }
         Err(error) if error.starts_with("ARCHIVE_INTERACTIONS_UNAVAILABLE:") => {
             set_progress(&archive, |p| {
                 let detail = concise_archive_error(
@@ -2944,12 +3257,10 @@ pub async fn start_feed_archive(
                 );
                 p.status = "partial";
                 p.message = format!(
-                    "已保存 {} / {} 条本人可见说说及评论回复，并读取 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}）；互动通知接口暂时不可用（{}），点赞等互动尚未补齐，请稍后继续归档",
+                    "已保存 {} / {} 条本人可见说说及评论回复，并读取 {} 条归属明确的历史互动；移动互动补充接口暂时不可用（{}）。已读取的历史会保留，此来源尚未补充完整",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
-                    history_summary.estimated_end_offset,
-                    history_summary.deepest_probe_offset,
                     detail
                 );
                 if let Some(error) = history_sync_error.as_deref() {
@@ -2960,7 +3271,8 @@ pub async fn start_feed_archive(
                     p.message
                         .push_str(&format!("。可见说说也未读取成功：{error}"));
                 }
-                p.retry_at = None;
+                p.retry_at = qzone::feed_error_is_waf_block(error)
+                    .then(|| now().saturating_add(REMOTE_BLOCK_COOLDOWN_SECONDS));
             });
         }
         Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => set_progress(&archive, |p| {
@@ -3018,6 +3330,8 @@ pub async fn start_feed_archive(
     if result.as_ref().is_err_and(|error| {
         error.starts_with("ARCHIVE_RATE_LIMIT:")
             || error.starts_with("ARCHIVE_INTERACTIONS_UNAVAILABLE:")
+            || error.starts_with("QQ_SOURCE_BUSY:")
+            || qzone::feed_error_is_waf_block(error)
     }) {
         Ok(progress)
     } else {
@@ -3088,6 +3402,12 @@ pub async fn retry_archive_skip(
     crate::license::require_archive_access()?;
     // 单独重试也会写库并占用分页频率额度，必须和归档任务互斥。
     ensure_archive_idle(&archive)?;
+    {
+        let progress = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?;
+        if remote_block_wait(&progress, now()) {
+            return Err("QQ 空间暂时拒绝访问，请等待任务页倒计时结束后重试".into());
+        }
+    }
     let owner_uin = login.qzone_auth().await?.uin;
     let connection = open_database(&app)?;
     let (cursor, resolved_at) = connection
@@ -5449,9 +5769,156 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn waf_block_finishes_after_desktop_channels_even_without_saved_rows() {
+    fn waf_block_never_finishes_as_an_ordinary_partial_result() {
         let error = "QQ 空间接口暂时不可用（获取空间动态失败：腾讯 WAF 拦截了移动端互动接口（HTTP 501 Not Implemented））。归档进度已保存";
-        assert!(interaction_failure_can_finish(error, 0, 0));
+        assert!(!interaction_failure_can_finish(error, 0, 0));
+        assert!(!interaction_failure_can_finish(error, 2, 10));
+        assert!(!interaction_failure_can_finish(
+            "QQ_REQUEST_BLOCKED: 历史消息",
+            2,
+            10
+        ));
+    }
+
+    fn gift_fixture() -> serde_json::Value {
+        json!({
+            "comm":{"appid":333,"subid":3,"time":1445097600,"feedskey":"gift-event"},
+            "gift":{"giftname":"生日礼物","giftdesc":"祝你生日快乐"},
+            "original":{
+                "cell_id":{"cellid":"gift-record"},"cell_comm":{"appid":333,"time":1445097600},
+                "cell_userinfo":{"user":{"uin":"friend","nickname":"好友"}}
+            }
+        })
+    }
+
+    #[test]
+    fn extended_dynamic_body_reads_gift_share_and_blog_without_borrowing_notification_text() {
+        let gift = gift_fixture();
+        assert_eq!(
+            super::parse_feed(&gift).unwrap().content.as_deref(),
+            Some("生日礼物\n祝你生日快乐")
+        );
+        let mut wrong_app = gift.clone();
+        wrong_app["original"]["cell_comm"]["appid"] = json!(311);
+        assert!(super::parse_feed(&wrong_app).unwrap().content.is_none());
+        let share = json!({"comm":{"appid":202},"cell_left_thumb":{"title":"文章标题","summary":"内容摘要"},"original":{"cell_comm":{"appid":202}}});
+        assert_eq!(
+            super::parse_feed(&share).unwrap().content.as_deref(),
+            Some("文章标题\n内容摘要")
+        );
+        assert_eq!(
+            super::dynamic_content(
+                &json!({"cell_comm":{"appid":4},"cell_title":{"title":"日志标题"}})
+            )
+            .as_deref(),
+            Some("日志标题")
+        );
+        let mut full = gift;
+        full["original"]["cell_summary"] = json!({"summary":"已存在的完整正文"});
+        assert_eq!(
+            super::parse_feed(&full).unwrap().content.as_deref(),
+            Some("已存在的完整正文")
+        );
+    }
+
+    #[test]
+    fn existing_gift_rows_are_repaired_locally_once_without_rearchiving_or_duplicate_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        super::initialize_database(&mut connection).unwrap();
+        let feed = gift_fixture();
+        let transaction = connection.transaction().unwrap();
+        super::save_feed_rows(&transaction, "owner", &[feed.clone()]).unwrap();
+        transaction.commit().unwrap();
+        // Simulate the old snapshot, which discarded the event-level gift payload.
+        connection
+            .execute(
+                "UPDATE archive_dynamics SET content=NULL,raw_original_json=?1",
+                [feed["original"].to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM archive_migrations WHERE name='extended-dynamic-content-v1'",
+                [],
+            )
+            .unwrap();
+        super::migrate_extended_dynamic_content(&mut connection).unwrap();
+        let result: (String, String, i64) = connection
+            .query_row(
+                "SELECT content,author_uin,published_at FROM archive_dynamics",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            ("生日礼物\n祝你生日快乐".into(), "friend".into(), 1445097600)
+        );
+        super::migrate_extended_dynamic_content(&mut connection).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM archive_dynamics", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[ignore = "requires QZA_CONTENT_VERIFY_DB; opens the supplied account database read-only"]
+    fn verifies_extended_content_against_local_source_without_modifying_it() {
+        let path = std::env::var("QZA_CONTENT_VERIFY_DB").expect("set a local database path");
+        let source =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut statement = source
+            .prepare(
+                "SELECT f.raw_json FROM archive_feeds f JOIN archive_dynamics d
+             ON d.owner_uin=f.owner_uin AND d.cell_id=f.cell_id
+             WHERE TRIM(COALESCE(d.content,''))=''
+               AND json_extract(d.raw_original_json,'$.cell_comm.appid') IN (4,202,333)",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        let mut verified = 0;
+        for row in rows {
+            let feed: serde_json::Value = serde_json::from_str(&row.unwrap()).unwrap();
+            let original = super::dynamic_original(&feed).unwrap();
+            assert!(super::dynamic_content(&original).is_some_and(|text| !text.trim().is_empty()));
+            verified += 1;
+        }
+        assert!(
+            verified > 0,
+            "expected local records matching the reported issue"
+        );
+    }
+
+    #[test]
+    fn remote_block_preserves_counts_and_requires_a_bounded_wait() {
+        let mut progress = super::ArchiveProgress {
+            pages: 7,
+            fetched: 15,
+            saved: 12,
+            skipped: 1,
+            ..Default::default()
+        };
+        super::pause_for_remote_block(&mut progress, 1000);
+        assert_eq!(progress.status, "limited");
+        assert_eq!(progress.retry_at, Some(1600));
+        assert!(super::remote_block_wait(&progress, 1000));
+        assert!(super::remote_block_wait(&progress, 1599));
+        assert!(!super::remote_block_wait(&progress, 1600));
+        assert_eq!(
+            (
+                progress.pages,
+                progress.fetched,
+                progress.saved,
+                progress.skipped
+            ),
+            (7, 15, 12, 1)
+        );
+        progress.message = "ordinary partial result".into();
+        assert!(!super::remote_block_wait(&progress, 1000));
     }
 
     #[test]
@@ -5937,6 +6404,75 @@ mod tests {
 mod source_resume_tests {
     use super::*;
     #[test]
+    fn desktop_history_checkpoint_keeps_its_own_cursor_and_counts() {
+        let cursor: qzone::desktop_history::Cursor = serde_json::from_value(
+            json!({"offset":20,"total":9,"basetime":1700000000u64,"feedsource":0,"pagenum":2}),
+        )
+        .unwrap();
+        let checkpoint = DesktopHistoryCheckpoint {
+            next: Some(cursor.clone()),
+            complete: false,
+            fetched: 17,
+            summary: HistorySyncSummary {
+                pages: 2,
+                records: 9,
+                saved: 9,
+                desktop: true,
+                ..Default::default()
+            },
+        };
+        let restored: DesktopHistoryCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap();
+        assert_eq!(restored.next, Some(cursor));
+        assert_eq!(
+            (
+                restored.summary.pages,
+                restored.fetched,
+                restored.summary.saved
+            ),
+            (2, 17, 9)
+        );
+        assert!(!restored.complete);
+        // Legacy offset checkpoints are not a valid cursor-based checkpoint.
+        let legacy = serde_json::to_string(&HistoryCheckpoint::default()).unwrap();
+        assert!(serde_json::from_str::<DesktopHistoryCheckpoint>(&legacy).is_err());
+    }
+    #[test]
+    fn only_the_supplementary_channel_can_be_partial_after_desktop_completion() {
+        let mobile = "QQ_REQUEST_BLOCKED: 互动通知请求被 QQ 空间拦截（HTTP 501）";
+        assert!(desktop_history_can_preserve_partial(mobile, true));
+        assert!(!desktop_history_can_preserve_partial(mobile, false));
+        for error in [
+            "QQ_REQUEST_BLOCKED: 桌面历史请求被 QQ 空间拦截（HTTP 501）",
+            "QQ_LOGIN_REQUIRED: 请重新登录",
+            "QQ_SOURCE_BUSY: network busy",
+        ] {
+            assert!(!desktop_history_can_preserve_partial(error, true));
+        }
+        let p = ArchiveProgress {
+            status: "partial",
+            message: format!("ARCHIVE_INTERACTIONS_UNAVAILABLE:{mobile}"),
+            retry_at: Some(2000),
+            pages: 3,
+            saved: 9,
+            ..Default::default()
+        };
+        assert!(remote_block_wait(&p, 1999));
+        assert!(!remote_block_wait(&p, 2000));
+        assert_eq!((p.pages, p.saved), (3, 9));
+    }
+    #[test]
+    fn busy_cooldown_protects_the_saved_history_checkpoint() {
+        let p = ArchiveProgress {
+            status: "limited",
+            message: "QQ_SOURCE_BUSY: 历史接口繁忙".into(),
+            retry_at: Some(2000),
+            ..Default::default()
+        };
+        assert!(remote_block_wait(&p, 1999));
+        assert!(!remote_block_wait(&p, 2000));
+    }
+    #[test]
     fn expired_login_is_not_partial_success_from_cached_sources() {
         for error in [
             "历史消息接口返回错误（-3000）",
@@ -5983,6 +6519,7 @@ mod source_resume_tests {
     fn history_resume_keeps_depth_and_empty_tail_across_rate_limit_windows() {
         let c = database();
         let state = HistoryCheckpoint {
+            scan_version: HISTORY_SCAN_VERSION,
             next_offset: 9000,
             empty_tail: 5100,
             last_hit: Some(3870),
@@ -6062,3 +6599,47 @@ mod source_resume_tests {
 
 #[cfg(test)]
 mod data_tests;
+
+#[cfg(test)]
+mod older_history_resume_tests {
+    use super::*;
+    #[test]
+    fn an_empty_gap_does_not_finish_while_the_server_has_older_records() {
+        for positions in [6000, 6010, 12000] {
+            assert!(!history_tail_complete(positions, Some(true)));
+        }
+        assert!(history_tail_complete(6000, Some(false)));
+        assert!(!history_tail_complete(5990, Some(false)));
+    }
+    #[test]
+    fn old_checkpoints_recheck_pages_that_the_old_parser_could_have_missed() {
+        let legacy = serde_json::json!({"next_offset":8030,"empty_tail":6000,"last_hit":2020,"complete":true,
+          "summary":{"pages":803,"records":40,"saved":40,"estimated_end_offset":2020,"deepest_probe_offset":8020}});
+        let checkpoint = resume_history_checkpoint(serde_json::from_value(legacy).unwrap());
+        assert!(!checkpoint.complete);
+        assert_eq!(checkpoint.next_offset, 0);
+        assert_eq!(checkpoint.empty_tail, 0);
+        assert_eq!(checkpoint.summary.records, 0);
+        assert_eq!(checkpoint.scan_version, HISTORY_SCAN_VERSION);
+    }
+    #[test]
+    fn current_completed_checkpoints_and_paused_gaps_remain_resumable() {
+        let completed = resume_history_checkpoint(HistoryCheckpoint {
+            scan_version: HISTORY_SCAN_VERSION,
+            complete: true,
+            next_offset: 9000,
+            ..Default::default()
+        });
+        assert!(completed.complete);
+        let paused = resume_history_checkpoint(HistoryCheckpoint {
+            scan_version: HISTORY_SCAN_VERSION,
+            complete: false,
+            next_offset: 10000,
+            empty_tail: 7000,
+            ..Default::default()
+        });
+        assert!(!paused.complete);
+        assert_eq!(paused.empty_tail, 7000);
+        assert_eq!(paused.next_offset, 10000);
+    }
+}

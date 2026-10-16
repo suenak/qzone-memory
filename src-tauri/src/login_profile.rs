@@ -27,7 +27,15 @@ fn profile_data(bytes: &[u8]) -> Result<Value, String> {
     }
     let value: Value =
         serde_json::from_str(&text[start..=end]).map_err(|_| "用户资料格式不正确")?;
-    if value.get("code").and_then(Value::as_i64) != Some(0) {
+    let code = value.get("code").and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    });
+    if code == Some(-3000) {
+        return Err("QQ_LOGIN_REQUIRED: QQ 登录已失效，请重新登录".into());
+    }
+    if code != Some(0) {
         return Err("QQ 用户资料暂时不可用".into());
     }
     value
@@ -68,11 +76,18 @@ pub async fn get_login_user(state: tauri::State<'_, QLoginState>) -> Result<Logi
             .send()
             .await;
         if let Ok(response) = response {
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err("QQ_LOGIN_REQUIRED: QQ 登录已失效，请重新登录".into());
+            }
             if response.status().is_success() {
                 if let Ok(bytes) = media_http::bounded_body(response, 1024 * 1024).await {
-                    if let Ok(data) = profile_data(&bytes) {
-                        profile = Some(data);
-                        break;
+                    match profile_data(&bytes) {
+                        Ok(data) => {
+                            profile = Some(data);
+                            break;
+                        }
+                        Err(error) if error.starts_with("QQ_LOGIN_REQUIRED:") => return Err(error),
+                        Err(_) => {}
                     }
                 }
             }
@@ -138,5 +153,16 @@ mod tests {
         ] {
             assert!(profile_data(invalid.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn expired_profile_response_preserves_authentication_error_for_the_ui() {
+        let error = profile_data(br#"cb({"code":-3000,"message":"login required"});"#).unwrap_err();
+        assert!(error.starts_with("QQ_LOGIN_REQUIRED:"));
+        assert!(profile_data(br#"{"code":"-3000"}"#)
+            .unwrap_err()
+            .starts_with("QQ_LOGIN_REQUIRED:"));
+        let temporary = profile_data(br#"{"code":-1,"message":"busy"}"#).unwrap_err();
+        assert!(!temporary.starts_with("QQ_LOGIN_REQUIRED:"));
     }
 }

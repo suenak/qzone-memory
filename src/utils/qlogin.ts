@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./qqInvoke";
 
 /** Display identity only. QQ cookies and derived tokens stay in Rust. */
 export interface LoginIdentity { uin: string; }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { describeError, diagnosticError } from "../utils/uiError";
+import { qqProgressNotice, qqSourceNotice } from "../utils/qqSourceNotice";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import Button from "primevue/button";
@@ -46,6 +47,7 @@ const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
 const skipNotice = ref("");
 const actionError = ref("");
+const actionNotice = ref("");
 const starting = ref(false);
 const stopping = ref(false);
 const refreshing = ref(false);
@@ -55,10 +57,13 @@ let timer: ReturnType<typeof setInterval> | undefined;
 const running = computed(() => progress.value.status === "running");
 const needsLogin = computed(() => !running.value && /QQ_LOGIN_REQUIRED:|(?:^|\D)-3000(?!\d)/.test(progress.value.message));
 const rateLimited = computed(() => progress.value.status === "limited");
+const sourceNotice = computed(() => qqProgressNotice(progress.value));
+const stateError = computed(() => qqSourceNotice(archiveStore.error) ? "" : archiveStore.error);
+const progressMessage = computed(() => sourceNotice.value?.details ?? diagnosticError(progress.value.message));
 const remainingSeconds = computed(() => Math.max(0, Math.ceil((Number(progress.value.retryAt || 0) * 1000 - currentTime.value) / 1000)));
-const rateWaiting = computed(() => rateLimited.value && remainingSeconds.value > 0);
+const rateWaiting = computed(() => (rateLimited.value || progress.value.status === "partial") && remainingSeconds.value > 0);
 const remainingText = computed(() => `${String(Math.floor(remainingSeconds.value / 60)).padStart(2, "0")}:${String(remainingSeconds.value % 60).padStart(2, "0")}`);
-const statusText = computed(() => ({ idle: "未开始", running: "进行中", completed: "已完成", partial: "未读取完整", cancelled: "已取消", limited: "稍后继续", error: "失败" }[progress.value.status]));
+const statusText = computed(() => sourceNotice.value?.label ?? ({ idle: "未开始", running: "进行中", completed: "已完成", partial: "未读取完整", cancelled: "已取消", limited: "稍后继续", error: "失败" }[progress.value.status]));
 
 /* ---------------------------------------------------------------------- UI 层
  * 以下只为呈现服务：状态卡文案、配色、展开状态、备份间隔草稿。
@@ -66,6 +71,7 @@ const statusText = computed(() => ({ idle: "未开始", running: "进行中", co
 
 /** 状态色：进行中用主色，完成用成功色，限流与取消用警告色，失败用危险色。 */
 const statusTone = computed<"accent" | "success" | "warning" | "danger" | "neutral">(() => {
+  if (sourceNotice.value) return "neutral";
   const tones: Record<ArchiveStatus, "accent" | "success" | "warning" | "danger" | "neutral"> = {
     idle: "neutral",
     running: "accent",
@@ -79,7 +85,7 @@ const statusTone = computed<"accent" | "success" | "warning" | "danger" | "neutr
 });
 
 /** 状态标题：一眼看懂「现在在做什么」。 */
-const statusTitle = computed(() => needsLogin.value ? "QQ 登录已失效" : ({
+const statusTitle = computed(() => needsLogin.value ? "QQ 登录已失效" : sourceNotice.value?.title ?? ({
   idle: "等待开始",
   running: "正在查找和保存说说",
   completed: "本轮读取已完成",
@@ -90,7 +96,7 @@ const statusTitle = computed(() => needsLogin.value ? "QQ 登录已失效" : ({
 }[progress.value.status]));
 
 /** 状态说明：解释「为什么」以及「下一步」。 */
-const statusDescription = computed(() => needsLogin.value ? "重新登录后可从断点继续。已保存的记录会保留。" : ({
+const statusDescription = computed(() => needsLogin.value ? "重新登录后可从断点继续。已保存的记录会保留。" : sourceNotice.value?.description ?? ({
   idle: "开始后会逐页读取空间记录，保存到本机。",
   running: "正在读取并保存。请保持应用运行，不要切换 QQ 账号。",
   completed: "本轮读取已结束，可到「说说」查看结果。",
@@ -155,13 +161,16 @@ async function start() {
   if (!loggedIn.value || starting.value || running.value || rateWaiting.value || !licenseStore.canArchive) return;
   starting.value = true;
   actionError.value = "";
+  actionNotice.value = "";
   archiveStore.beginRun();
   try {
     archiveStore.finishRun(await startFeedArchive(getArchiveInterval()));
   }
   catch (reason) {
     archiveStore.finishRun();
-    actionError.value = describeError(reason, "未能开始恢复，请重试。");
+    const notice = qqSourceNotice(reason);
+    if (notice) actionNotice.value = notice;
+    else actionError.value = describeError(reason, "未能开始恢复，请重试。");
   }
   finally { starting.value = false; await archiveStore.refresh(); await refresh(); }
 }
@@ -180,9 +189,9 @@ async function retrySkip(item: ArchiveSkipItem) {
   skipNotice.value = "";
   try {
     const result = await retryArchiveSkip(item.id);
-    skipNotice.value = result.message;
+    skipNotice.value = qqSourceNotice(result.message) ?? result.message;
   } catch (error) {
-    skipNotice.value = describeError(error, "重试此页失败，请稍后再试。");
+    skipNotice.value = qqSourceNotice(error) ?? describeError(error, "重试此页失败，请稍后再试。");
   } finally {
     retryingId.value = undefined;
     await refresh();
@@ -232,7 +241,8 @@ onBeforeUnmount(() => clearInterval(timer));
         </button>
       </template>
 
-      <p v-if="archiveStore.error" class="skip-notice" role="alert">{{ describeError(archiveStore.error, "恢复状态读取失败，请刷新进度。") }}</p>
+      <p v-if="stateError" class="skip-notice" role="alert">{{ describeError(stateError, "恢复状态读取失败，请刷新进度。") }}</p>
+      <p v-if="actionNotice || qqSourceNotice(archiveStore.error)" class="source-notice" role="status">{{ actionNotice || qqSourceNotice(archiveStore.error) }}</p>
       <p v-if="actionError" class="skip-notice" role="alert">{{ actionError }}</p>
       <p v-if="loggedIn && !licenseStore.canArchive" class="skip-notice">当前授权仅支持查看和导出，更新授权后可开始恢复。</p>
       <SkeletonBlock v-if="statsLoading" :lines="3" height="18px" />
@@ -241,7 +251,7 @@ onBeforeUnmount(() => clearInterval(timer));
         <div class="status-panel" :class="`is-${statusTone}`">
           <span class="status-panel__icon" aria-hidden="true">
             <component
-              :is="{
+              :is="sourceNotice ? Clock : {
                 idle: CircleSlash,
                 running: HardDriveDownload,
                 completed: CircleCheck,
@@ -261,16 +271,16 @@ onBeforeUnmount(() => clearInterval(timer));
         </div>
 
         <!-- 进度没有总任务量，因此只做不确定进度提示，不画百分比进度条。 -->
-        <div v-if="running || rateLimited" class="indeterminate" role="progressbar" aria-label="恢复任务进度" aria-valuetext="无法预估剩余量">
+        <div v-if="running || (rateLimited && !sourceNotice)" class="indeterminate" role="progressbar" aria-label="恢复任务进度" aria-valuetext="无法预估剩余量">
           <span class="indeterminate__bar" />
         </div>
 
         <details v-if="progress.message && progress.status !== 'idle'" class="task-message">
-          <summary><Info :size="15" :stroke-width="1.8" /><span>{{ progress.status === 'partial' || progress.status === 'error' ? '查看原因和读取详情' : '查看本轮读取详情' }}</span><ChevronDown :size="15" :stroke-width="1.8" /></summary>
-          <p class="engine-message">{{ diagnosticError(progress.message) }}</p>
+          <summary><Info :size="15" :stroke-width="1.8" /><span>{{ sourceNotice ? '查看读取说明' : progress.status === 'partial' || progress.status === 'error' ? '查看原因和读取详情' : '查看本轮读取详情' }}</span><ChevronDown :size="15" :stroke-width="1.8" /></summary>
+          <p class="engine-message">{{ progressMessage }}</p>
         </details>
 
-        <div v-if="rateWaiting" class="notice is-warning">
+        <div v-if="rateWaiting" class="notice" :class="{ 'is-warning': !sourceNotice }">
           <span class="notice__icon" aria-hidden="true">
             <Clock :size="18" :stroke-width="1.8" />
           </span>
@@ -281,7 +291,7 @@ onBeforeUnmount(() => clearInterval(timer));
           <span class="notice__timer">{{ remainingText }}</span>
         </div>
 
-        <div v-else-if="rateLimited" class="notice is-warning">
+        <div v-else-if="rateLimited" class="notice" :class="{ 'is-warning': !sourceNotice }">
           <span class="notice__icon" aria-hidden="true">
             <Clock :size="18" :stroke-width="1.8" />
           </span>
@@ -388,7 +398,7 @@ onBeforeUnmount(() => clearInterval(timer));
                   {{ item.resolvedAt ? "已恢复" : "待重试" }}
                 </span>
               </div>
-              <p class="skip-item__error">{{ diagnosticError(item.error) }}</p>
+              <p class="skip-item__error">{{ qqSourceNotice(item.error) ?? diagnosticError(item.error) }}</p>
               <small>
                 跳过于 {{ formatTime(item.skippedAt) }}<template v-if="item.retryCount"> · 已重试 {{ item.retryCount }} 次 · 最近 {{ formatTime(item.lastRetryAt) }}</template><template v-if="item.resolvedAt"> · 恢复 {{ item.recoveredRecords }} 条</template>
               </small>
@@ -1004,6 +1014,7 @@ onBeforeUnmount(() => clearInterval(timer));
   .notice__copy { overflow-wrap:anywhere; }
 }
 
+.source-notice { margin:var(--space-3) 0; padding:var(--space-3); color:var(--color-text-secondary); background:var(--color-surface-sunken); border-radius:var(--radius-md); font-size:var(--text-sm); line-height:var(--leading-relaxed); }
 .task-message { margin-top:var(--space-3); border:var(--line-width) solid var(--color-border); border-radius:var(--radius-md); }
 .task-message summary { display:flex; align-items:center; gap:var(--space-2); padding:var(--space-3); min-height:var(--touch-target); cursor:pointer; color:var(--color-text-secondary); font-size:var(--text-sm); list-style:none; }
 .task-message summary::-webkit-details-marker { display:none; }

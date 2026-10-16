@@ -60,7 +60,7 @@ fn string(chars: &mut Peekable<Chars<'_>>, quote: char) -> Result<String, String
     Err("历史消息字符串不完整".into())
 }
 
-fn object(response: &str) -> Result<Value, String> {
+pub(crate) fn object(response: &str) -> Result<Value, String> {
     let callback = response
         .find("_Callback")
         .map(|index| &response[index..])
@@ -136,8 +136,54 @@ fn object(response: &str) -> Result<Value, String> {
     Err("历史消息响应不完整".into())
 }
 
-pub(crate) fn html(response: &str) -> Result<String, String> {
+pub(crate) struct HistoryResponse {
+    pub html: String,
+    pub has_more: Option<bool>,
+    pub entry_count: Option<usize>,
+}
+
+pub(crate) fn decode(response: &str) -> Result<HistoryResponse, String> {
     let value = object(response)?;
+    let html = html_from_value(&value)?;
+    let main = value.pointer("/data/main").or_else(|| value.get("main"));
+    let has_more = main
+        .and_then(|main| main.get("hasMoreFeeds"))
+        .map(|flag| match flag {
+            Value::Bool(value) => Ok(*value),
+            Value::Number(value) if value.as_u64() == Some(0) => Ok(false),
+            Value::Number(value) if value.as_u64() == Some(1) => Ok(true),
+            Value::String(value) if value == "0" || value == "false" => Ok(false),
+            Value::String(value) if value == "1" || value == "true" => Ok(true),
+            _ => Err("历史消息返回了无效的分页状态".to_owned()),
+        })
+        .transpose()?;
+    let entry_count = value
+        .pointer("/data/data")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("html")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+                .count()
+        });
+    Ok(HistoryResponse {
+        html,
+        has_more,
+        entry_count,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn html(response: &str) -> Result<String, String> {
+    decode(response).map(|page| page.html)
+}
+
+fn html_from_value(value: &Value) -> Result<String, String> {
     let code = value.get("code").and_then(Value::as_i64);
     for name in ["code", "subcode"] {
         if let Some(status) = value.get(name) {
@@ -147,14 +193,19 @@ pub(crate) fn html(response: &str) -> Result<String, String> {
             }
         }
     }
+    let main = value.pointer("/data/main").or_else(|| value.get("main"));
+    let explicitly_empty = code == Some(0)
+        && main.is_some_and(|main| main["hasMoreFeeds"] == false && main["total_number"] == 0);
     for parent in [
-        &value,
+        value,
         &value["data"],
         &value["data"]["main"],
         &value["main"],
     ] {
         if let Some(html) = parent.get("html").and_then(Value::as_str) {
-            return Ok(html.to_owned());
+            if !html.trim().is_empty() {
+                return Ok(html.to_owned());
+            }
         }
     }
     // Current legacy endpoints return one HTML fragment per data.data entry.
@@ -169,6 +220,12 @@ pub(crate) fn html(response: &str) -> Result<String, String> {
                 .collect::<Option<Vec<_>>>()
                 .ok_or("部分历史消息缺少可读取的内容")?;
             if fragments.iter().all(|fragment| fragment.trim().is_empty()) {
+                // QQ also emits [undefined] (or empty placeholders) on empty
+                // pages. An array slot is not a record: verify the successful
+                // empty-page metadata before treating missing text as a failure.
+                if explicitly_empty {
+                    return Ok(String::new());
+                }
                 return Err("历史消息包含记录，但没有可读取的正文".into());
             }
             return Ok(fragments.join("\n"));
@@ -176,10 +233,7 @@ pub(crate) fn html(response: &str) -> Result<String, String> {
     }
     // Only an explicit successful, empty page can replace a missing html field.
     // Missing fields, an expired session, or a nonempty page remain errors.
-    let main = value.pointer("/data/main").or_else(|| value.get("main"));
-    if code == Some(0)
-        && main.is_some_and(|main| main["hasMoreFeeds"] == false && main["total_number"] == 0)
-    {
+    if explicitly_empty {
         return Ok(String::new());
     }
     Err("历史消息响应中缺少可读取的内容".into())
@@ -192,6 +246,34 @@ mod tests {
     fn accepts_the_successful_empty_response_without_html() {
         let response = r#"_Callback({"code":0,"subcode":0,"message":"","default":0,"data":{main:{hasMoreFeeds:false,total_number:0,offset:0,}}});"#;
         assert_eq!(html(response).unwrap(), "");
+    }
+    #[test]
+    fn accepts_verified_empty_pages_with_sentinel_or_blank_placeholders() {
+        for entries in [
+            "[undefined]",
+            "[null,undefined]",
+            "[{html:''},undefined]",
+            "[]",
+        ] {
+            let response = "_Callback({code:0,subcode:0,data:{main:{hasMoreFeeds:false,total_number:0},data:ENTRIES}});".replace("ENTRIES", entries);
+            assert_eq!(html(&response).unwrap(), "");
+        }
+    }
+    #[test]
+    fn blank_container_does_not_hide_readable_fragments() {
+        assert_eq!(html(r#"cb({code:0,data:{html:'',main:{hasMoreFeeds:true,total_number:1},data:[{html:'<li>正文</li>'},undefined]}});"#).unwrap(), "<li>正文</li>");
+    }
+    #[test]
+    fn sentinels_do_not_conceal_errors_or_unread_records() {
+        for response in [
+            r#"cb({code:-3000,data:{main:{hasMoreFeeds:false,total_number:0},data:[undefined]}});"#,
+            r#"cb({code:0,data:{main:{hasMoreFeeds:true,total_number:1},data:[undefined]}});"#,
+            r#"cb({code:0,data:{main:{hasMoreFeeds:false,total_number:1},data:[{html:''},undefined]}});"#,
+            r#"cb({code:0,data:{main:{hasMoreFeeds:false,total_number:0},data:[{},undefined]}});"#,
+            r#"cb({code:0,data:{data:[undefined]}});"#,
+        ] {
+            assert!(html(response).is_err(), "{response}");
+        }
     }
     #[test]
     fn reads_nested_html_and_decodes_escapes_once() {

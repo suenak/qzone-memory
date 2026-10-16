@@ -52,15 +52,18 @@ if (disclaimerAccepted.value) {
   checkForUpdatesOnStartup();
 }
 function retryPersistedSession() {
-  if (disclaimerAccepted.value && !authStore.loggedIn && document.visibilityState === "visible") {
+  if (disclaimerAccepted.value && document.visibilityState === "visible") {
     void authStore.restoreSession();
   }
 }
+let sessionCheckTimer: ReturnType<typeof setInterval> | undefined;
 onMounted(() => {
   window.addEventListener("focus", retryPersistedSession);
   document.addEventListener("visibilitychange", retryPersistedSession);
+  sessionCheckTimer = setInterval(retryPersistedSession, 5 * 60_000);
 });
 onBeforeUnmount(() => {
+  if (sessionCheckTimer) clearInterval(sessionCheckTimer);
   updateStore.stopAutomaticChecks();
   window.removeEventListener("focus", retryPersistedSession);
   document.removeEventListener("visibilitychange", retryPersistedSession);

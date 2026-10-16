@@ -29,9 +29,34 @@ import java.io.File
 @InvokeArg
 class OpenUpdateArgs { lateinit var path: String }
 
+@InvokeArg
+class SaveSessionArgs { lateinit var session: String }
+
 /** Native QQ login page; no JS bridge or credentials in frontend storage. */
 @TauriPlugin
 class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
+    private val sessionVault = QqSessionVault(activity)
+
+    @Command
+    fun loadSession(invoke: Invoke) {
+        try { invoke.resolve(JSObject().put("session", sessionVault.load() ?: org.json.JSONObject.NULL)) }
+        catch (_: Exception) { invoke.reject("无法读取已保存的 QQ 登录，请重新登录") }
+    }
+
+    @Command
+    fun saveSession(invoke: Invoke) {
+        try {
+            sessionVault.save(invoke.parseArgs(SaveSessionArgs::class.java).session)
+            invoke.resolve(JSObject())
+        } catch (_: Exception) { invoke.reject("无法安全保存 QQ 登录，本次会话仅在应用运行期间有效") }
+    }
+
+    @Command
+    fun deleteSession(invoke: Invoke) {
+        try { sessionVault.delete(); invoke.resolve(JSObject()) }
+        catch (_: Exception) { invoke.reject("无法清除已保存的 QQ 登录") }
+    }
+
     @Command
     fun openUpdate(invoke: Invoke) {
         try {
@@ -63,6 +88,8 @@ class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
     private var browser: WebView? = null
     private var state = "webLoginCancelled"
     private var message = "登录已取消"
+    private var callbackNonce: String? = null
+    private var infoLabel: TextView? = null
     // Let Qzone generate the current mobile login URL and parameters.
     private val loginUrl = "https://h5.qzone.qq.com/mqzone/index"
 
@@ -72,11 +99,24 @@ class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private fun close() {
+        callbackNonce = null
+        infoLabel = null
         dialog?.dismiss()
         browser?.stopLoading()
         browser?.destroy()
         browser = null
         dialog = null
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val web = browser ?: return
+        val destination = QqLoginCallback.destination(intent.dataString ?: return, callbackNonce) ?: return
+        callbackNonce = null // A callback is single-use; cancellation/restarting also invalidates it.
+        state = "webLoginWaiting"
+        message = "QQ 已确认，正在完成空间登录…"
+        infoLabel?.text = message
+        web.loadUrl(destination)
     }
 
     @Command
@@ -89,6 +129,7 @@ class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
         val window = Dialog(activity, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
         val layout = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         val info = TextView(activity).apply { text = message }
+        infoLabel = info
         val back = Button(activity).apply {
             text = "取消登录"
             setOnClickListener { close() }
@@ -115,10 +156,20 @@ class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
                 // The official one-key login can be initiated from an iframe.
                 if (browser === view && QqLoginNavigation.canOpenClient(view.url ?: "", uri.toString(), request.isForMainFrame)) {
                     try {
-                        activity.startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage("com.tencent.mobileqq"))
+                        val bytes = ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
+                        val nonce = bytes.joinToString("") { "%02x".format(it.toInt() and 255) }
+                        val launch = QqLoginCallback.prepareLaunch(view.url ?: "", uri.toString(), request.isForMainFrame, nonce)
+                        if (launch == null) {
+                            message = "当前 QQ 快捷登录方式暂不支持，请在官方页面使用账号密码登录"
+                            info.text = message
+                            return true
+                        }
+                        callbackNonce = nonce
+                        activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(launch)).setPackage("com.tencent.mobileqq"))
                         message = "请在 QQ 中确认，完成后返回拾忆"
                         info.text = message
                     } catch (_: android.content.ActivityNotFoundException) {
+                        callbackNonce = null
                         message = "未能打开 QQ，请在下方官方页面使用账号密码登录"
                         info.text = message
                     }
@@ -156,6 +207,8 @@ class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
         window.setContentView(layout)
         window.setOnDismissListener {
             if (dialog === window) {
+                callbackNonce = null
+                infoLabel = null
                 browser = null
                 dialog = null
                 web.stopLoading()
@@ -186,7 +239,10 @@ class QqLoginPlugin(private val activity: Activity) : Plugin(activity) {
     fun poll(invoke: Invoke) {
         val result = JSObject().put("status", state).put("message", message)
         if (dialog != null && state != "error") {
-            val cookies = CookieManager.getInstance().getCookie("https://h5.qzone.qq.com") ?: ""
+            val manager = CookieManager.getInstance()
+            val cookies = QqLoginCookies.select(listOf(
+                "https://user.qzone.qq.com", "https://i.qq.com", "https://h5.qzone.qq.com"
+            ).map { manager.getCookie(it) ?: "" }) ?: ""
             result.put("cookieHeader", cookies)
             result.put("userAgent", browser?.settings?.userAgentString ?: "")
         }
