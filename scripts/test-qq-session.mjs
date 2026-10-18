@@ -39,6 +39,21 @@ await assert.rejects(state.request(async () => { throw new Error('网络超时')
 assert.equal(state.expired, false, 'Network errors must preserve login state');
 await state.request(async () => ({ status: 'error', message: 'QQ_LOGIN_REQUIRED: historical task' }));
 assert.equal(state.expired, false, 'Old saved progress must not invalidate a new login');
+
+// Exercise the command adapter itself: retry failures are resolved result objects,
+// while stored progress may describe a different, already expired login session.
+const adapterSource = readFileSync(new URL('../src/utils/qqInvoke.ts', import.meta.url), 'utf8');
+const adapterJs = transpileModule(adapterSource, { compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022 } }).outputText;
+const resolvedLoginFailure = { success: false, message: 'QQ_LOGIN_REQUIRED: expired during retry', recoveredRecords: 0 };
+const invokeQq = new Function('nativeInvoke', 'qqSession',
+  adapterJs.replace(/^import .*;\r?\n/gm, '').replace('export function invoke', 'return function invoke'))(
+    async () => resolvedLoginFailure, qqSession);
+qqSession.authenticated();
+assert.deepEqual(await invokeQq('retry_archive_skip', { id: 1 }), resolvedLoginFailure);
+assert.equal(qqSession.expired, true, 'Resolved skip retry failures must invalidate the QQ identity');
+qqSession.authenticated();
+await invokeQq('get_archive_progress');
+assert.equal(qqSession.expired, false, 'Reading old progress must preserve the current QQ identity');
 // Exercise the real Pinia store with mocked IPC; never access an actual QQ account or vault.
 const { defineStore, createPinia, setActivePinia } = await import('pinia');
 const { computed, onScopeDispose, ref } = await import('vue');
@@ -46,6 +61,7 @@ const authSource = readFileSync(new URL('../src/stores/auth.ts', import.meta.url
 const authJs = transpileModule(authSource, { compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022 } }).outputText;
 let statusRequests = 0;
 let recycleCleared = 0;
+const archiveAccess = { dataChanging: false };
 let profileLoader = async () => ({ uin: 'test-account', nickname: 'Test account', avatarImage: 'test-avatar' });
 const dependencies = {
   defineStore, computed, onScopeDispose, ref, qqSession, requiresQqLogin,
@@ -61,6 +77,7 @@ const dependencies = {
   router: {}, platform: () => 'windows',
   useLicenseStore: () => ({ canArchive: true, refresh: async () => {} }),
   useRecycleSessionStore: () => ({ clear: () => { recycleCleared += 1; } }),
+  useArchiveStore: () => archiveAccess,
 };
 const useAuthStore = new Function(...Object.keys(dependencies),
   authJs.replace(/^import .*;\r?\n/gm, '').replace('export const useAuthStore =', 'return'))(...Object.values(dependencies));
@@ -129,4 +146,26 @@ await oldRestore;
 assert.equal(uncertain.loggedIn, true);
 assert.equal(uncertain.user.uin, 'new-account');
 uncertain.$dispose();
+
+qqSession.authenticated();
+setActivePinia(createPinia());
+const dataChangeGate = useAuthStore();
+dataChangeGate.user = { uin: 'current-account', nickname: 'Current' };
+dataChangeGate.status = 'success';
+archiveAccess.dataChanging = true;
+const beforeBlockedRestore = statusRequests;
+await dataChangeGate.restoreSession(true);
+await dataChangeGate.openLogin();
+await dataChangeGate.reauthenticate();
+assert.equal(statusRequests, beforeBlockedRestore, 'Data changes must block session restoration');
+assert.equal(dataChangeGate.dialogVisible, false, 'Data changes must block new login attempts');
+assert.equal(qqSession.expired, false, 'Blocked reauthentication must preserve the current QQ identity');
+assert.equal(dataChangeGate.user.uin, 'current-account');
+archiveAccess.dataChanging = false;
+const pendingOpen = dataChangeGate.openLogin();
+archiveAccess.dataChanging = true;
+await pendingOpen;
+assert.equal(dataChangeGate.dialogVisible, false, 'Recheck the data operation after asynchronous licence validation');
+archiveAccess.dataChanging = false;
+dataChangeGate.$dispose();
 console.log('QQ session and auth store regression checks passed');

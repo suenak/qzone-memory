@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node scripts/test-qq-session.mjs && node scripts/test-qq-source-notice.mjs && node --test scripts/test-library-lifecycle.mjs scripts/test-archive-store.mjs scripts/test-tasks-lifecycle.mjs scripts/test-archives-lifecycle.mjs scripts/test-browsing-lifecycle.mjs scripts/test-update-store.mjs scripts/test-settings-lifecycle.mjs scripts/test-auth-lifecycle.mjs scripts/test-license-store.mjs scripts/test-activation-lifecycle.mjs scripts/test-recycle-lifecycle.mjs scripts/test-dashboard-lifecycle.mjs scripts/test-shell-search.mjs",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",

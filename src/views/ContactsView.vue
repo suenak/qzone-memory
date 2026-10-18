@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { describeError } from "../utils/uiError";
 import {
   CalendarDays,
@@ -24,8 +24,6 @@ import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import StatTile from "../components/ui/StatTile.vue";
 import { listContactCommentThreads, listInteractors, type ArchiveItem, type Interactor } from "../utils/qzone";
 
-/* ------------------------------------------------------------------ 原有业务逻辑，保持不动 */
-
 const contacts = ref<Interactor[]>([]);
 const loading = ref(false);
 const error = ref("");
@@ -37,6 +35,8 @@ const commentsVisible = ref(false);
 const commentsLoading = ref(false);
 const commentsError = ref("");
 let commentSequence = 0;
+let loadSequence = 0;
+let disposed = false;
 
 type SortOption = { label: string; value: typeof sortBy.value };
 const sortOptions: SortOption[] = [
@@ -76,6 +76,7 @@ const formatTime = (seconds: number) =>
     : "";
 
 async function openComments(contact: Interactor) {
+  if (disposed) return;
   const sequence = ++commentSequence;
   selectedContact.value = contact;
   commentsVisible.value = true;
@@ -93,15 +94,19 @@ async function openComments(contact: Interactor) {
 }
 
 async function load() {
-  if (loading.value) return;
+  if (disposed || loading.value) return;
+  const sequence = ++loadSequence;
   loading.value = true;
   error.value = "";
   try {
-    contacts.value = await listInteractors();
+    const result = await listInteractors();
+    if (sequence !== loadSequence) return;
+    contacts.value = result;
+    brokenAvatars.value = {};
   } catch (reason) {
-    error.value = String(reason);
+    if (sequence === loadSequence) error.value = String(reason);
   } finally {
-    loading.value = false;
+    if (sequence === loadSequence) loading.value = false;
   }
 }
 
@@ -155,23 +160,36 @@ function avatarClass(rank: number) {
 }
 
 function observeSentinel() {
-  if (!observer || !sentinel.value) return;
-  observer.unobserve(sentinel.value);
+  observer?.disconnect();
+  if (disposed || !observer || !sentinel.value || !hasMore.value) return;
   observer.observe(sentinel.value);
+}
+
+function showMore() {
+  if (disposed || !hasMore.value) return;
+  visibleCount.value = Math.min(visibleCount.value + PAGE_SIZE, ranked.value.length);
 }
 
 watch([searchKey, sortBy], () => {
   visibleCount.value = PAGE_SIZE;
 });
 
-watch(hasMore, () => {
-  void nextTick(observeSentinel);
-});
+// The sentinel can be replaced while hasMore stays true, such as after search.
+// Re-arm after each batch too, so a tall viewport can fill beyond one batch.
+watch([sentinel, visibleCount, hasMore], observeSentinel, { flush: "post" });
+watch(commentsVisible, (visible) => {
+  if (visible) return;
+  ++commentSequence;
+  commentsLoading.value = false;
+  commentsError.value = "";
+  commentThreads.value = [];
+  selectedContact.value = undefined;
+}, { flush: "sync" });
 
 onMounted(() => {
   observer = new IntersectionObserver(
     (entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) visibleCount.value += PAGE_SIZE;
+      if (entries.some((entry) => entry.isIntersecting && entry.target === sentinel.value)) showMore();
     },
     { rootMargin: "160px" },
   );
@@ -179,6 +197,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
+  ++loadSequence;
+  ++commentSequence;
   observer?.disconnect();
   observer = undefined;
 });
@@ -342,8 +363,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-if="hasMore" ref="sentinel" class="qzc-sentinel">
-          <SkeletonBlock width="100%" height="10px" />
-          <span>加载更多联系人…</span>
+          <Button label="显示更多联系人" severity="secondary" text @click="showMore" />
         </div>
       </template>
 

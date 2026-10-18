@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { describeError, diagnosticError } from "../utils/uiError";
 import { qqProgressNotice, qqSourceNotice } from "../utils/qqSourceNotice";
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import Button from "primevue/button";
 import InputNumber from "primevue/inputnumber";
@@ -30,7 +30,7 @@ import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import StatTile from "../components/ui/StatTile.vue";
 import {
-  cancelFeedArchive, listArchiveSkips, retryArchiveSkip, startFeedArchive,
+  cancelFeedArchive, listArchiveSkips, startFeedArchive,
   IDLE_ARCHIVE_PROGRESS, type ArchiveProgress, type ArchiveSkipItem, type ArchiveStatus,
 } from "../utils/qzone";
 import { useArchiveStore } from "../stores/archive";
@@ -44,7 +44,7 @@ const licenseStore = useLicenseStore();
 const { loggedIn } = storeToRefs(authStore);
 const progress = computed<ArchiveProgress>(() => archiveStore.progress ?? IDLE_ARCHIVE_PROGRESS);
 const skips = ref<ArchiveSkipItem[]>([]);
-const retryingId = ref<number>();
+const retryingId = computed(() => archiveStore.retryingSkipId);
 const skipNotice = ref("");
 const actionError = ref("");
 const actionNotice = ref("");
@@ -54,6 +54,9 @@ const refreshing = ref(false);
 const skipsError = ref("");
 const currentTime = ref(Date.now());
 let timer: ReturnType<typeof setInterval> | undefined;
+let viewRevision = 0;
+let disposed = false;
+const isCurrentView = (revision: number) => !disposed && revision === viewRevision;
 const running = computed(() => progress.value.status === "running");
 const needsLogin = computed(() => !running.value && /QQ_LOGIN_REQUIRED:|(?:^|\D)-3000(?!\d)/.test(progress.value.message));
 const rateLimited = computed(() => progress.value.status === "limited");
@@ -62,6 +65,7 @@ const stateError = computed(() => qqSourceNotice(archiveStore.error) ? "" : arch
 const progressMessage = computed(() => sourceNotice.value?.details ?? diagnosticError(progress.value.message));
 const remainingSeconds = computed(() => Math.max(0, Math.ceil((Number(progress.value.retryAt || 0) * 1000 - currentTime.value) / 1000)));
 const rateWaiting = computed(() => (rateLimited.value || progress.value.status === "partial") && remainingSeconds.value > 0);
+const canRetrySkips = computed(() => loggedIn.value && licenseStore.canArchive && !archiveStore.busy && !rateWaiting.value);
 const remainingText = computed(() => `${String(Math.floor(remainingSeconds.value / 60)).padStart(2, "0")}:${String(remainingSeconds.value % 60).padStart(2, "0")}`);
 const statusText = computed(() => sourceNotice.value?.label ?? ({ idle: "未开始", running: "进行中", completed: "已完成", partial: "未读取完整", cancelled: "已取消", limited: "稍后继续", error: "失败" }[progress.value.status]));
 
@@ -143,22 +147,41 @@ function commitIntervalInput() {
 
 /** All progress reads share the store's request-order protection. */
 let refreshPromise: Promise<void> | null = null;
-async function refresh() {
-  if (refreshPromise) return refreshPromise;
+let refreshRevision = -1;
+let refreshSequence = 0;
+async function refresh(force = false) {
+  if (disposed) return;
+  if (!force && refreshPromise && refreshRevision === viewRevision) return refreshPromise;
+  const revision = viewRevision;
+  const sequence = ++refreshSequence;
+  const isCurrentRequest = () => isCurrentView(revision) && sequence === refreshSequence;
+  refreshRevision = revision;
   refreshing.value = true;
-  refreshPromise = (async () => {
+  const request = (async () => {
     try {
       await archiveStore.refresh();
+      if (!isCurrentRequest()) return;
       if (!loggedIn.value) { skips.value = []; return; }
-      try { skips.value = await listArchiveSkips(); skipsError.value = ""; }
-      catch (reason) { skipsError.value = describeError(reason, "跳页记录读取失败，请刷新重试。"); }
-    } finally { refreshing.value = false; refreshPromise = null; }
+      try {
+        const result = await listArchiveSkips();
+        if (!isCurrentRequest()) return;
+        skips.value = result;
+        skipsError.value = "";
+      }
+      catch (reason) { if (isCurrentRequest()) skipsError.value = describeError(reason, "跳页记录读取失败，请刷新重试。"); }
+    } finally {
+      if (isCurrentRequest()) refreshing.value = false;
+      if (sequence === refreshSequence) refreshPromise = null;
+    }
   })();
-  return refreshPromise;
+  refreshPromise = request;
+  return request;
 }
 async function start() {
+  if (disposed || archiveStore.retrying || archiveStore.dataChanging) return;
   if (needsLogin.value) { await authStore.reauthenticate(); return; }
   if (!loggedIn.value || starting.value || running.value || rateWaiting.value || !licenseStore.canArchive) return;
+  const revision = viewRevision;
   starting.value = true;
   actionError.value = "";
   actionNotice.value = "";
@@ -168,33 +191,41 @@ async function start() {
   }
   catch (reason) {
     archiveStore.finishRun();
+    if (!isCurrentView(revision)) return;
     const notice = qqSourceNotice(reason);
     if (notice) actionNotice.value = notice;
     else actionError.value = describeError(reason, "未能开始恢复，请重试。");
   }
-  finally { starting.value = false; await archiveStore.refresh(); await refresh(); }
+  finally {
+    if (isCurrentView(revision)) { starting.value = false; await refresh(true); }
+    else void archiveStore.refresh();
+  }
 }
 async function cancel() {
-  if (stopping.value) return;
+  if (disposed || stopping.value) return;
+  const revision = viewRevision;
   stopping.value = true;
   actionError.value = "";
   try {
     await cancelFeedArchive();
   }
-  catch (reason) { actionError.value = describeError(reason, "未能停止恢复，请重试。"); }
-  finally { stopping.value = false; await refresh(); }
+  catch (reason) { if (isCurrentView(revision)) actionError.value = describeError(reason, "未能停止恢复，请重试。"); }
+  finally {
+    if (isCurrentView(revision)) { stopping.value = false; await refresh(true); }
+    else void archiveStore.refresh();
+  }
 }
 async function retrySkip(item: ArchiveSkipItem) {
-  retryingId.value = item.id;
+  if (disposed || !canRetrySkips.value || item.resolvedAt) return;
+  const revision = viewRevision;
   skipNotice.value = "";
   try {
-    const result = await retryArchiveSkip(item.id);
-    skipNotice.value = qqSourceNotice(result.message) ?? result.message;
+    const result = await archiveStore.retrySkip(item.id);
+    if (isCurrentView(revision)) skipNotice.value = qqSourceNotice(result.message) ?? result.message;
   } catch (error) {
-    skipNotice.value = qqSourceNotice(error) ?? describeError(error, "重试此页失败，请稍后再试。");
+    if (isCurrentView(revision)) skipNotice.value = qqSourceNotice(error) ?? describeError(error, "重试此页失败，请稍后再试。");
   } finally {
-    retryingId.value = undefined;
-    await refresh();
+    if (isCurrentView(revision)) await refresh(true);
   }
 }
 function formatTime(timestamp?: number) {
@@ -217,8 +248,19 @@ onMounted(async () => {
 watch(() => archiveStore.progress?.status, (status, previous) => {
   if (previous === "running" && status !== "running") void refresh();
 });
-watch(loggedIn, refresh);
-onBeforeUnmount(() => clearInterval(timer));
+watch([() => authStore.user?.uin, loggedIn], () => {
+  const revision = ++viewRevision;
+  skips.value = [];
+  skipsError.value = "";
+  skipNotice.value = "";
+  actionError.value = "";
+  actionNotice.value = "";
+  refreshing.value = false;
+  starting.value = false;
+  stopping.value = false;
+  void nextTick(() => { if (isCurrentView(revision)) void refresh(); });
+}, { flush: "sync" });
+onBeforeUnmount(() => { disposed = true; ++viewRevision; clearInterval(timer); });
 </script>
 
 <template>
@@ -235,7 +277,7 @@ onBeforeUnmount(() => clearInterval(timer));
           <span class="status-chip__dot" aria-hidden="true" />
           {{ statusText }}
         </span>
-        <button class="ghost-button" type="button" aria-label="刷新进度" :disabled="refreshing" @click="refresh">
+        <button class="ghost-button" type="button" aria-label="刷新进度" :disabled="refreshing" @click="refresh()">
           <RefreshCw :size="16" :stroke-width="1.8" />
           <span class="ghost-button__text">刷新</span>
         </button>
@@ -323,7 +365,7 @@ onBeforeUnmount(() => clearInterval(timer));
       <template #footer>
         <div class="action-bar">
           <div class="action-bar__buttons" :class="{ 'is-running': running }">
-            <Button :label="startLabel" :loading="starting" :disabled="running || rateWaiting || (!loggedIn && !needsLogin) || !licenseStore.canArchive" @click="start" ><template #icon><Download :size="16" :stroke-width="1.8" /></template></Button>
+            <Button :label="startLabel" :loading="starting" :disabled="running || archiveStore.retrying || archiveStore.dataChanging || rateWaiting || (!loggedIn && !needsLogin) || !licenseStore.canArchive" @click="start" ><template #icon><Download :size="16" :stroke-width="1.8" /></template></Button>
             <Button v-if="running" label="停止恢复" severity="secondary" outlined :loading="stopping" @click="cancel" ><template #icon><X :size="16" :stroke-width="1.8" /></template></Button>
             <button
               class="ghost-button"
@@ -409,7 +451,7 @@ onBeforeUnmount(() => clearInterval(timer));
               size="small"
               outlined
               :loading="retryingId === item.id"
-              :disabled="running || Boolean(item.resolvedAt) || retryingId !== undefined"
+              :disabled="!canRetrySkips || Boolean(item.resolvedAt)"
               @click="retrySkip(item)"
             ><template #icon><RefreshCw :size="16" :stroke-width="1.8" /></template></Button>
           </li>

@@ -4,6 +4,7 @@ import Dialog from "primevue/dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { describeError, diagnosticError } from "../utils/uiError";
 import { useAuthStore } from "../stores/auth";
+import { useArchiveStore } from "../stores/archive";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import InputText from "primevue/inputtext";
@@ -35,7 +36,6 @@ import {
   linkLibraryVideo,
   listQzoneLibrary,
   listQzoneLibraryYears,
-  syncQzoneLibrary,
   type LibraryItem,
   type LibraryModule,
   type LibraryPage,
@@ -43,6 +43,7 @@ import {
 
 const route = useRoute();
 const router = useRouter();
+const archiveStore = useArchiveStore();
 const items = ref<LibraryItem[]>([]);
 const page = ref<LibraryPage>();
 const years = ref<number[]>([]);
@@ -51,7 +52,7 @@ const query = ref("");
 const first = ref(0);
 const pageSize = ref(24);
 const loading = ref(false);
-const syncing = ref(false);
+const syncing = computed(() => archiveStore.syncing);
 const error = ref("");
 const notice = ref("");
 let coverObserver: IntersectionObserver | undefined;
@@ -60,6 +61,10 @@ const imageSources = reactive<Record<number, string>>({});
 const failedGuestbookAvatars = reactive(new Set<number>());
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 let loadSequence = 0;
+let contextSequence = 0;
+let disposed = false;
+let resettingContext = false;
+const isCurrentContext = (sequence: number) => !disposed && sequence === contextSequence;
 
 /* ------------------------------------------------------------------ 纯 UI 状态
  * 以下三段只服务于呈现：加载中的封面、灯箱索引、提示文案。
@@ -208,6 +213,16 @@ function releaseImages() {
   coverLoading.clear();
   imageRequests.clear();
   mediaSequence += 1;
+  mediaOpening.clear();
+  videoVisible.value = false;
+  videoSource.value = "";
+  videoError.value = "";
+  videoChoicesVisible.value = false;
+  activeVideoItem.value = undefined;
+  ++choiceSequence;
+  choicesLoading.value = false;
+  videoChoices.value = [];
+  choicesTotal.value = 0;
   Object.keys(originalSources).forEach(key => delete originalSources[Number(key)]);
   Object.keys(originalErrors).forEach(key => delete originalErrors[Number(key)]);
   Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
@@ -227,7 +242,7 @@ function observeCovers() {
   document.querySelectorAll<HTMLElement>(".library [data-library-cover]").forEach((element) => coverObserver?.observe(element));
 }
 async function loadCover(item: LibraryItem) {
-  if (!item.coverUrl || imageSources[item.id]) return;
+  if (disposed || !item.coverUrl || imageSources[item.id]) return;
   const generation = imageRequests.generation;
   try {
     let source: string;
@@ -241,6 +256,7 @@ async function loadCover(item: LibraryItem) {
   } catch { /* card keeps its media placeholder */ }
 }
 async function load() {
+  if (disposed) return;
   const sequence = ++loadSequence;
   loading.value = true;
   error.value = "";
@@ -264,29 +280,28 @@ async function load() {
   }
 }
 async function sync() {
-  if (syncing.value) return;
-  syncing.value = true;
+  if (disposed || syncing.value || archiveStore.retrying || archiveStore.dataChanging) return;
+  const context = contextSequence;
   const sourceModule = module.value;
   const sourceParent = parentKey.value;
   error.value = "";
   notice.value = "";
   try {
-    const result = await syncQzoneLibrary(sourceModule, sourceParent);
-    if (sourceModule !== module.value || sourceParent !== parentKey.value) return;
+    const result = await archiveStore.syncLibrary(sourceModule, sourceParent);
+    if (!isCurrentContext(context)) return;
     notice.value = `已保存 ${result.saved} 条${result.complete ? "，本轮备份完成。" : "，备份尚未完成，可稍后继续。"}`;
     if (result.complete) toast.success(notice.value);
     else toast.info(notice.value);
     first.value = 0;
     await load();
   } catch (reason) {
-    if (sourceModule === module.value && sourceParent === parentKey.value) {
+    if (isCurrentContext(context)) {
       const syncFailure = String(reason);
       // load() 首行会清空 error，而且它自身失败时的文案（「读取失败」）不该盖过本轮备份的真实原因；
       // 用 finally 把备份失败原因写回，避免限流／凭证失效被显示成读取失败。
-      try { await load(); } finally { error.value = syncFailure; }
+      try { await load(); } finally { if (isCurrentContext(context)) error.value = syncFailure; }
     }
   }
-  finally { syncing.value = false; }
 }
 function openItem(item: LibraryItem) {
   if (module.value === "albums") {
@@ -305,39 +320,54 @@ const videoChoices = ref<LibraryItem[]>([]);
 const linkingVideo = ref(false);
 let choiceSequence = 0;
 async function loadVideoChoices() {
+  if (disposed || !videoChoicesVisible.value) return;
   const sequence = ++choiceSequence;
   choicesLoading.value = true;
   try { const result = await listQzoneLibrary("videos",undefined,videoChoiceQuery.value.trim() || undefined,undefined,50,choiceOffset.value); if (sequence === choiceSequence) { videoChoices.value = result.items; choicesTotal.value = result.total; } }
-  catch (reason) { toast.error(describeError(reason,"视频列表读取失败，请重试。")); }
+  catch (reason) { if (sequence === choiceSequence) toast.error(describeError(reason,"视频列表读取失败，请重试。")); }
   finally { if (sequence === choiceSequence) choicesLoading.value = false; }
 }
-async function chooseVideo() { videoChoicesVisible.value = true; videoChoiceQuery.value = ""; choiceOffset.value = 0; await loadVideoChoices(); }
+async function chooseVideo() {
+  if (disposed) return;
+  videoChoicesVisible.value = true;
+  videoChoiceQuery.value = "";
+  choiceOffset.value = 0;
+  await loadVideoChoices();
+}
 async function confirmVideoChoice(video: LibraryItem) {
   const photo = activeVideoItem.value;
-  if (!photo || linkingVideo.value) return;
+  if (disposed || !videoChoicesVisible.value || !photo || linkingVideo.value) return;
+  const sequence = choiceSequence;
   linkingVideo.value = true;
-  try { await linkLibraryVideo(photo.id,video.id); videoChoicesVisible.value = false; await openMedia(photo); }
-  catch (reason) { toast.error(describeError(reason,"视频没有关联成功，请重试。")); }
-  finally { linkingVideo.value = false; }
+  try {
+    await linkLibraryVideo(photo.id,video.id);
+    if (sequence !== choiceSequence) return;
+    videoChoicesVisible.value = false;
+    await openMedia(photo);
+  }
+  catch (reason) { if (sequence === choiceSequence) toast.error(describeError(reason,"视频没有关联成功，请重试。")); }
+  finally { if (!disposed) linkingVideo.value = false; }
 }
 function showVideoCover() { const item = activeVideoItem.value; videoVisible.value = false; if (item) openLightbox(item); }
 let lastVideoRefresh = 0;
 let mediaSequence = 0;
 async function originalImage(item: LibraryItem) {
-  if (originalSources[item.id] || mediaOpening.has(item.id)) return;
+  if (disposed || originalSources[item.id] || mediaOpening.has(item.id)) return;
   mediaOpening.add(item.id); originalErrors[item.id] = "";
-  const sequence = mediaSequence;
+  const generation = imageRequests.generation;
   try {
     const result = await loadLibraryMedia(item.id);
-    if (sequence !== mediaSequence) return;
+    if (generation !== imageRequests.generation) return;
     originalSources[item.id] = convertFileSrc(result.path);
-  } catch (reason) { if (sequence === mediaSequence) originalErrors[item.id] = describeError(reason,"原图暂时取不到，请重试。"); }
-  finally { mediaOpening.delete(item.id); }
+  } catch (reason) { if (generation === imageRequests.generation) originalErrors[item.id] = describeError(reason,"原图暂时取不到，请重试。"); }
+  finally { if (generation === imageRequests.generation) mediaOpening.delete(item.id); }
 }
 async function openMedia(item: LibraryItem) {
+  if (disposed) return;
   if (!item.isVideo) { openLightbox(item); return; }
   if (mediaOpening.has(item.id)) return;
   const sequence = ++mediaSequence;
+  if (activeVideoItem.value) mediaOpening.delete(activeVideoItem.value.id);
   activeVideoItem.value = item;
   mediaOpening.add(item.id);
   closeLightbox();
@@ -346,11 +376,12 @@ async function openMedia(item: LibraryItem) {
     let result;
     try { result = await loadLibraryMedia(item.id); }
     catch (reason) {
+      if (sequence !== mediaSequence) return;
       // Refresh only expired/missing video URLs, never network failures or licence errors.
       if (!/HTTP 403|未找到.*播放地址/.test(String(reason)) || Date.now() - lastVideoRefresh < 60_000) throw reason;
       lastVideoRefresh = Date.now();
       videoError.value = "正在刷新视频播放地址…";
-      const refreshed = await syncQzoneLibrary("videos");
+      const refreshed = await archiveStore.syncLibrary("videos");
       if (!refreshed.complete) throw new Error("视频列表未读取完整，请稍后重新备份视频。");
       if (sequence !== mediaSequence) return;
       result = await loadLibraryMedia(item.id);
@@ -359,7 +390,7 @@ async function openMedia(item: LibraryItem) {
     closeLightbox();
     videoSource.value = convertFileSrc(result.path); videoError.value = "";
   } catch (reason) { if (sequence === mediaSequence) videoError.value = describeError(reason,"视频暂时无法播放，请重试；封面仍可查看。"); }
-  finally { mediaOpening.delete(item.id); }
+  finally { if (sequence === mediaSequence) mediaOpening.delete(item.id); }
 }
 function retryOriginal() {
   const item = lightboxEntry.value?.item;
@@ -374,7 +405,7 @@ function changePage(event: PageState) { first.value = event.first; pageSize.valu
 
 /** 包装已有 loadCover：只补一个「加载中」标记，不改变原来的取图方式。 */
 async function ensureCover(item: LibraryItem) {
-  if (!item.coverUrl || imageSources[item.id] || coverLoading.has(item.id)) return;
+  if (disposed || !item.coverUrl || imageSources[item.id] || coverLoading.has(item.id)) return;
   const generation = imageRequests.generation;
   coverLoading.add(item.id);
   try { await loadCover(item); } finally { if (generation === imageRequests.generation) coverLoading.delete(item.id); }
@@ -426,11 +457,48 @@ function stepLightbox(delta: number) {
   if (item && !item.isVideo && item.module === "photos") void originalImage(item);
 }
 
-watch(() => authStore.user?.uin, () => { closeLightbox(); videoVisible.value = false; releaseImages(); void load(); });
+// Invalidate immediately, including A → B → A navigation while a request is pending.
+watch([() => authStore.user?.uin, module, parentKey], () => {
+  const context = ++contextSequence;
+  resettingContext = true;
+  ++loadSequence;
+  if (searchTimer) clearTimeout(searchTimer);
+  closeLightbox();
+  releaseImages();
+  items.value = [];
+  page.value = undefined;
+  years.value = [];
+  error.value = "";
+  notice.value = "";
+  expandedEntries.clear();
+  failedGuestbookAvatars.clear();
+  first.value = 0;
+  selectedYear.value = 0;
+  query.value = "";
+  loading.value = true;
+  void nextTick(() => {
+    if (!isCurrentContext(context)) return;
+    resettingContext = false;
+    void load();
+  });
+}, { flush: "sync" });
+watch(videoVisible, (visible) => {
+  if (visible) return;
+  ++mediaSequence;
+  if (activeVideoItem.value) mediaOpening.delete(activeVideoItem.value.id);
+  videoSource.value = "";
+}, { flush: "sync" });
+watch(videoChoicesVisible, (visible) => {
+  if (visible) return;
+  ++choiceSequence;
+  choicesLoading.value = false;
+  videoChoices.value = [];
+  choicesTotal.value = 0;
+}, { flush: "sync" });
 onMounted(load);
-watch(() => [route.name, route.params.albumId], () => { first.value = 0; selectedYear.value = 0; query.value = ""; void load(); });
-watch(selectedYear, () => { first.value = 0; void load(); });
+watch(selectedYear, () => { if (!resettingContext) { first.value = 0; void load(); } });
 watch(query, () => {
+  if (resettingContext) return;
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = setTimeout(() => { first.value = 0; void load(); }, 260);
 });
@@ -438,6 +506,8 @@ watch(query, () => {
 watch(items, () => { lightboxIndex.value = -1; });
 
 onBeforeUnmount(() => {
+  disposed = true;
+  ++contextSequence;
   ++loadSequence;
   if (searchTimer) clearTimeout(searchTimer);
   releaseImages();
@@ -478,7 +548,7 @@ onBeforeUnmount(() => {
           <p class="library__sync-hint">{{ syncState.detail }}</p>
           <p class="library__sync-hint">上次备份：{{ syncedTime }}</p>
           <button v-if="!authStore.loggedIn" class="btn btn--primary" type="button" @click="authStore.openLogin">登录 QQ 空间后备份</button>
-          <button v-else class="btn btn--primary" type="button" :disabled="syncing" @click="sync">
+          <button v-else class="btn btn--primary" type="button" :disabled="syncing || archiveStore.retrying || archiveStore.dataChanging" @click="sync">
             <LoaderCircle v-if="syncing" class="is-spinning" :size="16" :stroke-width="1.8" />
             <RefreshCw v-else :size="16" :stroke-width="1.8" />
             <span>{{ syncing ? "正在备份…" : moduleInfo.action }}</span>
@@ -681,7 +751,7 @@ onBeforeUnmount(() => {
         </button>
         <button v-else-if="hasFilter" class="btn btn--ghost" type="button" @click="clearFilters">清除筛选</button>
         <button v-else-if="!authStore.loggedIn" class="btn btn--primary" type="button" @click="authStore.openLogin">登录 QQ 空间</button>
-        <button v-else class="btn btn--primary" type="button" :disabled="syncing" @click="sync">{{ syncing ? '正在备份…' : moduleInfo.action }}</button>
+        <button v-else class="btn btn--primary" type="button" :disabled="syncing || archiveStore.retrying || archiveStore.dataChanging" @click="sync">{{ syncing ? '正在备份…' : moduleInfo.action }}</button>
       </EmptyState>
     </SectionCard>
 

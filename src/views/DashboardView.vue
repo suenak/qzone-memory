@@ -39,6 +39,11 @@ const ranking = ref<InteractionRank[]>([]);
 const archiveYears = ref<number[]>([]);
 const loading = ref(false);
 const dashboardError = ref("");
+const rankingError = ref("");
+const recentError = ref("");
+const yearsError = ref("");
+const rankingLoaded = ref(false);
+const recentLoaded = ref(false);
 const avatarSources = reactive<Record<string, string>>({});
 let refreshTimer: number | undefined;
 let disposed = false;
@@ -46,6 +51,7 @@ let lastRefresh = 0;
 const avatarRequests = new Map<string, AbortController>();
 /** 登出或重新加载都会让在途请求作废，否则轮询期间旧账号的概览与排行会写回界面。 */
 let loadSequence = 0;
+let refreshQueued = false;
 const storageText = computed(() => overview.value.databaseBytes < 1024 * 1024 ? `${(overview.value.databaseBytes / 1024).toFixed(1)} KB` : `${(overview.value.databaseBytes / 1024 / 1024).toFixed(1)} MB`);
 const taskSeverity = computed(() => ({ completed: "success", partial: "warn", running: "info", error: "danger", cancelled: "warn", limited: "warn", idle: "secondary" }[progress.value.status]));
 const taskText = computed(() => ({ completed: "已完成", partial: "未读取完整", running: "恢复中", error: "失败", cancelled: "已取消", limited: "稍后继续", idle: "未开始" }[progress.value.status]));
@@ -62,7 +68,9 @@ const overviewLoaded = ref(false);
 
 
 /** 仅首屏需要骨架；后台静默刷新时保留已有数字，避免闪烁。 */
-const firstLoadPending = computed(() => loading.value && !overviewLoaded.value);
+const firstLoadPending = computed(() => !overviewLoaded.value && !dashboardError.value);
+const rankingPending = computed(() => !rankingLoaded.value && !rankingError.value);
+const recentPending = computed(() => !recentLoaded.value && !recentError.value);
 const hasMemory = computed(() => overview.value.dynamics > 0 || overview.value.pictures > 0 || recent.value.length > 0);
 const interactionTotal = computed(() => overview.value.likes + overview.value.comments);
 /** 时间轴上唯一的真实时间锚点：最近保存的那条回忆。 */
@@ -100,6 +108,18 @@ function releaseAvatars() {
   avatarRequests.clear();
   Object.values(avatarSources).forEach((url) => URL.revokeObjectURL(url));
   Object.keys(avatarSources).forEach((uin) => delete avatarSources[uin]);
+}
+function pruneAvatars(uins: Set<string>) {
+  for (const [uin, controller] of avatarRequests) {
+    if (uins.has(uin)) continue;
+    controller.abort();
+    avatarRequests.delete(uin);
+  }
+  for (const uin of Object.keys(avatarSources)) {
+    if (uins.has(uin)) continue;
+    URL.revokeObjectURL(avatarSources[uin]);
+    delete avatarSources[uin];
+  }
 }
 async function loadAvatar(uin: string) {
   if (!/^\d+$/.test(uin) || avatarSources[uin] || avatarRequests.has(uin) || disposed) return;
@@ -143,32 +163,49 @@ async function loadDashboard() {
   if (loading.value || disposed) return;
   const sequence = ++loadSequence;
   loading.value = true;
-  dashboardError.value = "";
   lastRefresh = Date.now();
   try {
-    const [stats, items, ranks, years] = await Promise.all([
+    const [stats, items, ranks, years] = await Promise.allSettled([
       getArchiveOverview(), listArchivedFeeds(3, 0), getInteractionRanking(8),
-      listArchiveYears("self").catch(() => [] as number[]),
+      listArchiveYears("self"),
     ]);
     if (sequence !== loadSequence || disposed) return;
-    overview.value = stats; recent.value = items; ranking.value = ranks;
-    archiveYears.value = years.filter((year) => year > 0);
-    overviewLoaded.value = true;
-    const avatarUins = [...items.flatMap((item) => item.authorUin ? [item.authorUin] : []), ...ranks.map((item) => item.uin)];
-    void Promise.all([...new Set(avatarUins)].map(loadAvatar));
-  } catch (reason) {
-    if (sequence !== loadSequence || disposed) return;
     // A fresh installation has neither a session nor a last local account.
-    if (!loggedIn.value && String(reason) === "尚未登录 QQ 空间") overviewLoaded.value = true;
-    else dashboardError.value = String(reason);
-  } finally { if (sequence === loadSequence && !disposed) loading.value = false; }
+    const noAccount = (reason: unknown) => !loggedIn.value && String(reason) === "尚未登录 QQ 空间";
+    if (stats.status === "fulfilled") {
+      overview.value = stats.value; overviewLoaded.value = true; dashboardError.value = "";
+    } else if (noAccount(stats.reason)) {
+      overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 };
+      overviewLoaded.value = true; dashboardError.value = "";
+    } else dashboardError.value = String(stats.reason);
+    if (items.status === "fulfilled" || noAccount(items.reason)) {
+      recent.value = items.status === "fulfilled" ? items.value : [];
+      recentLoaded.value = true; recentError.value = "";
+    } else recentError.value = String(items.reason);
+    if (ranks.status === "fulfilled" || noAccount(ranks.reason)) {
+      ranking.value = ranks.status === "fulfilled" ? ranks.value : [];
+      rankingLoaded.value = true; rankingError.value = "";
+    } else rankingError.value = String(ranks.reason);
+    if (years.status === "fulfilled" || noAccount(years.reason)) {
+      archiveYears.value = years.status === "fulfilled" ? [...new Set(years.value.filter((year) => Number.isInteger(year) && year > 0))].sort((a, b) => b - a) : [];
+      yearsError.value = "";
+    } else yearsError.value = String(years.reason);
+    const avatarUins = new Set([...recent.value.flatMap((item) => item.authorUin ? [item.authorUin] : []), ...ranking.value.map((item) => item.uin)]);
+    pruneAvatars(avatarUins);
+    void Promise.all([...avatarUins].map(loadAvatar));
+  } finally {
+    if (sequence === loadSequence && !disposed) {
+      loading.value = false;
+      if (refreshQueued) { refreshQueued = false; scheduleRefresh(true); }
+    }
+  }
 }
 function scheduleRefresh(immediate = false) {
   if (disposed || document.visibilityState !== "visible") return;
   if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
   refreshTimer = window.setTimeout(() => {
     refreshTimer = undefined;
-    if (loading.value) { scheduleRefresh(); return; }
+    if (loading.value) { refreshQueued = true; return; }
     void loadDashboard();
   }, immediate ? 0 : Math.max(500, 10_000 - (Date.now() - lastRefresh)));
 }
@@ -179,16 +216,20 @@ function handleVisibilityChange() {
   if (document.visibilityState === "visible") scheduleRefresh(true);
   else if (refreshTimer !== undefined) { window.clearTimeout(refreshTimer); refreshTimer = undefined; }
 }
-function primaryAction() { loggedIn.value ? router.push("/tasks") : authStore.openLogin(); }
+function primaryAction() { archiveStore.running || loggedIn.value ? router.push("/tasks") : authStore.openLogin(); }
 watch(() => user.value?.uin, () => {
   ++loadSequence;
   loading.value = false;
   overviewLoaded.value = false;
+  rankingLoaded.value = false; recentLoaded.value = false;
+  dashboardError.value = ""; rankingError.value = ""; recentError.value = ""; yearsError.value = "";
+  refreshQueued = false;
+  if (refreshTimer !== undefined) { window.clearTimeout(refreshTimer); refreshTimer = undefined; }
   overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 };
   recent.value = []; ranking.value = []; archiveYears.value = [];
   releaseAvatars();
   void loadDashboard();
-});
+}, { flush: "sync" });
 onMounted(() => {
   void loadDashboard();
   document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -223,11 +264,16 @@ onBeforeUnmount(() => {
         <li><span>03</span><div><strong>保存到本机</strong><small>随时查看，也可导出留存</small></div></li>
       </ol>
     </section>
+    <SectionCard v-if="dashboardError && overviewLoaded">
+      <EmptyState compact tone="danger" :icon="Archive" title="概览未能刷新" description="当前显示上次读取的统计，可稍后重试。">
+        <Button :loading="loading" @click="loadDashboard"><RefreshCw :size="16" :stroke-width="1.8" /><span>重试</span></Button>
+      </EmptyState>
+    </SectionCard>
     <!-- ------------------------------------------------------ 回忆时光区 -->
     <SectionCard class="memory-hero">
       <div class="memory-hero__inner">
-        <EmptyState v-if="dashboardError" :icon="Archive" tone="danger" title="本地记录读取失败" description="请重试，或到「说说」查看已保存的内容。">
-          <Button @click="loadDashboard"><RefreshCw :size="16" :stroke-width="1.8" /><span>重试</span></Button>
+        <EmptyState v-if="dashboardError && !overviewLoaded" :icon="Archive" tone="danger" title="本地记录读取失败" description="请重试，或到「说说」查看已保存的内容。">
+          <Button :loading="loading" @click="loadDashboard"><RefreshCw :size="16" :stroke-width="1.8" /><span>重试</span></Button>
         </EmptyState>
         <div v-else-if="firstLoadPending" class="memory-hero__skeleton">
           <SkeletonBlock width="320px" height="28px" />
@@ -278,7 +324,7 @@ onBeforeUnmount(() => {
     </SectionCard>
 
     <!-- ---------------------------------------------------------- 统计区 -->
-    <section v-if="!dashboardError" class="stat-grid" aria-label="本地记录统计">
+    <section v-if="!dashboardError || overviewLoaded" class="stat-grid" aria-label="本地记录统计">
       <StatTile
         label="说说"
         :value="overview.dynamics.toLocaleString('zh-CN')"
@@ -321,7 +367,10 @@ onBeforeUnmount(() => {
       />
     </section>
 
-    <SectionCard v-if="!dashboardError && (yearSpan || recent.length)" class="year-index" title="按年份查看">
+    <SectionCard v-if="(!dashboardError || overviewLoaded) && (yearSpan || recent.length || yearsError)" class="year-index" title="按年份查看">
+      <EmptyState v-if="yearsError" compact :icon="Archive" tone="danger" title="年份未能读取" description="可先查看说说速览，或重新读取年份列表。">
+        <Button text size="small" :loading="loading" @click="loadDashboard">重试</Button>
+      </EmptyState>
       <nav class="year-index__years" aria-label="按年份翻阅"><RouterLink v-for="year in archiveYears" :key="year" :to="{ path: '/archives', query: { year: String(year) } }"><span>{{ year }}</span><ChevronRight :size="16" :stroke-width="1.8" /></RouterLink></nav>
       <blockquote v-if="recent[0]" class="memory-excerpt"><time>{{ latestMemoryDate }}</time><p class="selectable"><QzoneText :value="recent[0].content" /></p><RouterLink to="/archives">查看本地说说<ChevronRight :size="15" :stroke-width="1.8" /></RouterLink></blockquote>
     </SectionCard>
@@ -333,7 +382,10 @@ onBeforeUnmount(() => {
           <span v-if="ranking.length" class="rank-badge">TOP {{ ranking.length }}</span>
         </template>
 
-        <div v-if="firstLoadPending" class="rank-list">
+        <EmptyState v-if="rankingError" compact :icon="Users" tone="danger" title="互动排行未能读取" :description="rankingLoaded ? '当前保留上次读取的排行，可重新读取。' : '统计与说说仍可查看，请重试读取排行。'">
+          <Button :loading="loading" @click="loadDashboard">重试</Button>
+        </EmptyState>
+        <div v-if="rankingPending" class="rank-list">
           <div v-for="index in 4" :key="index" class="rank-row">
             <SkeletonBlock class="row-avatar-skeleton" width="38px" circle />
             <div class="rank-row__person"><SkeletonBlock :lines="2" /></div>
@@ -374,7 +426,7 @@ onBeforeUnmount(() => {
         </ol>
 
         <EmptyState
-          v-else
+          v-else-if="!rankingError"
           compact
           :icon="Users"
           title="还没有互动记录"
@@ -390,7 +442,10 @@ onBeforeUnmount(() => {
           </Button>
         </template>
 
-        <div v-if="firstLoadPending" class="recent-list">
+        <EmptyState v-if="recentError" compact :icon="MessageSquareQuote" tone="danger" title="说说速览未能读取" :description="recentLoaded ? '当前保留上次读取的说说，可重新读取。' : '可到「说说」查看本地记录，或重试读取速览。'">
+          <Button :loading="loading" @click="loadDashboard">重试</Button>
+        </EmptyState>
+        <div v-if="recentPending" class="recent-list">
           <div v-for="index in 3" :key="index" class="recent-item">
             <SkeletonBlock class="row-avatar-skeleton" width="38px" circle />
             <div class="recent-item__body"><SkeletonBlock :lines="2" /></div>
@@ -425,7 +480,7 @@ onBeforeUnmount(() => {
         </div>
 
         <EmptyState
-          v-else
+          v-else-if="!recentError"
           compact
           :icon="MessageSquareQuote"
           title="还没有保存说说"

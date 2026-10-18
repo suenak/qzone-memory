@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { qqProgressNotice } from "../utils/qqSourceNotice";
 import type { Component } from "vue";
 import { storeToRefs } from "pinia";
-import { useRoute, useRouter } from "vue-router";
+import { isNavigationFailure, useRoute, useRouter } from "vue-router";
 import { platform } from "../utils/platform";
 import {
   Bookmark,
@@ -56,6 +56,9 @@ const logoutLoading = ref(false);
 const searchInput = ref("");
 const mobileSearchVisible = ref(false);
 const searchElement = ref<HTMLInputElement>();
+const searchSubmitting = ref(false);
+let disposed = false;
+let searchSequence = 0;
 
 const { sidebarCollapsed, themeMode } = storeToRefs(appStore);
 const { loggedIn, user } = storeToRefs(authStore);
@@ -215,42 +218,78 @@ function selectTheme(mode: ThemeMode) {
 }
 
 async function logout() {
-  if (logoutLoading.value || archiveStore.busy) return;
+  if (disposed || logoutLoading.value || archiveStore.busy) return;
   logoutLoading.value = true;
   try {
     accountPopover.value?.hide();
     await authStore.logout();
+    if (disposed) return;
     await router.push("/");
-    toast.success("已退出 QQ 登录。");
+    if (!disposed) toast.success("已退出 QQ 登录。");
   } catch (reason) {
-    toast.error(describeError(reason, "退出登录失败，请重试。"));
+    if (!disposed) toast.error(describeError(reason, "退出登录失败，请重试。"));
   } finally {
-    logoutLoading.value = false;
+    if (!disposed) logoutLoading.value = false;
   }
 }
-watch(mobileSearchVisible, async (open) => { if (open) { await nextTick(); searchElement.value?.focus(); } });
+async function focusSearch() {
+  await nextTick();
+  if (!disposed && mobileSearchVisible.value) searchElement.value?.focus();
+}
+watch(mobileSearchVisible, (open) => { if (open) void focusSearch(); });
 
 /** 全局搜索入口：把关键词交给说说页，由它负责真正的检索。 */
-function submitSearch() {
+async function submitSearch(event?: KeyboardEvent) {
+  if (disposed || event?.isComposing) return;
+  event?.preventDefault();
   const query = searchInput.value.trim();
-  if (query === "") return;
-  void router.push({ path: "/archives", query: { q: query } });
+  if (!query || searchSubmitting.value) return;
+  const sequence = ++searchSequence;
+  searchSubmitting.value = true;
+  const current = () => !disposed && sequence === searchSequence;
+  try {
+    const failure = await router.push({ path: "/archives", query: { q: query } });
+    if (!current()) return;
+    const atTarget = route.path === "/archives" && route.query.q === query;
+    if (isNavigationFailure(failure) && !atTarget) {
+      if (searchInput.value.trim() === query) toast.error("搜索页面没有打开，请重试。");
+      return;
+    }
+    // The input remains editable during navigation. Do not discard a newer draft.
+    if (searchInput.value.trim() === query) {
+      searchInput.value = "";
+      mobileSearchVisible.value = false;
+    }
+  } catch (reason) {
+    if (current() && searchInput.value.trim() === query) toast.error(describeError(reason, "搜索页面没有打开，请重试。"));
+  } finally {
+    if (current()) searchSubmitting.value = false;
+  }
+}
+watch(() => user.value?.uin, () => {
+  searchSequence += 1;
+  searchSubmitting.value = false;
   searchInput.value = "";
   mobileSearchVisible.value = false;
-}
+}, { flush: "sync" });
 
 function handleSearchShortcut(event: KeyboardEvent) {
+  if (disposed || event.isComposing) return;
   if (document.querySelector('[role="dialog"]')) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
-    mobileSearchVisible.value = true;
-    requestAnimationFrame(() => searchElement.value?.focus());
+    if (mobileSearchVisible.value) void focusSearch();
+    else mobileSearchVisible.value = true;
   }
   if (event.key === "Escape") mobileSearchVisible.value = false;
 }
 
 onMounted(() => document.addEventListener("keydown", handleSearchShortcut));
-onBeforeUnmount(() => document.removeEventListener("keydown", handleSearchShortcut));
+onBeforeUnmount(() => {
+  disposed = true;
+  searchSequence += 1;
+  document.removeEventListener("keydown", handleSearchShortcut);
+});
 
 onMounted(() => {
   // 侧边栏需要全局可见的恢复状态，因此轮询在这里启停，TasksView 复用同一份数据。
@@ -333,7 +372,7 @@ onBeforeUnmount(() => {
           <p v-if="pageSubtitle" class="topbar__subtitle">{{ pageSubtitle }}</p>
         </div>
 
-        <label class="topbar__search" :class="{ 'is-open': mobileSearchVisible }">
+        <label class="topbar__search" :class="{ 'is-open': mobileSearchVisible }" :aria-busy="searchSubmitting">
           <Search :size="15" :stroke-width="1.8" aria-hidden="true" />
           <input
             v-model="searchInput"
@@ -341,7 +380,7 @@ onBeforeUnmount(() => {
             type="search"
             placeholder="搜索已保存的说说"
             aria-label="搜索已保存的说说"
-            @keydown.enter.prevent="submitSearch"
+            @keydown.enter="submitSearch"
           />
           <kbd>{{ searchShortcut }}</kbd>
         </label>

@@ -5,6 +5,15 @@ import { ref } from "vue";
 export const useRecycleSessionStore = defineStore("recycle-session", () => {
   const pwd2sig = ref("");
   const ownerUin = ref("");
+  let windowQueue = Promise.resolve();
+
+  // Shared across page instances: an old close must finish before a new window
+  // opens, including when a page is left while the native open is still pending.
+  function withVerificationWindow<T>(operation: () => Promise<T>): Promise<T> {
+    const request = windowQueue.then(operation);
+    windowQueue = request.then(() => {}, () => {});
+    return request;
+  }
 
   function setVerified(token: string, uin: string) {
     pwd2sig.value = token;
@@ -16,5 +25,5 @@ export const useRecycleSessionStore = defineStore("recycle-session", () => {
     ownerUin.value = "";
   }
 
-  return { pwd2sig, ownerUin, setVerified, clear };
+  return { pwd2sig, ownerUin, setVerified, clear, withVerificationWindow };
 });
