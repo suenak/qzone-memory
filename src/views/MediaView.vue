@@ -40,6 +40,7 @@ const detailError = ref("");
 const detailTarget = ref<ArchiveMediaItem>();
 let loadSequence = 0;
 let detailSequence = 0;
+let disposed = false;
 const detail = ref<ArchiveItem>();
 const imageRequests = new ImageRequestScope();
 const imageSources = reactive<Record<string, string>>({});
@@ -124,12 +125,12 @@ const emptyDescription = computed(() => {
 });
 
 async function load(reset = false) {
-  if ((!reset && loading.value) || (!reset && !hasMore.value)) return;
+  if (disposed || (!reset && loading.value) || (!reset && !hasMore.value)) return;
   const sequence = reset ? ++loadSequence : loadSequence;
   loading.value = true;
   error.value = "";
   // 切换年份时先清空列表，否则加载期间还会继续渲染上一个年份的媒体。
-  if (reset) { media.value = []; exhausted.value = false; }
+  if (reset) { resetMediaContext(); media.value = []; exhausted.value = false; }
   try {
     const page = await listArchivedMedia(PAGE_SIZE, reset ? 0 : media.value.length, selectedYear.value || undefined);
     if (sequence !== loadSequence) return;
@@ -139,14 +140,17 @@ async function load(reset = false) {
     // 空页只说明「没有下一页」：把 total 改写成当前长度会伪造总数，这里用独立标志收尾。
     if (!page.items.length) exhausted.value = true;
     await nextTick();
-    observeImages();
+    if (sequence === loadSequence) observeImages();
   } catch (reason) { if (sequence === loadSequence) error.value = `读取媒体失败：${String(reason)}`; }
   finally { if (sequence === loadSequence) loading.value = false; }
 }
 
 function observeImages() {
+  if (disposed) return;
   imageObserver?.disconnect();
+  const generation = imageRequests.generation;
   imageObserver = new IntersectionObserver((entries) => {
+    if (disposed || generation !== imageRequests.generation) return;
     for (const entry of entries) {
       if (!entry.isIntersecting) continue;
       const element = entry.target as HTMLElement;
@@ -161,7 +165,7 @@ function observeImages() {
 }
 
 async function loadImage(url: string, dynamicId?: number, pictureIndex?: number) {
-  if (!url || imageSources[url] || imageLoading[url]) return;
+  if (disposed || !url || imageSources[url] || imageLoading[url]) return;
   const generation = imageRequests.generation;
   imageLoading[url] = true;
   delete imageErrors[url];
@@ -189,7 +193,7 @@ async function loadRemoteImage(url: string) {
   else URL.revokeObjectURL(source);
 }
 async function handleImageError(url: string) {
-  if (!url || imageLoading[url]) return;
+  if (disposed || !url || imageLoading[url]) return;
   const source = imageSources[url];
   if (source?.startsWith("blob:")) URL.revokeObjectURL(source);
   delete imageSources[url];
@@ -206,6 +210,7 @@ async function handleImageError(url: string) {
 }
 
 async function openOriginal(item: ArchiveMediaItem) {
+  if (disposed) return;
   const sequence = ++detailSequence;
   detailTarget.value = item;
   detailError.value = "";
@@ -225,7 +230,7 @@ async function openOriginal(item: ArchiveMediaItem) {
 }
 
 async function playVideo() {
-  if (!detail.value?.videoUrl || videoLoading.value) return;
+  if (disposed || !detailVisible.value || !detail.value?.videoUrl || videoLoading.value) return;
   const sequence = detailSequence;
   const id = detail.value.id;
   videoLoading.value = true;
@@ -242,6 +247,24 @@ function releaseVideo() {
   if (videoSource.value.startsWith("blob:")) URL.revokeObjectURL(videoSource.value);
   videoSource.value = "";
   videoError.value = "";
+}
+
+function resetMediaContext() {
+  ++detailSequence;
+  closeLightbox();
+  detailVisible.value = false;
+  detailLoading.value = false;
+  detail.value = undefined;
+  detailTarget.value = undefined;
+  detailError.value = "";
+  releaseVideo();
+  imageRequests.clear();
+  imageObserver?.disconnect();
+  Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
+  Object.keys(imageSources).forEach(key => delete imageSources[key]);
+  Object.keys(imageLoading).forEach(key => delete imageLoading[key]);
+  Object.keys(imageErrors).forEach(key => delete imageErrors[key]);
+  Object.keys(imageFallbackAttempted).forEach(key => delete imageFallbackAttempted[key]);
 }
 
 /* ------------------------------------------------------------------ 灯箱交互 */
@@ -317,23 +340,22 @@ function retryLightboxImage() {
 }
 
 
-watch(selectedYear, () => void load(true));
-watch(detailVisible, (visible) => { if (!visible) { detailSequence += 1; releaseVideo(); } });
+watch(selectedYear, () => void load(true), { flush: "sync" });
+watch(detailVisible, (visible) => { if (!visible) { detailSequence += 1; detailLoading.value = false; releaseVideo(); } }, { flush: "sync" });
 // 增量加载不会打断正在看的照片，只有索引真的失效时才收起灯箱。
 watch(media, () => { if (lightboxIndex.value >= lightboxList.value.length) closeLightbox(); });
 onMounted(() => {
   void load(true);
-  loadObserver = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) void load(); }, { rootMargin: "500px 0px" });
+  loadObserver = new IntersectionObserver((entries) => { if (!disposed && !error.value && entries.some((entry) => entry.isIntersecting)) void load(); }, { rootMargin: "500px 0px" });
   const sentinel = document.querySelector(".media-load-sentinel");
   if (sentinel) loadObserver.observe(sentinel);
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
   ++loadSequence; ++detailSequence;
-  imageRequests.clear();
-  imageObserver?.disconnect(); loadObserver?.disconnect(); releaseVideo();
-  Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
-
+  resetMediaContext();
+  loadObserver?.disconnect();
 });
 </script>
 

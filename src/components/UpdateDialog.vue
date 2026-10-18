@@ -40,14 +40,14 @@ const canRetry = computed(() => ["error", "cancelled"].includes(update.progress?
     <p class="update-hint"><Info :size="15" :stroke-width="1.8" /><span>{{ update.downloaded && archive.busy ? '恢复或同步任务正在运行，请先停止任务再安装。' : devicePlatform === 'android' ? '下载完成后按系统提示安装。首次安装更新可能需要允许拾忆安装应用。' : '下载完成后打开安装包，按系统提示完成更新。' }}</span></p>
     <template #footer>
       <div class="update-actions">
-        <Button v-if="update.downloaded && !mobile" text severity="secondary" size="small" @click="update.showPackage"><FolderOpen :size="16" :stroke-width="1.8" />打开文件夹</Button>
+        <Button v-if="update.downloaded && !mobile" text severity="secondary" size="small" :loading="update.revealing" :disabled="update.opening || update.checking" @click="update.showPackage"><FolderOpen :size="16" :stroke-width="1.8" />打开文件夹</Button>
         <Button v-else text severity="secondary" size="small" label="官网下载" @click="update.goToDownloadPage" />
         <div class="update-actions__primary">
           <Button text severity="secondary" size="small" :label="update.downloading ? '后台下载' : '稍后再说'" @click="update.dialogVisible = false" />
-          <Button v-if="update.downloading" outlined severity="secondary" size="small" label="取消下载" @click="update.cancelDownload" />
+          <Button v-if="update.downloading" outlined severity="secondary" size="small" :label="update.cancelling ? '正在取消…' : '取消下载'" :loading="update.cancelling" @click="update.cancelDownload" />
           <Button v-if="!update.downloading && (update.progress?.status === 'error' || !update.available?.download)" outlined severity="secondary" size="small" label="重新检查" :loading="update.checking" @click="update.check()" />
-          <Button v-if="!update.downloading && update.downloaded" size="small" label="打开安装包" :loading="update.opening" :disabled="archive.busy" @click="update.openPackage" />
-          <Button v-else-if="!update.downloading && update.available?.download" size="small" :label="canRetry ? '重新下载' : '下载安装包'" @click="update.download" />
+          <Button v-if="!update.downloading && update.downloaded" size="small" label="打开安装包" :loading="update.opening" :disabled="archive.busy || update.revealing || update.checking" @click="update.openPackage" />
+          <Button v-else-if="!update.downloading && update.available?.download" size="small" :label="canRetry ? '重新下载' : '下载安装包'" :disabled="update.checking" @click="update.download" />
         </div>
       </div>
     </template>

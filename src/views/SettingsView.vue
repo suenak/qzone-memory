@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { describeError, describeLicenseError } from "../utils/uiError";
 import { storeToRefs } from "pinia";
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { getVersion } from "@tauri-apps/api/app";
 import {
@@ -59,6 +59,11 @@ const deleting = ref(false);
 const clearing = ref(false);
 const error = ref("");
 const appVersion = ref("");
+let disposed = false;
+let localAccountsSequence = 0;
+const settingsBusy = computed(() => archiveStore.busy || authStore.loading || authStore.dialogVisible || authStore.status === "checking" || licenseStore.loading
+  || clearing.value || deleting.value || switchingLocal.value || loggingOut.value || accountActionBusy.value);
+onBeforeUnmount(() => { disposed = true; ++localAccountsSequence; });
 
 /* ------------------------------------------------------------------ 更新 */
 
@@ -80,7 +85,8 @@ function commitIntervalInput() {
 
 onMounted(async () => {
   try {
-    appVersion.value = await getVersion();
+    const version = await getVersion();
+    if (!disposed) appVersion.value = version;
   } catch (reason) {
     console.warn("读取应用版本失败", reason);
   }
@@ -123,59 +129,96 @@ function formatDate(seconds: number | null) {
 /* -------------------------------------------------------------- 数据管理 */
 
 async function clearArchiveContent() {
-  if (clearing.value || archiveStore.busy) return;
+  if (disposed || !clearVisible.value || !loggedIn.value || settingsBusy.value) return;
   clearing.value = true;
   error.value = "";
   try {
-    const removed = await clearArchivedFeeds();
+    const removed = await archiveStore.withDataChange(clearArchivedFeeds);
+    if (disposed) return;
     clearVisible.value = false;
     toast.success(`已清空 ${removed} 条备份记录，账号与授权保留`);
   } catch (reason) {
+    if (disposed) return;
     error.value = String(reason);
     toast.error("清空失败，请稍后重试");
   } finally {
-    clearing.value = false;
+    if (!disposed) clearing.value = false;
   }
 }
 
 const localAccounts = ref<{uin: string; selected: boolean}[]>([]);
 const localAccount = ref("");
 const switchingLocal = ref(false);
-onMounted(async () => {
-  try { localAccounts.value = await listLocalAccounts(); localAccount.value = localAccounts.value.find(a => a.selected)?.uin || ""; } catch { /* Retry after opening settings again. */ }
-});
+const localAccountsLoading = ref(false);
+const localAccountsError = ref("");
+let switchTarget = "";
+async function loadLocalAccounts() {
+  if (disposed || switchingLocal.value || localAccountsLoading.value) return;
+  const sequence = ++localAccountsSequence;
+  localAccountsLoading.value = true;
+  localAccountsError.value = "";
+  try {
+    const accounts = await listLocalAccounts();
+    if (disposed || sequence !== localAccountsSequence) return;
+    localAccounts.value = accounts;
+    localAccount.value = accounts.find(a => a.selected)?.uin || "";
+  } catch (reason) {
+    if (!disposed && sequence === localAccountsSequence) localAccountsError.value = describeError(reason, "本地账号列表读取失败，请重试。");
+  } finally {
+    if (!disposed && sequence === localAccountsSequence) localAccountsLoading.value = false;
+  }
+}
+onMounted(loadLocalAccounts);
 async function switchLocalAccount() {
-  if (!localAccount.value || switchingLocal.value) return;
+  if (disposed) return;
+  if (switchingLocal.value) { localAccount.value = switchTarget; return; }
+  if (loggedIn.value || settingsBusy.value) {
+    localAccount.value = localAccounts.value.find(a => a.selected)?.uin || "";
+    return;
+  }
+  if (!localAccount.value) return;
+  const target = localAccount.value;
+  const previous = localAccounts.value.find(a => a.selected)?.uin || "";
+  switchTarget = target;
+  ++localAccountsSequence;
+  localAccountsLoading.value = false;
   switchingLocal.value = true;
-  try { await selectLocalAccount(localAccount.value); localAccounts.value.forEach(a => a.selected = a.uin === localAccount.value); toast.success("已切换本地账号"); }
-  catch (reason) { toast.error(describeError(reason,"账号没有切换成功，请重试。")); localAccount.value = localAccounts.value.find(a => a.selected)?.uin || ""; }
-  finally { switchingLocal.value = false; }
+  try {
+    await archiveStore.withDataChange(() => selectLocalAccount(target));
+    if (disposed) return;
+    localAccount.value = target;
+    localAccounts.value.forEach(a => a.selected = a.uin === target);
+    localAccountsError.value = "";
+    toast.success("已切换本地账号");
+  }
+  catch (reason) { if (!disposed) { toast.error(describeError(reason,"账号没有切换成功，请重试。")); localAccount.value = previous; } }
+  finally { if (!disposed) switchingLocal.value = false; }
 }
 
 async function deleteEverything() {
-  if (deleting.value || archiveStore.busy) return;
+  if (disposed || !deleteVisible.value || settingsBusy.value) return;
+  const account = authStore.user?.uin;
   deleting.value = true;
   error.value = "";
   try {
-    await deleteAllAppData();
+    await archiveStore.withDataChange(async () => {
+      await deleteAllAppData();
+      if (!disposed) { deleteVisible.value = false; toast.success("当前账号数据已删除"); }
+      // Native deletion already cleared QQ credentials. Settle the shared display
+      // even after navigation, but never log out a subsequently signed-in account.
+      if (authStore.user?.uin === account) {
+        try { await authStore.logout(); }
+        catch (reason) { if (!disposed) toast.error(describeError(reason, "数据已删除，但退出 QQ 登录未完成，请手动退出。")); }
+      }
+      try { await licenseStore.refresh(); }
+      catch (reason) { if (!disposed) toast.error(describeError(reason, "数据已删除，但授权状态刷新失败，可稍后重试。")); }
+    });
   } catch (reason) {
+    if (disposed) return;
     // 只有主体删除失败才算失败：此时数据未删净，用户可以按提示重试。
     error.value = String(reason);
     toast.error("删除失败，请稍后重试");
-    deleting.value = false;
-    return;
-  }
-  /* 主体已经删净（后端已清理当前账号数据库、媒体文件与 QQ 会话），后续三步都只是收尾：
-   * 它们各自兜错并降级为提示，否则会把「其实删成功」报成失败，用户再点一次就会
-   * 在空库上重复执行删除路径。 */
-  deleteVisible.value = false;
-  toast.success("当前账号数据已删除");
-  deleting.value = false;
-
-  try { await authStore.logout(); }
-  catch (reason) { toast.error(describeError(reason, "数据已删除，但退出 QQ 登录未完成，请手动退出。")); }
-  try { await licenseStore.refresh(); }
-  catch (reason) { toast.error(describeError(reason, "数据已删除，但授权状态刷新失败，可稍后重试。")); }
+  } finally { if (!disposed) deleting.value = false; }
 }
 
 /* ------------------------------------------------------------ 授权席位 */
@@ -189,58 +232,67 @@ const releaseTarget = ref<LicenseSeat | null>(null);
 const accountAction = ref<"release" | "signOut">("release");
 const confirmError = ref("");
 const accountActionBusy = ref(false);
-function askRelease(seat: LicenseSeat) { releaseTarget.value = seat; accountAction.value = "release"; confirmError.value = ""; accountConfirmVisible.value = true; }
-function askSignOut() { accountAction.value = "signOut"; confirmError.value = ""; accountConfirmVisible.value = true; }
+function askRelease(seat: LicenseSeat) { if (disposed || settingsBusy.value || seat.current) return; releaseTarget.value = { ...seat }; accountAction.value = "release"; confirmError.value = ""; accountConfirmVisible.value = true; }
+function askSignOut() { if (disposed || settingsBusy.value) return; accountAction.value = "signOut"; confirmError.value = ""; accountConfirmVisible.value = true; }
 async function confirmAccountAction() {
-  if (accountActionBusy.value) return;
+  if (disposed || !accountConfirmVisible.value || settingsBusy.value) return;
+  if (accountAction.value === "release" && !releaseTarget.value) { confirmError.value = "请选择需要解绑的设备。"; return; }
   accountActionBusy.value = true;
   confirmError.value = "";
   try {
     if (accountAction.value === "release" && releaseTarget.value) {
       await licenseStore.deactivateSeat(releaseTarget.value.id);
+      if (disposed) return;
       seatMessage.value = "设备已解绑，名额已释放。";
-      seatError.value = licenseStore.lastError ? describeLicenseError(licenseStore.lastError, "解绑成功，但设备列表未能刷新。") : "";
+      seatError.value = licenseStore.seatsError ? describeLicenseError(licenseStore.seatsError, "解绑成功，但设备列表未能刷新。") : "";
     } else {
       await licenseStore.signOut();
+      if (disposed) return;
       seatsVisible.value = false;
       toast.success("已退出授权，重新使用时需激活。");
     }
     accountConfirmVisible.value = false;
-  } catch (reason) { confirmError.value = describeLicenseError(reason); }
-  finally { accountActionBusy.value = false; }
+  } catch (reason) { if (!disposed) confirmError.value = describeLicenseError(reason); }
+  finally { if (!disposed) accountActionBusy.value = false; }
 }
 async function logout() {
-  if (loggingOut.value || archiveStore.busy) return;
+  if (disposed || settingsBusy.value) return;
   loggingOut.value = true;
-  try { await authStore.logout(); toast.success("已退出 QQ 登录。"); }
-  catch (reason) { toast.error(describeError(reason, "退出登录失败，请重试。")); }
-  finally { loggingOut.value = false; }
+  try { await authStore.logout(); if (!disposed) toast.success("已退出 QQ 登录。"); }
+  catch (reason) { if (!disposed) toast.error(describeError(reason, "退出登录失败，请重试。")); }
+  finally { if (!disposed) loggingOut.value = false; }
 }
 
 async function openSeats() {
+  if (disposed || seatsBusy.value) return;
   seatsBusy.value = true;
   seatMessage.value = "";
   seatError.value = "";
   seatsVisible.value = true;
   try {
     await licenseStore.loadSeats();
-    if (licenseStore.lastError) seatError.value = describeLicenseError(licenseStore.lastError, "设备列表读取失败，请重试。");
+    if (disposed) return;
+    if (licenseStore.seatsError) seatError.value = describeLicenseError(licenseStore.seatsError, "设备列表读取失败，请重试。");
+  } catch (reason) {
+    if (!disposed) seatError.value = describeLicenseError(reason);
   } finally {
-    seatsBusy.value = false;
+    if (!disposed) seatsBusy.value = false;
   }
 }
 
 async function refreshSeats() {
+  if (disposed || seatsBusy.value) return;
   seatsBusy.value = true;
   seatMessage.value = "";
   try {
     await licenseStore.loadSeats();
-    seatError.value = licenseStore.lastError ? describeLicenseError(licenseStore.lastError, "设备列表读取失败，请重试。") : "";
+    if (disposed) return;
+    seatError.value = licenseStore.seatsError ? describeLicenseError(licenseStore.seatsError, "设备列表读取失败，请重试。") : "";
     if (!seatError.value) seatMessage.value = "设备列表已刷新。";
   } catch (reason) {
-    seatError.value = describeLicenseError(reason);
+    if (!disposed) seatError.value = describeLicenseError(reason);
   } finally {
-    seatsBusy.value = false;
+    if (!disposed) seatsBusy.value = false;
   }
 }
 
@@ -310,11 +362,11 @@ async function refreshSeats() {
           outlined
           size="small"
           :loading="loggingOut"
-          :disabled="archiveStore.busy"
+          :disabled="settingsBusy"
           :title="archiveStore.busy ? '请先停止备份或资料同步，再退出登录' : undefined"
           @click="logout"
         />
-        <Button v-else label="登录" size="small" @click="authStore.openLogin" />
+        <Button v-else label="登录" size="small" :disabled="settingsBusy" @click="authStore.openLogin" />
       </div>
 
       <div class="setting-row">
@@ -373,12 +425,14 @@ async function refreshSeats() {
             <small>清空当前 QQ 账号的说说、互动和续传记录。保留相册等其他资料、媒体缓存与授权。</small>
           </div>
         </div>
-        <Button label="清空说说" severity="secondary" outlined size="small" :disabled="!loggedIn || archiveStore.busy" @click="error = ''; clearVisible = true" />
+        <Button label="清空说说" severity="secondary" outlined size="small" :disabled="!loggedIn || settingsBusy" @click="error = ''; clearVisible = true" />
       </div>
 
-      <div v-if="localAccounts.length > 1" class="setting-row">
+      <div v-if="localAccounts.length > 1 || localAccountsLoading || localAccountsError" class="setting-row">
         <div class="setting-row__label"><div><strong>查看本机其他账号</strong><small>{{ loggedIn ? '退出 QQ 登录后，可切换已保存的账号。' : '切换后可离线查看、搜索和导出这个账号的记录。' }}</small></div></div>
-        <Select v-model="localAccount" :options="localAccounts.map(a => ({label: `QQ ${a.uin}`, value: a.uin}))" option-label="label" option-value="value" :disabled="loggedIn || switchingLocal || archiveStore.busy" aria-label="本地账号" @change="switchLocalAccount" />
+        <Select v-if="localAccounts.length" v-model="localAccount" :options="localAccounts.map(a => ({label: `QQ ${a.uin}`, value: a.uin}))" option-label="label" option-value="value" :disabled="loggedIn || settingsBusy || localAccountsLoading" aria-label="本地账号" @change="switchLocalAccount" />
+        <span v-if="localAccountsLoading" role="status">正在读取本地账号…</span>
+        <div v-else-if="localAccountsError"><p class="settings-error" role="alert">{{ localAccountsError }}</p><Button label="重试读取账号" severity="secondary" text @click="loadLocalAccounts" /></div>
       </div>
       <div class="setting-row is-danger">
         <div class="setting-row__label">
@@ -388,7 +442,7 @@ async function refreshSeats() {
             <small>删除当前账号的备份、续传记录、媒体文件和 QQ 登录状态。保留其他账号与软件授权。</small>
           </div>
         </div>
-        <Button label="删除当前账号数据" severity="danger" outlined size="small" :disabled="archiveStore.busy" @click="error = ''; deleteVisible = true" />
+        <Button label="删除当前账号数据" severity="danger" outlined size="small" :disabled="settingsBusy" @click="error = ''; deleteVisible = true" />
       </div>
 
       <p v-if="error" class="settings-error" role="alert">{{ describeError(error) }}</p>
@@ -483,7 +537,7 @@ async function refreshSeats() {
       <p v-if="error" role="alert" class="settings-error">{{ describeError(error, '清空失败，请重试。') }}</p>
       <template #footer>
         <Button label="取消" severity="secondary" text :disabled="clearing" @click="clearVisible = false" />
-        <Button label="确认清空" severity="danger" :loading="clearing" @click="clearArchiveContent" ><template #icon><Trash2 :size="16" :stroke-width="1.8" /></template></Button>
+        <Button label="确认清空" severity="danger" :loading="clearing" :disabled="settingsBusy || !loggedIn" @click="clearArchiveContent" ><template #icon><Trash2 :size="16" :stroke-width="1.8" /></template></Button>
       </template>
     </Dialog>
 
@@ -498,7 +552,7 @@ async function refreshSeats() {
       <p v-if="error" role="alert" class="settings-error">{{ describeError(error, '删除失败，请重试。') }}</p>
       <template #footer>
         <Button label="取消" severity="secondary" text :disabled="deleting" @click="deleteVisible = false" />
-        <Button label="确认删除" severity="danger" :loading="deleting" @click="deleteEverything" ><template #icon><Trash2 :size="16" :stroke-width="1.8" /></template></Button>
+        <Button label="确认删除" severity="danger" :loading="deleting" :disabled="settingsBusy" @click="deleteEverything" ><template #icon><Trash2 :size="16" :stroke-width="1.8" /></template></Button>
       </template>
     </Dialog>
 
@@ -538,7 +592,7 @@ async function refreshSeats() {
       </div>
       <template #footer>
         <Button label="刷新" severity="secondary" text :loading="seatsBusy" @click="refreshSeats" />
-        <Button label="退出本机授权" severity="danger" outlined :disabled="archiveStore.busy || seatsBusy" @click="askSignOut" />
+        <Button label="退出本机授权" severity="danger" outlined :disabled="settingsBusy || seatsBusy" @click="askSignOut" />
         <Button label="关闭" @click="seatsVisible = false" />
       </template>
     </Dialog>
@@ -548,7 +602,7 @@ async function refreshSeats() {
         <p v-else>本机需要重新激活才能继续备份。已有备份会保留，此操作不会释放设备名额。</p>
         <p v-if="confirmError" role="alert" class="settings-error">{{ confirmError }}</p>
       </div>
-      <template #footer><Button label="取消" severity="secondary" text :disabled="accountActionBusy" @click="accountConfirmVisible = false" /><Button :label="accountAction === 'release' ? '解绑设备' : '退出授权'" severity="danger" :loading="accountActionBusy" @click="confirmAccountAction" /></template>
+      <template #footer><Button label="取消" severity="secondary" text :disabled="accountActionBusy" @click="accountConfirmVisible = false" /><Button :label="accountAction === 'release' ? '解绑设备' : '退出授权'" severity="danger" :loading="accountActionBusy" :disabled="settingsBusy" @click="confirmAccountAction" /></template>
     </Dialog>
   </div>
 </template>

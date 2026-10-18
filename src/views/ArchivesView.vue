@@ -44,6 +44,8 @@ import SectionCard from "../components/ui/SectionCard.vue";
 import SkeletonBlock from "../components/ui/SkeletonBlock.vue";
 import ArchiveHeading from "../components/ui/ArchiveHeading.vue";
 import { useToast } from "../composables/useToast";
+import { useArchiveStore } from "../stores/archive";
+import { useAuthStore } from "../stores/auth";
 import { ImageRequestScope, mediaFileName } from "../utils/archiveImage";
 import { countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, listArchiveYears, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 
@@ -51,9 +53,16 @@ const route = useRoute();
 // 清筛选时要一并改写路由参数，否则 ?q= 会被路由 watcher 写回搜索框。
 const router = useRouter();
 const toast = useToast();
+const archiveStore = useArchiveStore();
+const authStore = useAuthStore();
 const records = ref<ArchiveItem[]>([]);
+function routeSearch(value: unknown) { return typeof value === "string" ? value.trim() : ""; }
+function routeYear(value: unknown) {
+  return typeof value === "string" && /^\d{1,4}$/.test(value) ? Number(value) : 0;
+}
 // 全局搜索会带着 ?q= 跳到本页，初始关键词直接取自路由，避免闪一次空结果。
-const query = ref(typeof route.query.q === "string" ? route.query.q : "");
+const query = ref(routeSearch(route.query.q));
+const searchKey = computed(() => query.value.trim());
 const loading = ref(false);
 const loadingMore = ref(false);
 const deleting = ref(false);
@@ -61,12 +70,14 @@ const exporting = ref(false);
 const error = ref("");
 const selectedIds = ref<number[]>([]);
 const confirmVisible = ref(false);
+const deleteIds = ref<number[]>([]);
+const loadMoreFailed = ref(false);
 const first = ref(0);
 const pageSize = ref(20);
 const totalRecords = ref(0);
 const category = ref<ArchiveCategory>("self");
 const years = ref<number[]>([]);
-const selectedYear = ref(Number(route.query.year) || 0);
+const selectedYear = ref(routeYear(route.query.year));
 const descending = ref(true);
 const yearOptions = computed(() => [{ label: "全部年份", value: 0 }, ...years.value.map((year) => ({ label: `${year} 年`, value: year }))]);
 const orderOptions = [
@@ -95,7 +106,10 @@ const expandedComments = reactive(new Set<number>());
 const expandedLikes = reactive(new Set<number>());
 let imageObserver: IntersectionObserver | undefined;
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
+let routeFilterSyncPending = false;
 let loadSequence = 0;
+let requestedFilterSequence = -1;
+let disposed = false;
 const currentPlatform = platform();
 const desktopPlatforms = new Set(["windows", "macos", "linux"]);
 const isDesktopPlatform = desktopPlatforms.has(currentPlatform) || currentPlatform === "browser";
@@ -135,7 +149,8 @@ async function copyContent(item: ArchiveItem) {
 const visibleIds = computed(() => filtered.value.map((item) => item.id));
 const allVisibleSelected = computed(() => visibleIds.value.length > 0 && visibleIds.value.every((id) => selectedIds.value.includes(id)));
 const hasMore = computed(() => records.value.length < totalRecords.value);
-const confirmTitle = computed(() => `删除 ${selectedIds.value.length} 条备份？`);
+const confirmTitle = computed(() => `删除 ${deleteIds.value.length} 条备份？`);
+const canDelete = computed(() => authStore.loggedIn && !archiveStore.busy && !loading.value && !deleting.value);
 const confirmDescription = "所选记录将从本机永久删除，不会删除 QQ 空间中的内容。此操作无法撤销。";
 const formatTime = (seconds: number) => seconds ? new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(seconds * 1000)) : "时间未知";
 const yearStamp = (seconds: number) => seconds ? String(new Date(seconds * 1000).getFullYear()) : "年份未知";
@@ -170,12 +185,19 @@ const emptyDescription = computed(() => hasFilter.value
   : "到「恢复任务」开始保存说说。");
 
 async function load() {
+  if (disposed) return;
+  if (searchTimer !== undefined) { clearTimeout(searchTimer); searchTimer = undefined; }
   const sequence = ++loadSequence;
+  requestedFilterSequence = sequence;
   releaseVideos();
+  loadingMore.value = false;
+  loadMoreFailed.value = false;
+  selectedIds.value = [];
+  if (!deleting.value) { confirmVisible.value = false; deleteIds.value = []; }
   loading.value = true; error.value = "";
   try {
     const year = selectedYear.value || undefined;
-    const search = query.value.trim() || undefined;
+    const search = searchKey.value || undefined;
     const [items, total, availableYears] = await Promise.all([
       listArchivedFeeds(pageSize.value, 0, category.value, year, descending.value, search),
       countArchivedFeeds(category.value, year, search),
@@ -187,6 +209,7 @@ async function load() {
     first.value = items.length;
     years.value = availableYears;
     if (selectedYear.value && !availableYears.includes(selectedYear.value)) selectedYear.value = 0;
+    if (sequence !== loadSequence) return;
     // The timeline is hidden while loading; observe only after it has rendered.
     loading.value = false;
     await nextTick();
@@ -197,12 +220,14 @@ async function load() {
 }
 /** 追加下一页；由滚动哨兵触发，也可手动调用。 */
 async function loadMore() {
-  if (loading.value || loadingMore.value || !hasMore.value) return;
+  if (disposed || loading.value || loadingMore.value || !hasMore.value) return;
   const sequence = loadSequence;
   loadingMore.value = true;
+  loadMoreFailed.value = false;
+  error.value = "";
   try {
     const year = selectedYear.value || undefined;
-    const search = query.value.trim() || undefined;
+    const search = searchKey.value || undefined;
     const items = await listArchivedFeeds(pageSize.value, first.value, category.value, year, descending.value, search);
     if (sequence !== loadSequence) return;
     if (!items.length) { totalRecords.value = records.value.length; return; }
@@ -211,18 +236,22 @@ async function loadMore() {
     first.value += items.length;
     if (!fresh.length) { totalRecords.value = records.value.length; return; }
     records.value = [...records.value, ...fresh];
-    await nextTick(); observeArchiveImages();
+    await nextTick();
+    if (sequence === loadSequence) observeArchiveImages();
   }
-  catch (reason) { if (sequence === loadSequence) error.value = String(reason); }
+  catch (reason) {
+    if (sequence === loadSequence) { loadMoreFailed.value = true; error.value = String(reason); }
+  }
   finally { if (sequence === loadSequence) { loadingMore.value = false; void ensureFilled(); } }
 }
 /** 首页不足一屏时哨兵一直可见，滚动不会产生新交叉事件，这里主动补齐。 */
 async function ensureFilled() {
   await nextTick();
-  if (hasRefinements.value || !sentinelVisible || !hasMore.value || loading.value || loadingMore.value) return;
+  if (disposed || error.value || loadMoreFailed.value || hasRefinements.value || !sentinelVisible || !hasMore.value || loading.value || loadingMore.value) return;
   void loadMore();
 }
 function observeSentinel() {
+  if (disposed) return;
   sentinelObserver?.disconnect();
   sentinelVisible = false;
   const element = sentinelEl.value;
@@ -230,7 +259,7 @@ function observeSentinel() {
   sentinelObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
       sentinelVisible = entry.isIntersecting;
-      if (entry.isIntersecting) void loadMore();
+      if (entry.isIntersecting && !error.value && !loadMoreFailed.value) void loadMore();
     }
   }, { rootMargin: "320px 0px" });
   sentinelObserver.observe(element);
@@ -258,6 +287,7 @@ function releaseVideos() {
   Object.keys(imageFallbackAttempted).forEach((key) => delete imageFallbackAttempted[key]);
 }
 function observeArchiveImages() {
+  if (disposed) return;
   imageObserver?.disconnect();
   imageObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
@@ -273,7 +303,7 @@ function observeArchiveImages() {
   document.querySelectorAll<HTMLElement>(".archive-page [data-archive-image]").forEach((element) => imageObserver?.observe(element));
 }
 async function loadArchiveImage(url: string, dynamicId?: number, pictureIndex?: number) {
-  if (!url || imageSources[url] || imageLoading[url]) return;
+  if (disposed || !url || imageSources[url] || imageLoading[url]) return;
   const generation = imageRequests.generation;
   imageLoading[url] = true;
   delete imageErrors[url];
@@ -358,7 +388,9 @@ function releaseDetachedPreviewBlobs() {
 }
 function closeImagePreview() { imagePreviewVisible.value = false; releaseDetachedPreviewBlobs(); }
 async function exportHtml(selectedOnly: boolean) {
-  if (exporting.value || (selectedOnly && !selectedIds.value.length)) return;
+  if (disposed || exporting.value || loading.value || (selectedOnly && !selectedIds.value.length)) return;
+  const account = authStore.user?.uin;
+  const isCurrentAccount = () => !disposed && account === authStore.user?.uin;
   exporting.value = true; error.value = "";
   try {
     const exportCategory = category.value;
@@ -368,14 +400,15 @@ async function exportHtml(selectedOnly: boolean) {
       defaultPath: `QQ空间恢复备份-${categoryLabel.value}-${date}.html`,
       filters: [{ name: "HTML 网页", extensions: ["html"] }],
     });
-    if (!path) return;
+    if (!path || !isCurrentAccount()) return;
     const result = await exportArchivedHtml(exportCategory, path, exportIds);
+    if (!isCurrentAccount()) return;
     const mediaNote = result.mediaFiles > 0 ? "移动时请将网页和旁边的媒体文件夹一起带走。" : "文字和互动记录可离线查看。";
     const summary = `已导出 ${result.records} 条记录和 ${result.mediaFiles} 个媒体文件。${mediaNote}`;
     if (result.missingMedia > 0) toast.info(`${summary}另有 ${result.missingMedia} 个媒体尚未保存，已在网页中标注。`);
     else toast.success(summary);
-  } catch (reason) { error.value = `导出失败：${String(reason)}`; }
-  finally { exporting.value = false; }
+  } catch (reason) { if (isCurrentAccount()) error.value = `导出失败：${String(reason)}`; }
+  finally { if (!disposed) exporting.value = false; }
 }
 async function loadVideo(item: ArchiveItem) {
   if (!item.videoUrl || videoLoading[item.id]) return;
@@ -397,65 +430,105 @@ function toggleVisible() {
   const visible = new Set(visibleIds.value);
   selectedIds.value = allVisibleSelected.value ? selectedIds.value.filter((id) => !visible.has(id)) : [...new Set([...selectedIds.value, ...visible])];
 }
-function askDelete() { if (selectedIds.value.length) confirmVisible.value = true; }
+function askDelete() {
+  if (disposed || !canDelete.value || !selectedIds.value.length) return;
+  const ids = [...new Set(selectedIds.value)];
+  if (ids.length > 500) { error.value = "单次最多删除 500 条说说，请减少选择后重试。"; return; }
+  error.value = "";
+  deleteIds.value = ids;
+  confirmVisible.value = true;
+}
 function toggleComments(id: number) { expandedComments.has(id) ? expandedComments.delete(id) : expandedComments.add(id); }
 /**
  * 顶部全局搜索会把 ?q= / ?year= 带到本页。本地清筛选后必须一并清掉路由参数，
  * 否则路由 watcher 会在 flush 后把关键词写回，用户会看到列表又跳回搜索结果。
  */
-function dropRouteFilters() {
-  if (!route.query.q && !route.query.year) return;
-  const nextQuery = { ...route.query };
-  delete nextQuery.q;
-  delete nextQuery.year;
-  void router.replace({ query: nextQuery });
+async function dropRouteFilters() {
+  if (routeFilterSyncPending || (!route.query.q && !route.query.year)) return;
+  routeFilterSyncPending = true;
+  try {
+    // Category resets can be followed by a new draft in the same event. Write
+    // the settled filters so the route echo cannot restore an earlier reset.
+    await nextTick();
+    if (disposed) return;
+    const nextQuery = { ...route.query };
+    if (searchKey.value) nextQuery.q = searchKey.value;
+    else delete nextQuery.q;
+    if (selectedYear.value) nextQuery.year = String(selectedYear.value);
+    else delete nextQuery.year;
+    await router.replace({ query: nextQuery });
+  } catch (reason) {
+    if (!disposed) toast.error(describeError(reason, "筛选已更改，但页面地址未能更新。"));
+  } finally { routeFilterSyncPending = false; }
 }
 function clearFilters() { query.value = ""; selectedYear.value = 0; dropRouteFilters(); }
 function dismissError() { error.value = ""; }
 async function confirmDelete() {
+  if (disposed || !canDelete.value || !confirmVisible.value || !deleteIds.value.length) return;
+  const ids = [...deleteIds.value];
+  const account = authStore.user?.uin;
+  const isCurrentAccount = () => !disposed && account === authStore.user?.uin;
   deleting.value = true; error.value = "";
   try {
-    await deleteArchivedFeeds(selectedIds.value);
+    const removed = await deleteArchivedFeeds(ids);
+    if (!isCurrentAccount()) return;
     confirmVisible.value = false;
-    toast.success(`已删除 ${selectedIds.value.length} 条备份记录`);
+    deleteIds.value = [];
+    selectedIds.value = selectedIds.value.filter(id => !ids.includes(id));
+    toast.success(`已删除 ${removed} 条备份记录`);
     await load();
-  } catch (reason) { error.value = String(reason); }
-  finally { deleting.value = false; }
+  } catch (reason) { if (isCurrentAccount()) error.value = String(reason); }
+  finally { if (!disposed) deleting.value = false; }
 }
 onMounted(() => {
 
   void load();
 });
-/** 本页自己重置筛选时置位：让 query 与年份的 watcher 跳过这一次，避免连发两次请求。 */
-let suppressFilterReload = false;
+// Stop old pages immediately, including the search debounce window.
+watch([category, selectedYear, descending, searchKey], () => {
+  ++loadSequence;
+  loading.value = true;
+  loadingMore.value = false;
+  loadMoreFailed.value = false;
+  error.value = "";
+  selectedIds.value = [];
+  confirmVisible.value = false;
+  deleteIds.value = [];
+  records.value = [];
+  totalRecords.value = 0;
+  first.value = 0;
+  detailOpen.value = false;
+  detailItem.value = undefined;
+  closeImagePreview();
+  releaseVideos();
+}, { flush: "sync" });
 watch(sentinelEl, () => observeSentinel(), { flush: "post" });
 watch(category, () => {
-  first.value = 0;
-  // 切换分类会同时清掉关键词与年份：静音下面两个 watcher，只由这里发起一次加载。
-  if (searchTimer) { clearTimeout(searchTimer); searchTimer = undefined; }
-  suppressFilterReload = true;
   query.value = "";
   selectedYear.value = 0;
-  void nextTick(() => { suppressFilterReload = false; });
   dropRouteFilters();
-  void load();
-});
-watch([selectedYear, descending], () => { if (suppressFilterReload) return; first.value = 0; void load(); });
-watch(query, () => {
-  if (suppressFilterReload) return;
-  if (searchTimer) clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => { first.value = 0; void load(); }, 260);
+}, { flush: "sync" });
+// Batch a route update/category reset into one request. Only typing is delayed;
+// changing year/order or manually refreshing cancels the pending typing request.
+watch([category, selectedYear, descending, searchKey], (current, previous) => {
+  if (disposed) return;
+  if (searchTimer !== undefined) { clearTimeout(searchTimer); searchTimer = undefined; }
+  if (requestedFilterSequence === loadSequence) return;
+  const onlySearch = current[0] === previous[0] && current[1] === previous[1] && current[2] === previous[2];
+  if (!onlySearch) { void load(); return; }
+  searchTimer = setTimeout(() => { searchTimer = undefined; void load(); }, 260);
 });
 // 顶栏的全局搜索会把关键词带过来，本页已在路由中时也要跟着更新。
 watch(
-  () => route.query.q,
-  (value) => {
-    const next = typeof value === "string" ? value.trim() : "";
-    if (next !== query.value) query.value = next;
+  [() => route.query.q, () => route.query.year],
+  ([search, year]) => {
+    query.value = routeSearch(search);
+    selectedYear.value = routeYear(year);
   },
+  { flush: "sync" },
 );
-watch(() => route.query.year, (value) => { selectedYear.value = Number(value) || 0; });
 onBeforeUnmount(() => {
+  disposed = true;
   ++loadSequence;
   closeImagePreview();
   if (searchTimer) clearTimeout(searchTimer);
@@ -546,11 +619,11 @@ onBeforeUnmount(() => {
               <span>{{ allVisibleSelected ? "取消选择" : `选择已显示的 ${visibleIds.length} 条` }}</span>
             </button>
             <span v-if="selectedIds.length" class="ar-pill">已选 {{ selectedIds.length }} 条</span>
-            <button v-if="selectedIds.length" type="button" class="ar-btn" :disabled="exporting" @click="exportHtml(true)">
+            <button v-if="selectedIds.length" type="button" class="ar-btn" :disabled="exporting || loading" @click="exportHtml(true)">
               <Download :size="15" :stroke-width="1.8" />
               <span>导出所选</span>
             </button>
-            <button v-if="selectedIds.length" type="button" class="ar-btn is-danger" :disabled="deleting" @click="askDelete">
+            <button v-if="selectedIds.length" type="button" class="ar-btn is-danger" :disabled="!canDelete" @click="askDelete">
               <Trash2 :size="15" :stroke-width="1.8" />
               <span>删除所选</span>
             </button>
@@ -568,7 +641,7 @@ onBeforeUnmount(() => {
     <div v-if="error && records.length" class="ar-errorbar" role="alert">
       <CircleAlert :size="16" :stroke-width="1.8" />
       <span class="ar-errorbar__text">{{ describeError(error, "备份读取没有完成，请重试。") }}</span>
-      <button type="button" class="ar-btn" @click="load">重试</button>
+      <button type="button" class="ar-btn" @click="loadMoreFailed ? loadMore() : load()">重试</button>
       <button type="button" class="ar-btn is-ghost" @click="dismissError">关闭提示</button>
     </div>
 
@@ -777,7 +850,7 @@ onBeforeUnmount(() => {
       <template #footer>
         <div class="ar-dialog-actions">
           <button type="button" class="ar-btn" :disabled="deleting" @click="confirmVisible = false">取消</button>
-          <button type="button" class="ar-btn is-danger is-solid" :disabled="deleting" @click="confirmDelete">
+          <button type="button" class="ar-btn is-danger is-solid" :disabled="!canDelete" @click="confirmDelete">
             <LoaderCircle v-if="deleting" class="is-spinning" :size="16" :stroke-width="1.8" />
             <Trash2 v-else :size="16" :stroke-width="1.8" />
             <span>{{ deleting ? "正在删除…" : "确认删除" }}</span>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { describeLicenseError } from "../utils/uiError";
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import { BookOpen, CircleAlert, CircleCheck, ShieldCheck, LockKeyhole, Ticket, Trash2, Sun, Moon, Monitor } from "lucide-vue-next";
 import Button from "primevue/button";
@@ -24,7 +24,8 @@ const username = ref("");
 const password = ref("");
 const deviceLabel = ref("");
 const code = ref("");
-const busy = ref(false);
+const submitting = ref(false);
+const busy = computed(() => submitting.value || store.loading);
 const error = ref("");
 const notice = ref("");
 const blockedSeats = ref<LicenseSeat[]>([]);
@@ -33,8 +34,32 @@ const releaseVisible = ref(false);
 const releaseTarget = ref<LicenseSeat | null>(null);
 const releasePassword = ref("");
 const releaseError = ref("");
-function validation(message: string, id: string) { error.value = message; void nextTick(() => document.getElementById(id)?.focus()); }
-watch(username, () => { blockedSeats.value = []; error.value = ""; notice.value = ""; });
+let releaseAccount = "";
+let disposed = false;
+let requestSequence = 0;
+const isCurrent = (run: number) => !disposed && run === requestSequence;
+function clearRelease() { releaseTarget.value = null; releasePassword.value = ""; releaseError.value = ""; releaseAccount = ""; }
+function validation(message: string, id: string) {
+  const run = requestSequence;
+  error.value = message;
+  void nextTick(() => { if (isCurrent(run)) document.getElementById(id)?.focus(); });
+}
+watch(username, () => {
+  requestSequence += 1;
+  blockedSeats.value = [];
+  error.value = "";
+  notice.value = "";
+  releaseVisible.value = false;
+  clearRelease();
+}, { flush: "sync" });
+watch(releaseVisible, (visible) => { if (!visible) clearRelease(); }, { flush: "sync" });
+onBeforeUnmount(() => {
+  disposed = true;
+  requestSequence += 1;
+  password.value = "";
+  code.value = "";
+  clearRelease();
+});
 
 const PLATFORM_LABELS: Record<string, string> = {
   windows: "Windows 电脑",
@@ -57,27 +82,31 @@ function formatTime(seconds: number) {
 }
 
 function switchMode() {
-  if (busy.value) return;
+  if (disposed || busy.value) return;
   mode.value = mode.value === "activate" ? "redeem" : "activate";
   error.value = "";
   notice.value = "";
+  blockedSeats.value = [];
+  releaseVisible.value = false;
 }
 
 async function submit() {
-  if (busy.value) return;
+  if (disposed || busy.value || mode.value !== "activate") return;
   error.value = "";
   notice.value = "";
   if (!username.value.trim()) { validation("填写授权账号。", "license-username"); return; }
   if (!password.value) { validation("填写授权密码。", "license-password"); return; }
 
-  busy.value = true;
+  const run = ++requestSequence;
+  const target = typeof route.query.returnTo === "string" && route.query.returnTo.startsWith("/") && !route.query.returnTo.startsWith("//") && !route.query.returnTo.startsWith("/activation") ? route.query.returnTo : "/";
+  submitting.value = true;
   try {
     const outcome = await store.activate(username.value.trim(), password.value, deviceLabel.value.trim());
+    if (!isCurrent(run)) return;
     if (outcome.success) {
       notice.value = "激活成功，正在进入应用…";
       password.value = "";
       blockedSeats.value = [];
-      const target = typeof route.query.returnTo === "string" && route.query.returnTo.startsWith("/") && !route.query.returnTo.startsWith("//") && !route.query.returnTo.startsWith("/activation") ? route.query.returnTo : "/";
       await router.replace(target);
       return;
     }
@@ -85,59 +114,68 @@ async function submit() {
     error.value = outcome.message;
     blockedSeats.value = outcome.seats ?? [];
   } catch (reason) {
+    if (!isCurrent(run)) return;
     error.value = typeof reason === "string" ? reason : "激活失败，请检查网络后重试";
   } finally {
-    busy.value = false;
+    if (!disposed) submitting.value = false;
   }
 }
 
 async function submitRedeem() {
-  if (busy.value) return;
+  if (disposed || busy.value || mode.value !== "redeem") return;
   error.value = "";
   notice.value = "";
   if (!username.value.trim()) { validation("填写授权账号。", "license-username"); return; }
   if (!password.value) { validation("填写授权密码。", "license-password"); return; }
   if (!code.value.trim()) { validation("填写卡密。", "license-code"); return; }
 
-  busy.value = true;
+  const run = ++requestSequence;
+  submitting.value = true;
   try {
     await store.redeem(username.value.trim(), password.value, code.value.trim());
+    if (!isCurrent(run)) return;
     notice.value = "兑换成功，返回激活即可使用。";
     code.value = "";
   } catch (reason) {
+    if (!isCurrent(run)) return;
     error.value = typeof reason === "string" ? reason : "兑换失败，请稍后重试";
   } finally {
-    busy.value = false;
+    if (!disposed) submitting.value = false;
   }
 }
 
 function openRelease(seat: LicenseSeat) {
-  releaseTarget.value = seat;
+  if (disposed || busy.value || !blockedSeats.value.some((item) => item.id === seat.id)) return;
+  releaseTarget.value = { ...seat };
+  releaseAccount = username.value.trim();
   releasePassword.value = password.value;
   releaseError.value = "";
   releaseVisible.value = true;
 }
 
 async function confirmRelease() {
-  if (busy.value) return;
+  if (disposed || busy.value || !releaseVisible.value) return;
   const seat = releaseTarget.value;
-  if (!seat) return;
+  if (!seat || !releaseAccount || releaseAccount !== username.value.trim() || !blockedSeats.value.some((item) => item.id === seat.id)) return;
   if (!releasePassword.value) {
     releaseError.value = "填写授权密码以确认解绑。";
     return;
   }
 
-  busy.value = true;
+  const run = ++requestSequence;
+  submitting.value = true;
   try {
-    await store.deactivateSeat(seat.id, username.value.trim(), releasePassword.value);
+    await store.deactivateSeat(seat.id, releaseAccount, releasePassword.value);
+    if (!isCurrent(run) || !releaseVisible.value || releaseTarget.value?.id !== seat.id) return;
     blockedSeats.value = blockedSeats.value.filter((item) => item.id !== seat.id);
     releaseVisible.value = false;
     releasePassword.value = "";
     notice.value = `已解绑「${seat.label || seat.id}」，现在可以重新激活`;
   } catch (reason) {
+    if (!isCurrent(run) || !releaseVisible.value) return;
     releaseError.value = describeLicenseError(reason, "解绑失败，请重试。");
   } finally {
-    busy.value = false;
+    if (!disposed) submitting.value = false;
   }
 }
 </script>
@@ -177,7 +215,7 @@ async function confirmRelease() {
         </label>
         <label class="activation-field">
           <span>设备名称 <small>（选填，用于区分设备）</small></span>
-          <InputText v-model="deviceLabel" :placeholder="platformLabel" />
+          <InputText v-model="deviceLabel" :disabled="busy" :placeholder="platformLabel" />
         </label>
         <Button
           type="submit"
@@ -221,7 +259,7 @@ async function confirmRelease() {
                 {{ PLATFORM_LABELS[seat.platform] ?? seat.platform }} · 最近使用 {{ formatTime(seat.last_seen) }}
               </span>
             </div>
-            <Button label="解绑" size="small" severity="danger" text @click="openRelease(seat)" />
+            <Button label="解绑" size="small" severity="danger" text :disabled="busy" @click="openRelease(seat)" />
           </li>
         </ul>
       </div>
@@ -244,7 +282,7 @@ async function confirmRelease() {
       </p>
       <label class="activation-field">
         <span>请输入账号密码以确认</span>
-        <Password v-model="releasePassword" :feedback="false" prompt-label="请输入密码" toggle-mask placeholder="账号密码" input-class="activation-password" />
+        <Password v-model="releasePassword" :disabled="busy" :feedback="false" prompt-label="请输入密码" toggle-mask placeholder="账号密码" input-class="activation-password" />
       </label>
       <p v-if="releaseError" class="activation-alert is-error" role="alert">
         <CircleAlert :size="14" :stroke-width="2" /><span>{{ releaseError }}</span>

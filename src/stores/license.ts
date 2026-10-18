@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, onScopeDispose, ref } from "vue";
 
 export interface LicenseSeat {
   id: string;
@@ -51,69 +51,154 @@ export const useLicenseStore = defineStore("license", () => {
   const initialized = ref(false);
   const lastError = ref("");
   const seats = ref<LicenseSeat[]>([]);
+  const seatsError = ref("");
+  let disposed = false;
+  let revision = 0;
+  let commandQueue = Promise.resolve();
+  let mutation: Promise<unknown> | undefined;
+  let statusRequest: { revision: number; promise: Promise<LicenseView | null> } | undefined;
+  let seatsRequest: { revision: number; promise: Promise<LicenseSeat[]> } | undefined;
+  let heartbeatRequest: Promise<boolean> | undefined;
+
+  const isCurrent = (run: number) => !disposed && run === revision;
+  onScopeDispose(() => { disposed = true; revision += 1; });
+
+  // Heartbeats also write native credentials. Finish them before activation or
+  // sign-out so an old server response cannot restore a superseded native token.
+  function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const request = commandQueue.then(operation);
+    commandQueue = request.then(() => {}, () => {});
+    return request;
+  }
+
+  function applyView(result: LicenseView, run: number) {
+    if (!isCurrent(run)) return;
+    view.value = result;
+    lastError.value = result.message ?? "";
+    initialized.value = true;
+  }
+
+  async function readStatus(run: number) {
+    if (!isCurrent(run)) return;
+    try {
+      applyView(await invoke<LicenseView>("get_license_status"), run);
+    } catch (error) {
+      if (!isCurrent(run)) return;
+      view.value = null;
+      lastError.value = String(error);
+      initialized.value = true;
+    }
+  }
+
+  async function readSeats(run: number) {
+    if (!isCurrent(run)) return;
+    seatsError.value = "";
+    try {
+      const result = await invoke<LicenseSeat[]>("list_license_seats");
+      if (isCurrent(run)) seats.value = result;
+    } catch (error) {
+      if (!isCurrent(run)) return;
+      seats.value = [];
+      seatsError.value = String(error);
+    }
+  }
+
+  function mutate<T>(operation: (run: number) => Promise<T>): Promise<T> {
+    if (disposed) return Promise.reject(new Error("授权操作已结束，请重新打开页面。"));
+    if (mutation) return Promise.reject(new Error("授权操作正在进行，请完成后重试。"));
+    const run = ++revision;
+    loading.value = true;
+    lastError.value = "";
+    seatsError.value = "";
+    const request = enqueue(async () => {
+      if (!isCurrent(run)) throw new Error("授权操作已取消。");
+      return operation(run);
+    }).catch((error) => {
+      if (isCurrent(run)) lastError.value = String(error);
+      throw error;
+    }).finally(() => {
+      if (mutation === request) mutation = undefined;
+      if (!disposed) loading.value = false;
+    });
+    mutation = request;
+    return request;
+  }
 
   const activated = computed(() => view.value?.activated === true);
-  const canArchive = computed(() => view.value?.canArchive === true);
+  const canArchive = computed(() => !loading.value && view.value?.canArchive === true);
   const status = computed(() => view.value?.status ?? "notActivated");
   const inGrace = computed(() => view.value?.status === "grace");
   const restricted = computed(() => view.value?.status === "restricted");
   const username = computed(() => view.value?.username ?? "");
 
-  async function refresh() {
-    try {
-      view.value = await invoke<LicenseView>("get_license_status");
-      lastError.value = view.value.message ?? "";
-    } catch (error) {
-      view.value = null;
-      lastError.value = String(error);
-    } finally {
-      initialized.value = true;
-    }
-    return view.value;
+  function refresh(): Promise<LicenseView | null> {
+    if (disposed) return Promise.resolve(view.value);
+    if (statusRequest?.revision === revision) return statusRequest.promise;
+    const run = revision;
+    const promise = enqueue(() => readStatus(run)).then(() => {
+      // A read started before an account operation must settle against its final
+      // native state, including callers awaiting refresh before logging into QQ.
+      if (!disposed && run !== revision) return refresh();
+      return view.value;
+    }).finally(() => {
+      if (statusRequest?.promise === promise) statusRequest = undefined;
+    });
+    statusRequest = { revision: run, promise };
+    return promise;
   }
 
-  async function activate(account: string, password: string, deviceLabel: string) {
-    loading.value = true;
-    lastError.value = "";
-    try {
+  function activate(account: string, password: string, deviceLabel: string) {
+    return mutate(async (run) => {
       const outcome = await invoke<ActivateOutcome>("activate_license", {
         username: account,
         password,
         deviceLabel: deviceLabel || null,
       });
-      view.value = outcome.view;
-      seats.value = outcome.seats;
+      applyView(outcome.view, run);
+      if (isCurrent(run)) seats.value = outcome.seats;
       return outcome;
-    } catch (error) {
-      lastError.value = String(error);
-      throw error;
-    } finally {
-      loading.value = false;
-    }
+    });
   }
 
   /** 心跳续期。网络失败不算致命：本地宽限期仍然成立，因此不抛异常。 */
-  async function heartbeat() {
-    try {
-      view.value = await invoke<LicenseView>("refresh_license");
-      lastError.value = "";
-      return true;
-    } catch (error) {
-      lastError.value = String(error);
-      // 被吊销或被停用时后端已清空本地凭证，此处同步刷新界面状态。
-      await refresh();
-      return false;
-    }
+  function heartbeat(): Promise<boolean> {
+    if (disposed || mutation) return Promise.resolve(false);
+    if (heartbeatRequest) return heartbeatRequest;
+    const run = revision;
+    const request = enqueue(async () => {
+      if (!isCurrent(run)) return false;
+      try {
+        const result = await invoke<LicenseView>("refresh_license");
+        if (!isCurrent(run)) return false;
+        applyView(result, run);
+        return true;
+      } catch (error) {
+        if (!isCurrent(run)) return false;
+        // Native status decides whether an offline grace period remains usable
+        // or a revoked token was cleared. Keep local browsing independent of it.
+        await readStatus(run);
+        if (isCurrent(run) && !lastError.value) lastError.value = String(error);
+        return false;
+      }
+    }).finally(() => {
+      if (heartbeatRequest === request) heartbeatRequest = undefined;
+    });
+    heartbeatRequest = request;
+    return request;
   }
 
-  async function loadSeats() {
-    lastError.value = "";
-    try {
-      seats.value = await invoke<LicenseSeat[]>("list_license_seats");
-    } catch (error) {
-      lastError.value = String(error);
-    }
-    return seats.value;
+  function loadSeats(): Promise<LicenseSeat[]> {
+    if (disposed) return Promise.resolve(seats.value);
+    if (seatsRequest?.revision === revision) return seatsRequest.promise;
+    const run = revision;
+    const promise = enqueue(() => readSeats(run)).then(() => {
+      if (!disposed && run !== revision) return loadSeats();
+      return seats.value;
+    }).finally(() => {
+      if (seatsRequest?.promise === promise) seatsRequest = undefined;
+    });
+    seatsRequest = { revision: run, promise };
+    return promise;
   }
 
   /**
@@ -122,45 +207,44 @@ export const useLicenseStore = defineStore("license", () => {
    * 不传账号密码时后端走本机凭证通道（已激活设备无需重复输入）；
    * 在「席位已满、本机尚未激活」的新设备上必须传账号密码。
    */
-  async function deactivateSeat(seatId: string, account?: string, password?: string) {
-    loading.value = true;
-    try {
-      view.value = await invoke<LicenseView>("deactivate_license_seat", {
+  function deactivateSeat(seatId: string, account?: string, password?: string) {
+    return mutate(async (run) => {
+      const result = await invoke<LicenseView>("deactivate_license_seat", {
         seatId,
         username: account ?? null,
         password: password ?? null,
       });
-      await loadSeats();
-    } finally {
-      loading.value = false;
-    }
+      applyView(result, run);
+      await readSeats(run);
+    });
   }
 
-  async function redeem(account: string, password: string, code: string) {
-    loading.value = true;
-    try {
+  function redeem(account: string, password: string, code: string) {
+    return mutate(async (run) => {
       const message = await invoke<string>("redeem_license_code", {
         username: account,
         password,
         code,
       });
-      await refresh();
+      await readStatus(run);
       return message;
-    } finally {
-      loading.value = false;
-    }
+    });
   }
 
-  async function signOut() {
-    await invoke("sign_out_license");
-    view.value = null;
-    seats.value = [];
-    await refresh();
+  function signOut() {
+    return mutate(async (run) => {
+      await invoke("sign_out_license");
+      if (!isCurrent(run)) return;
+      view.value = null;
+      seats.value = [];
+      await readStatus(run);
+    });
   }
 
   return {
     view,
     seats,
+    seatsError,
     loading,
     initialized,
     lastError,

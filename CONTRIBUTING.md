@@ -33,7 +33,7 @@
 
 ## 验证
 
-修改 Vue/Tauri 前端后运行 `npm run build`（包含 `vue-tsc --noEmit`）。修改文档站后运行 `npm --prefix website run build`。涉及 Rust 时运行 `cargo fmt --check` 和 `cargo check`；改动授权校验逻辑时另需运行 `cargo test --manifest-path src-tauri/license-core/Cargo.toml`。
+修改 Vue/Tauri 前端后运行 `npm test` 和 `npm run build`（包含 `vue-tsc --noEmit`）。`npm test` 使用受控的原生接口响应检查登录会话、错误提示、资料库异步状态和全局任务状态，不会连接真实 QQ 账号或访问凭据存储。修改文档站后运行 `npm --prefix website run build`。涉及 Rust 时运行 `cargo fmt --check` 和 `cargo check`；改动授权校验逻辑时另需运行 `cargo test --manifest-path src-tauri/license-core/Cargo.toml`。
 
 如果当前环境无法执行某项检查（缺少链接器、没有图形界面等），请在说明中明确写出，不要暗示已经验证过。
 

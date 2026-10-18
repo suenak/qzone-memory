@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
-import { getArchiveProgress, IDLE_ARCHIVE_PROGRESS, type ArchiveProgress } from "../utils/qzone";
+import { computed, onScopeDispose, ref } from "vue";
+import { getArchiveProgress, IDLE_ARCHIVE_PROGRESS, retryArchiveSkip, syncQzoneLibrary, type ArchiveProgress, type LibraryModule } from "../utils/qzone";
 
 /** 任务进行中时的轮询间隔。 */
 const ACTIVE_INTERVAL_MS = 2000;
@@ -25,6 +25,11 @@ export const useArchiveStore = defineStore("archive", () => {
   let revision = 0;
   let pendingRevision = -1;
   const taskPending = ref(false);
+  const pendingLibrarySyncs = ref(0);
+  const retryingSkipId = ref<number>();
+  const retrying = computed(() => retryingSkipId.value !== undefined);
+  const dataChanging = ref(false);
+  const recoveringRecycle = ref(false);
 
   const running = computed(() => taskPending.value || progress.value?.status === "running");
   const limited = computed(() => progress.value?.status === "limited");
@@ -35,17 +40,20 @@ export const useArchiveStore = defineStore("archive", () => {
    *
    * 它和归档任务是两条独立路径：归档走 start_feed_archive，资料同步走
    * sync_qzone_library，后者原先不体现在任何共享状态里，页面内自己管自己。
-   * 后端现在把同步中标记放进进度轮询，这里读出来给全局用。
+   * IPC 发出前立即标记，避免等待空闲轮询。页面卸载不会提前解除标记；
+   * 原生层报告的同步状态仍作为补充，兼容其他入口启动的同步。
    */
-  const syncing = computed(() => progress.value?.librarySyncing === true);
+  const syncing = computed(() => pendingLibrarySyncs.value > 0 || progress.value?.librarySyncing === true);
   /**
-   * 是否有任何任务在往归档数据里写。
+   * 是否有需要保持账号与数据稳定的操作在进行。
    *
-   * 设置页的清空、删除与退出登录必须以这个为准，不能只看 running ——
+   * 设置页的清空、删除与退出登录必须以这个为准，不能只看 running；
+   * 单页重试也会持续写库，必须等原生请求结束后才能解除忙碌状态。
    * 资料同步跑到一半时点清空，后续页会把刚删掉的数据补回去；换号则会把另一个
    * 账号的数据混进当前账号。
+   * 回收站恢复也使用当前 QQ 身份，原生请求结束前不能换号或删除账号数据。
    */
-  const busy = computed(() => running.value === true || syncing.value);
+  const busy = computed(() => running.value === true || syncing.value || retrying.value || dataChanging.value || recoveringRecycle.value);
 
   /** 是否出现了未解决的跳页记录（断点续传的异常条目）。 */
   const hasSkips = computed(() => (progress.value?.skipped ?? 0) > 0);
@@ -53,6 +61,8 @@ export const useArchiveStore = defineStore("archive", () => {
   // The native start command returns only when the entire run ends. Show the new
   // run immediately, and reject snapshots requested before either action boundary.
   function beginRun() {
+    if (recoveringRecycle.value) throw new Error("回收站恢复进行中，请等待完成后再开始任务。");
+    if (dataChanging.value) throw new Error("本地数据正在整理，请等待完成后再恢复。");
     revision += 1;
     taskPending.value = true;
     progress.value = {
@@ -70,6 +80,73 @@ export const useArchiveStore = defineStore("archive", () => {
     taskPending.value = false;
     if (snapshot) progress.value = snapshot;
     reschedule();
+  }
+
+  /** Own the native command's lifetime independently of the page that started it. */
+  async function syncLibrary(module: LibraryModule, parentKey?: string) {
+    if (recoveringRecycle.value) throw new Error("回收站恢复进行中，请等待完成后再备份资料。");
+    if (dataChanging.value) throw new Error("本地数据正在整理，请等待完成后再备份资料。");
+    if (retrying.value) throw new Error("异常页重试进行中，请等待结束后再备份资料。");
+    revision += 1;
+    pendingLibrarySyncs.value += 1;
+    reschedule();
+    try {
+      return await syncQzoneLibrary(module, parentKey);
+    } finally {
+      revision += 1;
+      pendingLibrarySyncs.value -= 1;
+      reschedule();
+      // A response requested during the sync can still say "syncing" after it
+      // finishes. Read a fresh snapshot without delaying the command's result.
+      void refresh();
+    }
+  }
+
+  async function retrySkip(id: number) {
+    if (busy.value) throw new Error("请等待当前恢复或资料同步结束后再重试。");
+    revision += 1;
+    retryingSkipId.value = id;
+    reschedule();
+    try {
+      return await retryArchiveSkip(id);
+    } finally {
+      revision += 1;
+      retryingSkipId.value = undefined;
+      reschedule();
+      void refresh();
+    }
+  }
+
+  /** Keep data changes busy through their native work and required cleanup. */
+  async function withDataChange<T>(operation: () => Promise<T>): Promise<T> {
+    if (busy.value) throw new Error("请等待当前任务结束后再修改本地数据。");
+    revision += 1;
+    dataChanging.value = true;
+    reschedule();
+    try {
+      return await operation();
+    } finally {
+      revision += 1;
+      dataChanging.value = false;
+      reschedule();
+      void refresh();
+    }
+  }
+
+  /** Keep account/data actions blocked until the in-flight QQ recovery settles. */
+  async function withRecycleRecovery<T>(operation: () => Promise<T>): Promise<T> {
+    if (busy.value) throw new Error("请等待当前任务结束后再恢复回收站内容。");
+    revision += 1;
+    recoveringRecycle.value = true;
+    reschedule();
+    try {
+      return await operation();
+    } finally {
+      revision += 1;
+      recoveringRecycle.value = false;
+      reschedule();
+      void refresh();
+    }
   }
 
   /**
@@ -136,11 +213,18 @@ export const useArchiveStore = defineStore("archive", () => {
     }
   }
 
+  onScopeDispose(stopPolling);
+
   return {
     progress,
     error,
     running,
     syncing,
+    retrying,
+    retryingSkipId,
+    dataChanging,
+    recoveringRecycle,
+    withRecycleRecovery,
     busy,
     limited,
     completed,
@@ -148,6 +232,9 @@ export const useArchiveStore = defineStore("archive", () => {
     hasSkips,
     beginRun,
     finishRun,
+    syncLibrary,
+    retrySkip,
+    withDataChange,
     refresh,
     startPolling,
     stopPolling,
